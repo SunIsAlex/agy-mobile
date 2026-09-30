@@ -42,12 +42,14 @@ import app.ccmobile.ui.DiffScreen
 import app.ccmobile.ui.SessionScreen
 import app.ccmobile.ui.SettingsScreen
 import app.ccmobile.ui.TasksScreen
+import app.ccmobile.ui.UsageScreen
 
 sealed interface Screen {
     data object Tasks : Screen
     data class Session(val sid: String) : Screen
     data class Diff(val sid: String) : Screen
     data object Settings : Screen
+    data object Usage : Screen
 }
 
 class Nav : ViewModel() {
@@ -148,9 +150,13 @@ private fun AppRoot(repository: Repository, nav: Nav) {
 
     Box(Modifier.fillMaxSize()) {
         when (val screen = nav.stack.last()) {
-            Screen.Tasks -> TasksScreen(repository, onOpen = { nav.push(Screen.Session(it)) }, onSettings = { nav.push(Screen.Settings) })
+            Screen.Tasks -> TasksScreen(
+                repository, onOpen = { nav.push(Screen.Session(it)) },
+                onSettings = { nav.push(Screen.Settings) }, onUsage = { nav.push(Screen.Usage) },
+            )
             is Screen.Session -> SessionScreen(repository, screen.sid, onBack = nav::pop, onDiff = { nav.push(Screen.Diff(screen.sid)) })
             is Screen.Diff -> DiffScreen(repository, screen.sid, onBack = nav::pop)
+            Screen.Usage -> UsageScreen(repository, onBack = nav::pop)
             Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null)
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 80.dp)) {

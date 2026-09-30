@@ -328,3 +328,64 @@ test('attachments are saved for Claude, images also sent inline; phone use attac
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('usage: plan limits from rate_limit_event, token totals from Claude Code transcripts', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  // Two transcripts. A message split into blocks repeats its usage; a forked session copies it.
+  const projects = path.join(tmp, 'claude-config', 'projects', '-demo');
+  fs.mkdirSync(projects, { recursive: true });
+  const now = Date.now();
+  const rec = (id, t, model, output, cwd = repo) => JSON.stringify({
+    type: 'assistant', timestamp: new Date(t).toISOString(), cwd,
+    message: { id, model, usage: { input_tokens: 1, output_tokens: output, cache_read_input_tokens: 100, cache_creation_input_tokens: 10 } },
+  });
+  fs.writeFileSync(path.join(projects, 'a.jsonl'), [
+    rec('m1', now - 60_000, 'claude-opus-5-5', 50), rec('m1', now - 60_000, 'claude-opus-5-5', 50),
+    rec('m2', now - 60_000, 'claude-haiku-4-5', 5, '/elsewhere'),
+    rec('old', now - 40 * 86_400_000, 'claude-opus-5-5', 999),
+    JSON.stringify({ type: 'user', message: { content: 'hi "usage"' } }),
+  ].join('\n') + '\n');
+  fs.writeFileSync(path.join(projects, 'b.jsonl'), rec('m1', now - 60_000, 'claude-opus-5-5', 50) + '\n');
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  let bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    let c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+
+    c.send({ op: 'usage', ref: 1, days: 7 });
+    const u = await c.next((m) => m.ev === 'usage');
+    assert.equal(u.limits, null);
+    assert.equal(u.days.length, 7);
+    const today = u.days.at(-1);
+    assert.deepEqual([today.output, today.requests, today.cacheRead], [55, 2, 200]);
+    assert.deepEqual(u.models.map((m) => [m.key, m.output]), [['claude-opus-5-5', 50], ['claude-haiku-4-5', 5]]);
+    assert.deepEqual(u.projects.map((p) => p.key), [repo, '/elsewhere']);
+    assert.equal(u.sessions, 1);
+
+    c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'go', mode: 'bypassPermissions' });
+    const limits = (await c.next((m) => m.ev === 'limits')).limits;
+    assert.deepEqual(limits.windows, [
+      { id: 'five_hour', utilization: 0.07, resetsAt: 2000000000000 },
+      { id: 'seven_day', utilization: 0.85, resetsAt: 2000500000000 },
+    ]);
+    c.end();
+
+    // Limits survive a restart and are sent on connect.
+    bridge.kill('SIGTERM');
+    await new Promise((r) => bridge.once('exit', r));
+    bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+    c = connect(port);
+    c.send({ op: 'hello', token });
+    assert.equal((await c.next((m) => m.ev === 'limits')).limits.windows[1].utilization, 0.85);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

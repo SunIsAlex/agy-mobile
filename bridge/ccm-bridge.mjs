@@ -212,7 +212,8 @@ class Session {
     if (msg.type === 'control_response') return;
     // Partial deltas are forwarded live but not stored; the final message replaces them.
     if (msg.type === 'stream_event') { sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg }); return; }
-    if (msg.type === 'rate_limit_event' || (msg.type === 'system' && msg.subtype === 'thinking_tokens')) return;
+    if (msg.type === 'rate_limit_event') { onRateLimit(msg.rate_limit_info); return; }
+    if (msg.type === 'system' && msg.subtype === 'thinking_tokens') return;
     if (msg.type === 'system' && msg.subtype === 'init') {
       msg = { type: 'system', subtype: 'init', model: msg.model, cwd: msg.cwd, permissionMode: msg.permissionMode, session_id: msg.session_id };
     }
@@ -514,6 +515,109 @@ function importCliSession(id) {
   return s;
 }
 
+// ---------- usage ----------
+
+// Plan limits come from the CLI's rate_limit_event, sent with every reply. They cover the whole
+// account (claude.ai and every Claude Code), not just this bridge, so the latest one is kept.
+const limitsFile = path.join(stateDir, 'limits.json');
+let limits = null;
+try { limits = JSON.parse(fs.readFileSync(limitsFile, 'utf8')); } catch {}
+
+function onRateLimit(info) {
+  if (!info) return;
+  const windows = Object.entries(info.unifiedWindows ?? {})
+    .filter(([, w]) => typeof w?.utilization === 'number')
+    .map(([id, w]) => ({ id, utilization: w.utilization, resetsAt: (w.resetsAt ?? 0) * 1000 }));
+  if (!windows.length && typeof info.utilization === 'number') {
+    windows.push({ id: info.rateLimitType ?? 'five_hour', utilization: info.utilization, resetsAt: (info.resetsAt ?? 0) * 1000 });
+  }
+  if (!windows.length) return;
+  limits = { status: info.status ?? 'allowed', windows, updatedAt: Date.now() };
+  try { fs.writeFileSync(limitsFile, JSON.stringify(limits)); } catch {}
+  broadcast({ ev: 'limits', limits });
+}
+
+// Token use per assistant message, read from Claude Code's transcripts (terminal and bridge
+// sessions alike). Parsed files are cached until they change.
+/** @type {Map<string, {mtimeMs: number, size: number, records: object[]}>} */
+const usageCache = new Map();
+
+function transcriptFiles(dir = claudeProjectsDir, depth = 0, out = []) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const f = path.join(dir, e.name);
+    if (e.isDirectory()) { if (depth < 3) transcriptFiles(f, depth + 1, out); }
+    else if (e.name.endsWith('.jsonl')) out.push(f);
+  }
+  return out;
+}
+
+function usageRecords(file, stat) {
+  const hit = usageCache.get(file);
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.records;
+  const records = [];
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch {}
+  for (const line of text.split('\n')) {
+    if (!line.includes('"usage"')) continue;
+    let r;
+    try { r = JSON.parse(line); } catch { continue; }
+    const u = r.message?.usage;
+    if (r.type !== 'assistant' || !u || r.message.model === '<synthetic>') continue;
+    records.push({
+      // A message split into several content blocks repeats its usage on each record.
+      id: r.message.id ?? r.requestId ?? r.uuid,
+      t: Date.parse(r.timestamp) || 0,
+      model: r.message.model ?? 'unknown',
+      cwd: r.cwd ?? '',
+      input: u.input_tokens ?? 0,
+      output: u.output_tokens ?? 0,
+      cacheRead: u.cache_read_input_tokens ?? 0,
+      cacheWrite: u.cache_creation_input_tokens ?? 0,
+    });
+  }
+  usageCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, records });
+  return records;
+}
+
+/** Totals per day (in the caller's time zone), model and project over the last [days] days. */
+function usageSummary(days, tzOffsetMin) {
+  days = Math.min(Math.max(Math.trunc(days) || 7, 1), 90);
+  const offset = (Number(tzOffsetMin) || 0) * 60_000;
+  const dayOf = (t) => new Date(t + offset).toISOString().slice(0, 10);
+  const today = Date.now();
+  const byDay = new Map();
+  for (let i = days - 1; i >= 0; i--) {
+    byDay.set(dayOf(today - i * 86_400_000), { date: dayOf(today - i * 86_400_000), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 });
+  }
+  const since = Date.parse(byDay.keys().next().value + 'T00:00:00Z') - offset;
+  const byModel = new Map();
+  const byProject = new Map();
+  const seen = new Set();
+  const sessionFiles = new Set();
+  for (const file of transcriptFiles()) {
+    let stat;
+    try { stat = fs.statSync(file); } catch { continue; }
+    if (stat.mtimeMs < since) continue;
+    for (const r of usageRecords(file, stat)) {
+      if (r.t < since || seen.has(r.id)) continue;
+      seen.add(r.id);
+      const d = byDay.get(dayOf(r.t));
+      if (!d) continue;
+      sessionFiles.add(file);
+      d.input += r.input; d.output += r.output; d.cacheRead += r.cacheRead; d.cacheWrite += r.cacheWrite; d.requests++;
+      for (const [map, key] of [[byModel, r.model], [byProject, r.cwd]]) {
+        const e = map.get(key) ?? { key, output: 0, input: 0, requests: 0 };
+        e.output += r.output; e.input += r.input + r.cacheRead + r.cacheWrite; e.requests++;
+        map.set(key, e);
+      }
+    }
+  }
+  const ranked = (map) => [...map.values()].sort((a, b) => b.output - a.output);
+  return { days: [...byDay.values()], models: ranked(byModel), projects: ranked(byProject), sessions: sessionFiles.size };
+}
+
 function describeInput(input) {
   if (!input || typeof input !== 'object') return '';
   const v = input.command ?? input.file_path ?? input.path ?? input.pattern ?? input.url ?? input.query ?? input.description;
@@ -641,6 +745,7 @@ class Client {
         clients.add(this);
         this.send({ ev: 'hello', version: VERSION, host: os.hostname(), platform: process.platform, roots: opts.roots, phone: phoneAvailable });
         this.send({ ev: 'sessions', sessions: [...sessions.values()].map((s) => s.summary()) });
+        if (limits) this.send({ ev: 'limits', limits });
         for (const s of sessions.values()) for (const req of s.pending.values()) this.send({ ev: 'approval', sid: s.id, title: s.title, request: req });
       } else {
         this.send({ ev: 'error', message: 'Unauthorized' });
@@ -683,6 +788,7 @@ class Client {
         this.send({ ev: 'started', ref, session: session.summary() });
         break;
       }
+      case 'usage': this.send({ ev: 'usage', ref, limits, ...usageSummary(msg.days, msg.tzOffsetMin) }); break;
       case 'claude_sessions': this.send({ ev: 'claude_sessions', ref, sessions: listCliSessions() }); break;
       case 'resume': {
         const id = String(msg.id ?? '');

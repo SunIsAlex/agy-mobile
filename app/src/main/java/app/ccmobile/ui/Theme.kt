@@ -30,6 +30,8 @@ object C {
     val GreenBg = Color(0xFF1F3021)
     val GreenPill = Color(0xFFA9D9A7)
     val Red = Color(0xFFEC9486)
+    val Amber = Color(0xFFFAB219)
+    val AmberBg = Color(0xFF3A3020)
     val AddBg = Color(0xFF1C3320)
     val AddText = Color(0xFFC6E8C4)
     val DelBg = Color(0xFF3A1F1C)

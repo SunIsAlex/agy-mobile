@@ -50,6 +50,12 @@ set_timer. Looking (screenshot, screen_elements, list_apps) runs without asking;
 through the usual approval unless you allow it always or turn on YOLO. Phone tasks don't need a
 repo. The chip only shows when the bridge's `su -c id` returns 0 (override with `CCM_PHONE=0|1`).
 
+**Usage** (gauge icon on the task list): plan limits (the 5-hour and weekly windows, with reset
+times) come from the `rate_limit_event` Claude Code sends with each reply, so they appear after the
+first reply through the bridge and cover all your Claude use. Below that: tokens in and out per day,
+project and model over 7 or 30 days, read from Claude Code's transcripts in `~/.claude/projects`
+(terminal sessions included). The icon turns amber at 80% of a limit and red at 100%.
+
 **On a computer:** run the same script with `--host <private address>`, e.g. your Tailscale IP,
 and enter host, port and token in the app's Settings. Traffic is not encrypted, so only bind a
 private network (or use an SSH tunnel to `127.0.0.1`).

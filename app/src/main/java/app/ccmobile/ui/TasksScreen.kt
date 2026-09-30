@@ -70,13 +70,14 @@ import app.ccmobile.data.SessionSummary
 import kotlinx.coroutines.launch
 
 @Composable
-fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: () -> Unit) {
+fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: () -> Unit, onUsage: () -> Unit) {
     val sessions by repository.sessions.collectAsStateWithLifecycle()
     val repos by repository.repos.collectAsStateWithLifecycle()
     val conn by repository.client.state.collectAsStateWithLifecycle()
     val claudeSessions by repository.claudeSessions.collectAsStateWithLifecycle()
     val roots by repository.roots.collectAsStateWithLifecycle()
     val phoneAvailable by repository.phoneAvailable.collectAsStateWithLifecycle()
+    val limits by repository.limits.collectAsStateWithLifecycle()
     val settings = repository.settings
 
     var repoPath by rememberSaveable { mutableStateOf(settings.lastRepo) }
@@ -134,6 +135,13 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
                 repos, repo, onPick = { repoPath = it.path }, onRefresh = repository::refreshRepos,
                 onNewFolder = { newFolder = true }.takeIf { conn is ConnState.Connected && roots.isNotEmpty() },
                 modifier = Modifier.weight(1f),
+            )
+            // Tinted when a plan limit is nearly used, so it shows before a task stalls on it.
+            val now = System.currentTimeMillis()
+            val peak = limits?.windows?.filter { it.resetsAt > now }?.maxOfOrNull { it.utilization } ?: 0.0
+            IconBtn(
+                R.drawable.ic_gauge, if (peak >= 0.8) "Usage, ${Math.round(peak * 100)}% of a limit used" else "Usage", onUsage,
+                tint = if (peak >= 1.0) C.Red else if (peak >= 0.8) C.Amber else C.Text,
             )
             IconBtn(R.drawable.ic_settings, "Settings", onSettings)
         }

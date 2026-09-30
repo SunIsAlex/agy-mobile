@@ -47,6 +47,40 @@ data class ClaudeSession(
     val repoName: String get() = cwd.trimEnd('/').substringAfterLast('/')
 }
 
+/** One plan-limit window from the CLI's rate_limit_event (see onRateLimit() in ccm-bridge.mjs). */
+@Serializable
+data class LimitWindow(val id: String, val utilization: Double, val resetsAt: Long = 0)
+
+/** The account's plan limits as of Claude's last reply through the bridge. */
+@Serializable
+data class Limits(val status: String = "allowed", val windows: List<LimitWindow> = emptyList(), val updatedAt: Long = 0)
+
+@Serializable
+data class DayUsage(
+    val date: String,
+    val input: Long = 0,
+    val output: Long = 0,
+    val cacheRead: Long = 0,
+    val cacheWrite: Long = 0,
+    val requests: Int = 0,
+) {
+    /** Everything Claude read: fresh input plus cache reads and writes. */
+    val read: Long get() = input + cacheRead + cacheWrite
+}
+
+/** Tokens for one model or project; [input] includes cache reads and writes. */
+@Serializable
+data class UsageShare(val key: String, val output: Long = 0, val input: Long = 0, val requests: Int = 0)
+
+/** Token use from Claude Code's transcripts on the bridge's machine (see usageSummary()). */
+@Serializable
+data class Usage(
+    val days: List<DayUsage> = emptyList(),
+    val models: List<UsageShare> = emptyList(),
+    val projects: List<UsageShare> = emptyList(),
+    val sessions: Int = 0,
+)
+
 @Serializable
 data class Repo(val path: String, val name: String, val branch: String? = null)
 

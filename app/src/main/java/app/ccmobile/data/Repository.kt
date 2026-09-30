@@ -15,6 +15,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.util.TimeZone
 
 data class DiffState(
     val loading: Boolean = false,
@@ -43,6 +44,9 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     private val _claudeSessions = MutableStateFlow<List<ClaudeSession>?>(null)
     /** Sessions from Claude Code elsewhere that can be resumed here; null until loaded. */
     val claudeSessions: StateFlow<List<ClaudeSession>?> = _claudeSessions.asStateFlow()
+    private val _limits = MutableStateFlow<Limits?>(null)
+    /** Plan limits as of Claude's last reply; null until the bridge has seen one. */
+    val limits: StateFlow<Limits?> = _limits.asStateFlow()
     private val _approvals = MutableStateFlow<List<Approval>>(emptyList())
     val approvals: StateFlow<List<Approval>> = _approvals.asStateFlow()
     private val _items = MutableStateFlow<Map<String, List<Item>>>(emptyMap())
@@ -120,6 +124,14 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         val path = reply.str("created") ?: return Result.failure(Exception(reply.str("message") ?: "Couldn't create the folder."))
         settings.lastRepo = path
         return Result.success(path)
+    }
+
+    /** Token use over the last [days] days, bucketed by this phone's calendar days. */
+    suspend fun loadUsage(days: Int): Usage? {
+        val tzOffsetMin = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
+        val reply = request("usage", "days" to days, "tzOffsetMin" to tzOffsetMin) ?: return null
+        reply.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
+        return json.decodeFromJsonElement(Usage.serializer(), reply)
     }
 
     fun refreshClaudeSessions() = fire("claude_sessions")
@@ -227,6 +239,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             }
             "claude_sessions" -> _claudeSessions.value =
                 json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
+            "limits" -> ev.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
             "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
             "history" -> {
                 val sid = ev.str("sid") ?: return

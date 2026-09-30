@@ -32,6 +32,10 @@ rl.on('line', (line) => {
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: `tool-${n}`, name: 'Bash', input: { command: 'touch x' } }] } });
     if (mode === 'bypassPermissions') {
       out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: 'ran without asking' }] } });
+      out({
+        type: 'rate_limit_event',
+        rate_limit_info: { status: 'allowed', resetsAt: 2000000000, rateLimitType: 'five_hour', unifiedWindows: { five_hour: { utilization: 0.07, resetsAt: 2000000000 }, seven_day: { utilization: 0.85, resetsAt: 2000500000 } } },
+      });
       out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01 });
       return;
     }
