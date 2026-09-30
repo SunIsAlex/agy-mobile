@@ -1,0 +1,270 @@
+package app.ccmobile.data
+
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
+data class DiffState(
+    val loading: Boolean = false,
+    val files: List<FileDiff> = emptyList(),
+    val truncated: Boolean = false,
+    val branch: String? = null,
+)
+
+/**
+ * App-wide state backed by the bridge. Lives for the whole process (held by CcApp) so the
+ * notification service and the UI share one connection. Call from the main thread.
+ */
+class Repository(private val scope: CoroutineScope, val settings: Settings) {
+    val client = BridgeClient(scope)
+
+    private val _sessions = MutableStateFlow<List<SessionSummary>>(emptyList())
+    val sessions: StateFlow<List<SessionSummary>> = _sessions.asStateFlow()
+    private val _repos = MutableStateFlow<List<Repo>>(emptyList())
+    val repos: StateFlow<List<Repo>> = _repos.asStateFlow()
+    private val _roots = MutableStateFlow<List<String>>(emptyList())
+    /** The folders the bridge scans for repos (its --roots); new folders go in one of these. */
+    val roots: StateFlow<List<String>> = _roots.asStateFlow()
+    private val _phoneAvailable = MutableStateFlow(false)
+    /** True when the bridge runs on a rooted phone, so tasks can use Phone use. */
+    val phoneAvailable: StateFlow<Boolean> = _phoneAvailable.asStateFlow()
+    private val _claudeSessions = MutableStateFlow<List<ClaudeSession>?>(null)
+    /** Sessions from Claude Code elsewhere that can be resumed here; null until loaded. */
+    val claudeSessions: StateFlow<List<ClaudeSession>?> = _claudeSessions.asStateFlow()
+    private val _approvals = MutableStateFlow<List<Approval>>(emptyList())
+    val approvals: StateFlow<List<Approval>> = _approvals.asStateFlow()
+    private val _items = MutableStateFlow<Map<String, List<Item>>>(emptyMap())
+    val items: StateFlow<Map<String, List<Item>>> = _items.asStateFlow()
+    private val _diffs = MutableStateFlow<Map<String, DiffState>>(emptyMap())
+    val diffs: StateFlow<Map<String, DiffState>> = _diffs.asStateFlow()
+    private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val errors: SharedFlow<String> = _errors
+
+    /** True while an activity is visible; approval notifications are held back then. */
+    val foreground = MutableStateFlow(false)
+
+    private val transcripts = HashMap<String, Transcript>()
+    private val open = mutableSetOf<String>()
+    private var nextRef = 1
+    private val waiting = HashMap<Int, CompletableDeferred<JsonObject?>>()
+    private val quietRefs = mutableSetOf<Int>()
+
+    init {
+        scope.launch { client.events.collect(::onEvent) }
+        scope.launch {
+            client.state.collect { state ->
+                if (state is ConnState.Connected) {
+                    send("repos")
+                    open.forEach { send("subscribe", "sid" to it) }
+                }
+            }
+        }
+    }
+
+    fun connect() {
+        settings.config()?.let(client::connect)
+    }
+
+    fun pair(host: String, port: Int, token: String) {
+        settings.host = host
+        settings.port = port
+        settings.token = token
+        connect()
+    }
+
+    // ---- actions ----
+
+    /** Starts a task and returns its session id, or null if the bridge refused or didn't answer. */
+    suspend fun start(
+        cwd: String, prompt: String, mode: String, model: String?,
+        phone: Boolean = false, attachments: List<PendingAttachment> = emptyList(),
+    ): String? {
+        settings.lastRepo = cwd
+        val reply = request(
+            "start", "cwd" to cwd, "prompt" to prompt, "mode" to mode, "model" to model,
+            "phone" to phone.takeIf { it }, "attachments" to attachmentsJson(attachments),
+        )
+        val session = reply?.obj("session") ?: return null
+        val summary = json.decodeFromJsonElement(SessionSummary.serializer(), session)
+        upsertSession(summary)
+        open(summary.id)
+        return summary.id
+    }
+
+    /** Brings a Claude Code session started elsewhere into the bridge and returns its id (the same session id). */
+    suspend fun resume(id: String): String? {
+        val reply = request("resume", "id" to id) ?: return null
+        val summary = json.decodeFromJsonElement(SessionSummary.serializer(), reply.obj("session") ?: return null)
+        upsertSession(summary)
+        _claudeSessions.update { list -> list?.filterNot { it.id == id } }
+        open(summary.id)
+        return summary.id
+    }
+
+    /** Creates a git repo folder named [name] (may be "a/b") under [root] and returns its path, or the bridge's error. */
+    suspend fun createFolder(root: String, name: String): Result<String> {
+        val reply = call("mkdir", quiet = true, "root" to root, "name" to name)
+            ?: return Result.failure(Exception("The bridge didn't answer."))
+        val path = reply.str("created") ?: return Result.failure(Exception(reply.str("message") ?: "Couldn't create the folder."))
+        settings.lastRepo = path
+        return Result.success(path)
+    }
+
+    fun refreshClaudeSessions() = fire("claude_sessions")
+
+    fun open(sid: String) {
+        if (open.add(sid)) scope.launch { send("subscribe", "sid" to sid) }
+    }
+
+    fun close(sid: String) {
+        if (open.remove(sid)) scope.launch { send("unsubscribe", "sid" to sid) }
+    }
+
+    fun sendMessage(sid: String, text: String, attachments: List<PendingAttachment> = emptyList()) =
+        fire("send", "sid" to sid, "text" to text, "attachments" to attachmentsJson(attachments))
+    fun setPhone(sid: String, on: Boolean) = fire("phone", "sid" to sid, "on" to on)
+    fun reportError(message: String) { _errors.tryEmit(message) }
+    fun interrupt(sid: String) = fire("interrupt", "sid" to sid)
+    fun setMode(sid: String, mode: String) = fire("mode", "sid" to sid, "mode" to mode)
+    fun stop(sid: String) = fire("stop", "sid" to sid)
+    fun archive(sid: String) = fire("archive", "sid" to sid)
+    fun refreshRepos() = fire("repos")
+
+    fun answer(approval: Approval, allow: Boolean, always: Boolean = false) {
+        _approvals.update { list -> list.filterNot { it.requestId == approval.requestId } }
+        fire("permission", "sid" to approval.sid, "requestId" to approval.requestId,
+            "decision" to if (allow) "allow" else "deny", "always" to always)
+    }
+
+    fun loadDiff(sid: String) {
+        _diffs.update { it + (sid to (it[sid] ?: DiffState()).copy(loading = true)) }
+        scope.launch {
+            val reply = request("diff", "sid" to sid)
+            val files = reply?.str("diff")?.let(DiffParser::parse).orEmpty()
+            _diffs.update {
+                it + (sid to DiffState(false, files, reply?.bool("truncated") == true, reply?.str("branch")))
+            }
+        }
+    }
+
+    // ---- wire ----
+
+    private fun fire(op: String, vararg fields: Pair<String, Any?>) {
+        scope.launch {
+            if (!send(op, *fields)) _errors.tryEmit("Not connected to the bridge.")
+        }
+    }
+
+    private suspend fun send(op: String, vararg fields: Pair<String, Any?>): Boolean {
+        val map = mutableMapOf<String, JsonElement>("op" to JsonPrimitive(op))
+        for ((k, v) in fields) when (v) {
+            null -> {}
+            is String -> map[k] = JsonPrimitive(v)
+            is Number -> map[k] = JsonPrimitive(v)
+            is Boolean -> map[k] = JsonPrimitive(v)
+            is JsonElement -> map[k] = v
+            else -> error("Unsupported field type for $k")
+        }
+        return client.send(JsonObject(map))
+    }
+
+    private suspend fun request(op: String, vararg fields: Pair<String, Any?>): JsonObject? =
+        call(op, quiet = false, *fields)?.takeUnless { it.str("ev") == "error" }
+
+    /**
+     * Sends [op] and waits for the reply with its ref, or an error event with it. Unless [quiet],
+     * errors also go to [errors]; a quiet caller shows them itself.
+     */
+    private suspend fun call(op: String, quiet: Boolean, vararg fields: Pair<String, Any?>): JsonObject? {
+        val ref = nextRef++
+        val deferred = CompletableDeferred<JsonObject?>()
+        waiting[ref] = deferred
+        if (quiet) quietRefs += ref
+        if (!send(op, *fields, "ref" to ref)) {
+            waiting.remove(ref)
+            quietRefs -= ref
+            _errors.tryEmit("Not connected to the bridge.")
+            return null
+        }
+        return withTimeoutOrNull(20_000) { deferred.await() }.also { waiting.remove(ref); quietRefs -= ref }
+    }
+
+    private fun attachmentsJson(list: List<PendingAttachment>): JsonArray? = list.takeIf { it.isNotEmpty() }?.let {
+        JsonArray(it.map { a -> JsonObject(mapOf("name" to JsonPrimitive(a.name), "mime" to JsonPrimitive(a.mime), "data" to JsonPrimitive(a.base64))) })
+    }
+
+    private fun onEvent(ev: JsonObject) {
+        val ref = (ev["ref"] as? JsonPrimitive)?.content?.toIntOrNull()
+        when (ev.str("ev")) {
+            "hello" -> {
+                _roots.value = ev.arr("roots").orEmpty().mapNotNull { (it as? JsonPrimitive)?.content }
+                _phoneAvailable.value = ev.bool("phone") == true
+            }
+            "sessions" -> _sessions.value = json.decodeFromJsonElement(ListSerializer(SessionSummary.serializer()), ev["sessions"]!!)
+                .sortedByDescending { it.updatedAt }
+            "session" -> ev.obj("session")?.let {
+                val s = json.decodeFromJsonElement(SessionSummary.serializer(), it)
+                upsertSession(s)
+                if (s.pending == 0) _approvals.update { list -> list.filterNot { a -> a.sid == s.id } }
+            }
+            "removed" -> ev.str("sid")?.let { sid ->
+                _sessions.update { list -> list.filterNot { it.id == sid } }
+                _approvals.update { list -> list.filterNot { it.sid == sid } }
+                transcripts.remove(sid)
+                _items.update { it - sid }
+            }
+            "claude_sessions" -> _claudeSessions.value =
+                json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
+            "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
+            "history" -> {
+                val sid = ev.str("sid") ?: return
+                val transcript = Transcript(sid, titleOf(sid))
+                transcript.applyAll(ev.arr("events").orEmpty().mapNotNull { it as? JsonObject })
+                transcripts[sid] = transcript
+                _items.update { it + (sid to transcript.snapshot()) }
+            }
+            "cli" -> {
+                val sid = ev.str("sid") ?: return
+                val transcript = transcripts[sid] ?: return
+                val msg = ev.obj("msg") ?: return
+                transcript.apply(msg)
+                if (msg.str("type") == "control_cancel_request") {
+                    _approvals.update { list -> list.filterNot { it.requestId == msg.str("request_id") } }
+                }
+                _items.update { it + (sid to transcript.snapshot()) }
+            }
+            "approval" -> {
+                val sid = ev.str("sid") ?: return
+                val approval = approvalFrom(sid, ev.str("title") ?: titleOf(sid), ev.obj("request") ?: return) ?: return
+                _approvals.update { list -> if (list.any { it.requestId == approval.requestId }) list else list + approval }
+            }
+            "approval_done" -> _approvals.update { list -> list.filterNot { it.requestId == ev.str("requestId") } }
+            "error" -> {
+                val message = ev.str("message") ?: "Bridge error"
+                val quiet = ref != null && quietRefs.remove(ref)
+                if (ref != null) waiting.remove(ref)?.complete(ev)
+                if (message != "Unauthorized" && !quiet) _errors.tryEmit(message)
+                return
+            }
+        }
+        if (ref != null) waiting.remove(ref)?.complete(ev)
+    }
+
+    private fun upsertSession(s: SessionSummary) = _sessions.update { list ->
+        (list.filterNot { it.id == s.id } + s).sortedByDescending { it.updatedAt }
+    }
+
+    private fun titleOf(sid: String) = _sessions.value.firstOrNull { it.id == sid }?.title ?: "Task"
+}
