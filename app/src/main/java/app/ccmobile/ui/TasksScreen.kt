@@ -85,6 +85,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
     var prompt by rememberSaveable { mutableStateOf("") }
     var mode by rememberSaveable { mutableStateOf(settings.mode) }
     var model by rememberSaveable { mutableStateOf(settings.model) }
+    var effort by rememberSaveable { mutableStateOf(settings.effort) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var starting by remember { mutableStateOf(false) }
     var resuming by remember { mutableStateOf<String?>(null) }
@@ -109,7 +110,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
         val target = cwd ?: return
         starting = true
         scope.launch {
-            val sid = repository.start(target, prompt.trim(), mode, model.ifBlank { null }, phoneOn, attachments.toList())
+            val sid = repository.start(target, prompt.trim(), mode, model.ifBlank { null }, effort.ifBlank { null }, phoneOn, attachments.toList())
             starting = false
             if (sid != null) {
                 prompt = ""
@@ -158,6 +159,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
                         prompt = prompt, onPrompt = { prompt = it },
                         mode = mode, onMode = { mode = it },
                         model = model, onModel = { model = it },
+                        effort = effort, onEffort = { effort = it },
                         canStart = canStart, starting = starting, onStart = ::start,
                         attachments = attachments, onError = repository::reportError,
                         phone = phoneOn.takeIf { phoneAvailable }, onPhone = { phone = it; settings.phone = it },
@@ -273,6 +275,7 @@ private fun Composer(
     prompt: String, onPrompt: (String) -> Unit,
     mode: String, onMode: (String) -> Unit,
     model: String, onModel: (String) -> Unit,
+    effort: String, onEffort: (String) -> Unit,
     canStart: Boolean, starting: Boolean, onStart: () -> Unit,
     attachments: SnapshotStateList<PendingAttachment>, onError: (String) -> Unit,
     /** Phone use toggle state, or null when the bridge can't offer it. */
@@ -320,11 +323,21 @@ private fun Composer(
             }
             var menu by remember { mutableStateOf(false) }
             Box {
-                Chip(modelLabels.firstOrNull { it.first == model }?.second ?: model, onClick = { menu = true })
+                // One chip for model and effort keeps the composer row short: "Opus · High".
+                val modelText = modelLabels.firstOrNull { it.first == model }?.second ?: model
+                Chip(if (effort.isEmpty()) modelText else "$modelText · ${effortLabel(effort)}", onClick = { menu = true })
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    MenuHeading("Model")
                     modelLabels.forEach { (value, label) ->
-                        DropdownMenuItem(text = { Text(if (value.isEmpty()) "Default model" else label) }, onClick = { onModel(value); menu = false })
+                        DropdownMenuItem(
+                            text = { Text(if (value.isEmpty()) "Default model" else label) },
+                            onClick = { onModel(value); menu = false },
+                            trailingIcon = { if (value == model) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
+                        )
                     }
+                    HorizontalDivider(color = C.Border)
+                    MenuHeading("Reasoning effort")
+                    EffortItems(effort) { onEffort(it); menu = false }
                 }
             }
             if (phone != null) Chip("Phone", onClick = { onPhone(!phone) }, icon = R.drawable.ic_phone, on = phone)
@@ -475,5 +488,30 @@ private fun ClaudeSessionRow(s: ClaudeSession, resuming: Boolean, onClick: () ->
             else CcIcon(R.drawable.ic_chevron_right, C.Muted, 18.dp)
         }
         HorizontalDivider(Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp), color = Color(0xFF242320))
+    }
+}
+
+@Composable
+fun MenuHeading(text: String) {
+    Text(
+        text.uppercase(), color = C.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp,
+        modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
+    )
+}
+
+/** Effort levels as menu items, with what each one means; [selected] is ticked. */
+@Composable
+fun EffortItems(selected: String, onSelect: (String) -> Unit) {
+    effortLabels.forEach { (value, label) ->
+        DropdownMenuItem(
+            text = {
+                Column(Modifier.padding(vertical = 4.dp)) {
+                    Text(label, fontWeight = FontWeight.Medium)
+                    Text(effortDescription(value), fontSize = 12.sp, lineHeight = 16.sp, color = C.Muted)
+                }
+            },
+            onClick = { onSelect(value) },
+            trailingIcon = { if (value == selected) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
+        )
     }
 }

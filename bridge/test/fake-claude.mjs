@@ -7,6 +7,7 @@ const sid = process.argv[process.argv.indexOf(process.argv.includes('--resume') 
 const out = (o) => process.stdout.write(JSON.stringify({ session_id: sid, ...o }) + '\n');
 let n = 0;
 let mode = process.argv[process.argv.indexOf('--permission-mode') + 1];
+let effort = process.argv.includes('--effort') ? process.argv[process.argv.indexOf('--effort') + 1] : null;
 const canBypass = process.argv.includes('--allow-dangerously-skip-permissions');
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -28,8 +29,15 @@ rl.on('line', (line) => {
     const c = msg.message.content;
     const said = typeof c === 'string' ? c : c.map((b) => (b.type === 'text' ? b.text : `[${b.type} ${b.source.media_type}]`)).join(' ');
     const mcp = process.argv.includes('--mcp-config') ? ` [mcp: ${Object.keys(JSON.parse(process.argv[process.argv.indexOf('--mcp-config') + 1]).mcpServers)}]` : '';
-    out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Looking at: ${said}${mcp}` }] } });
+    const eff = effort ? ` [effort: ${effort}]` : '';
+    out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Looking at: ${said}${mcp}${eff}` }] } });
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: `tool-${n}`, name: 'Bash', input: { command: 'touch x' } }] } });
+    if (said.includes('screenshot')) {
+      // Like Read on an image: the result carries base64 data, and tool_use_result repeats it.
+      const data = Buffer.alloc(300_000, 7).toString('base64');
+      const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
+      out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: [image] }] }, tool_use_result: { file: { base64: data } } });
+    }
     if (mode === 'bypassPermissions') {
       out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: 'ran without asking' }] } });
       out({
@@ -50,6 +58,8 @@ rl.on('line', (line) => {
     const r = msg.response.response;
     out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: `${r.behavior}${r.updatedPermissions ? ' always' : ''}`, is_error: r.behavior !== 'allow' }] } });
     out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01 });
+  } else if (msg.type === 'control_request' && msg.request.subtype === 'apply_flag_settings') {
+    if ('effortLevel' in msg.request.settings) effort = msg.request.settings.effortLevel;
   } else if (msg.type === 'control_request' && msg.request.subtype === 'interrupt') {
     out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'interrupted', total_cost_usd: 0 });
   }

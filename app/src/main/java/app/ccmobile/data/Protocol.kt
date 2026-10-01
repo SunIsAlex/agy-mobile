@@ -19,6 +19,8 @@ data class SessionSummary(
     val cwd: String,
     val title: String,
     val model: String? = null,
+    /** Reasoning effort (low…max), or null for the model's default. */
+    val effort: String? = null,
     val mode: String = "default",
     val status: String = "idle",
     val createdAt: Long = 0,

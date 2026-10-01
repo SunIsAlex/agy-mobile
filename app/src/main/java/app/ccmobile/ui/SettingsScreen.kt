@@ -63,6 +63,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var token by remember { mutableStateOf(settings.token) }
     var mode by remember { mutableStateOf(settings.mode) }
     var model by remember { mutableStateOf(settings.model) }
+    var effort by remember { mutableStateOf(settings.effort) }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -119,6 +120,11 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
 
             Section("Default model") {
                 Segmented(modelLabels, model, { model = it; settings.model = it })
+            }
+
+            Section("Default reasoning effort") {
+                Segmented(effortShortLabels, effort, { effort = it; settings.effort = it })
+                Text(effortDescription(effort), color = C.Muted, fontSize = 13.sp)
             }
 
             Row(
@@ -184,6 +190,9 @@ private fun Field(label: String, value: String, onChange: (String) -> Unit, keyb
         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = C.Clay, unfocusedBorderColor = C.Surface3, cursorColor = C.Clay, focusedLabelColor = C.ClayText),
     )
 }
+
+/** Six options fit one row only with short names. */
+private val effortShortLabels = effortLabels.map { (v, l) -> v to if (v == "xhigh") "XHigh" else if (v == "medium") "Med" else l }
 
 private fun copy(context: Context, text: String) {
     context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("command", text))

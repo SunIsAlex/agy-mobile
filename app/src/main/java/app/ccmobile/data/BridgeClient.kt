@@ -36,6 +36,9 @@ sealed interface ConnState {
     data class Failed(val message: String, val retrying: Boolean) : ConnState
 }
 
+/** Longest bridge message the app reads; the bridge keeps history well under this. */
+private const val MAX_LINE_CHARS = 16_000_000
+
 /** One NDJSON connection to ccm-bridge, reconnecting with backoff until [disconnect]. */
 class BridgeClient(private val scope: CoroutineScope) {
     private val _state = MutableStateFlow<ConnState>(ConnState.Idle)
@@ -57,7 +60,7 @@ class BridgeClient(private val scope: CoroutineScope) {
     fun disconnect() {
         job?.cancel()
         job = null
-        runCatching { socket?.close() } // unblocks readLine()
+        runCatching { socket?.close() } // unblocks reader.next()
         _state.value = ConnState.Idle
     }
 
@@ -84,11 +87,18 @@ class BridgeClient(private val scope: CoroutineScope) {
             try {
                 s.connect(InetSocketAddress(config.host, config.port), 5_000)
                 s.keepAlive = true
-                val reader = s.getInputStream().bufferedReader()
+                val reader = LineReader(s.getInputStream().reader(), MAX_LINE_CHARS)
                 writer = s.getOutputStream().bufferedWriter()
                 send(JsonObject(mapOf("op" to JsonPrimitive("hello"), "token" to JsonPrimitive(config.token))))
                 while (true) {
-                    val line = reader.readLine() ?: break
+                    val line = when (val l = reader.next() ?: break) {
+                        is LineReader.Line.Text -> l.text
+                        is LineReader.Line.TooLong -> {
+                            val mb = "%.0f".format(l.chars / 1e6)
+                            _events.emit(JsonObject(mapOf("ev" to JsonPrimitive("error"), "message" to JsonPrimitive("Skipped a $mb MB message from the bridge: too large for this phone."))))
+                            continue
+                        }
+                    }
                     val obj = runCatching { json.parseToJsonElement(line).jsonObject }.getOrNull() ?: continue
                     when (obj.str("ev")) {
                         "hello" -> {

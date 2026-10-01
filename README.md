@@ -50,6 +50,10 @@ set_timer. Looking (screenshot, screen_elements, list_apps) runs without asking;
 through the usual approval unless you allow it always or turn on YOLO. Phone tasks don't need a
 repo. The chip only shows when the bridge's `su -c id` returns 0 (override with `CCM_PHONE=0|1`).
 
+**Reasoning effort:** the model chip on a new task also picks effort (Low, Medium, High, Extra high,
+Max, or the model's default; passed as `--effort`). In a running task, *Reasoning effort* in the menu
+changes it from the next reply without restarting Claude. The default for new tasks is in Settings.
+
 **Usage** (gauge icon on the task list): plan limits (the 5-hour and weekly windows, with reset
 times) come from the `rate_limit_event` Claude Code sends with each reply, so they appear after the
 first reply through the bridge and cover all your Claude use. Below that: tokens in and out per day,

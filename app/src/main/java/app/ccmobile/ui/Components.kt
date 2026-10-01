@@ -213,4 +213,16 @@ fun modeDescription(mode: String): String = when (mode) {
     YOLO -> "Claude runs commands and edits files without asking. Only changes to settings, git and tool config still need your OK."
     else -> "Claude asks before editing files or running commands."
 }
+val effortLabels = listOf("" to "Default", "low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "Extra high", "max" to "Max")
+
+fun effortLabel(effort: String?): String = effortLabels.firstOrNull { it.first == effort.orEmpty() }?.second ?: effort.orEmpty()
+
+fun effortDescription(effort: String): String = when (effort) {
+    "low" -> "Quick answers with little thinking. Fastest, and lightest on your limits."
+    "medium" -> "Some thinking. A good fit for routine edits."
+    "high" -> "Thinks things through before acting."
+    "xhigh" -> "Thinks longer, for tricky bugs and designs."
+    "max" -> "Thinks as long as it needs. Slowest, and uses the most of your limits."
+    else -> "Uses the model's own default."
+}
 val modelLabels = listOf("" to "Default", "opus" to "Opus", "sonnet" to "Sonnet", "haiku" to "Haiku")

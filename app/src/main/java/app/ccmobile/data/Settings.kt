@@ -25,6 +25,10 @@ class Settings(context: Context) {
     var model: String
         get() = prefs.getString("model", "")!!
         set(v) = prefs.edit { putString("model", v) }
+    /** Reasoning effort passed to `--effort` (low, medium, high, xhigh, max), or blank for the model's default. */
+    var effort: String
+        get() = prefs.getString("effort", "")!!
+        set(v) = prefs.edit { putString("effort", v) }
     /** Whether new tasks start with Phone use on (only offered when the bridge has root). */
     var phone: Boolean
         get() = prefs.getBoolean("phone", false)

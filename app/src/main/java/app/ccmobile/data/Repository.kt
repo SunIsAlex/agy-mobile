@@ -92,12 +92,12 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
 
     /** Starts a task and returns its session id, or null if the bridge refused or didn't answer. */
     suspend fun start(
-        cwd: String, prompt: String, mode: String, model: String?,
+        cwd: String, prompt: String, mode: String, model: String?, effort: String?,
         phone: Boolean = false, attachments: List<PendingAttachment> = emptyList(),
     ): String? {
         settings.lastRepo = cwd
         val reply = request(
-            "start", "cwd" to cwd, "prompt" to prompt, "mode" to mode, "model" to model,
+            "start", "cwd" to cwd, "prompt" to prompt, "mode" to mode, "model" to model, "effort" to effort,
             "phone" to phone.takeIf { it }, "attachments" to attachmentsJson(attachments),
         )
         val session = reply?.obj("session") ?: return null
@@ -150,6 +150,8 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     fun reportError(message: String) { _errors.tryEmit(message) }
     fun interrupt(sid: String) = fire("interrupt", "sid" to sid)
     fun setMode(sid: String, mode: String) = fire("mode", "sid" to sid, "mode" to mode)
+    /** Changes effort from the next turn; blank goes back to the model's default. */
+    fun setEffort(sid: String, effort: String) = fire("effort", "sid" to sid, "effort" to effort.ifBlank { null })
     fun stop(sid: String) = fire("stop", "sid" to sid)
     fun archive(sid: String) = fire("archive", "sid" to sid)
     fun refreshRepos() = fire("repos")

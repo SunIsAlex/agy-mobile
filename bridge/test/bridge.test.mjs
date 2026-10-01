@@ -389,3 +389,74 @@ test('usage: plan limits from rate_limit_event, token totals from Claude Code tr
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('reasoning effort is set at launch and changed on a running session', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const said = (re) => (m) => m.ev === 'cli' && m.msg.type === 'assistant' && re.test(m.msg.message.content[0].text ?? '');
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'think', mode: 'bypassPermissions', effort: 'low' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    assert.equal(session.effort, 'low');
+    await c.next(said(/\[effort: low\]/));
+    await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
+
+    c.send({ op: 'effort', sid: session.id, effort: 'max' });
+    assert.equal((await c.next((m) => m.ev === 'session' && m.session.effort === 'max')).session.id, session.id);
+    c.send({ op: 'send', sid: session.id, text: 'harder' });
+    await c.next(said(/harder \[effort: max\]/));
+
+    // No effort means the model's default.
+    c.send({ op: 'effort', sid: session.id });
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.effort === null);
+    c.send({ op: 'send', sid: session.id, text: 'plain' });
+    await c.next(said(/plain$/));
+
+    c.send({ op: 'effort', ref: 2, sid: session.id, effort: 'huge' });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 2)).message, /Unknown effort/);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('image data in tool results is left out of events and history', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const isImageResult = (m) => m.type === 'user' && m.message.content[0]?.content?.[0]?.type === 'image';
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'take a screenshot', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    const live = (await c.next((m) => m.ev === 'cli' && isImageResult(m.msg))).msg;
+    assert.deepEqual(live.message.content[0].content[0], { type: 'image', source: { type: 'base64', media_type: 'image/png' }, omittedBytes: 300_000 });
+    assert.equal(live.tool_use_result, undefined);
+    await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
+
+    c.send({ op: 'subscribe', sid: session.id });
+    const history = await c.next((m) => m.ev === 'history');
+    assert.equal(history.events.find(isImageResult).message.content[0].content[0].omittedBytes, 300_000);
+    assert.ok(fs.statSync(path.join(stateDir, 'sessions', session.id + '.jsonl')).size < 20_000);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

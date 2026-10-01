@@ -18,6 +18,9 @@ import { READ_ONLY as PHONE_READ_ONLY } from './phone-mcp.mjs';
 const VERSION = 1;
 const MAX_EVENTS = 4000;
 const MAX_DIFF_BYTES = 1_000_000;
+// History sent when the app opens a task; older events are left out past this. The app reads
+// each message as one line, and a 61 MB history crashed it with OutOfMemoryError.
+const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 // Image types and size the Messages API takes inline; other files are only saved for Claude to Read.
@@ -62,6 +65,8 @@ const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(o
 // bypassPermissions is the app's "YOLO" mode: tools run without asking. Claude Code still sends
 // writes to settings, git and tool-configuration files to the permission handler (the app).
 const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'manual', 'dontAsk', 'bypassPermissions'];
+// Reasoning effort (--effort); null leaves it to the model's default.
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 function loadToken() {
   const file = path.join(stateDir, 'token');
@@ -84,17 +89,49 @@ function tokenMatches(candidate) {
 
 // ---------- sessions ----------
 
+// Images and documents in transcripts (screenshots, video frames Claude Reads) are base64, often
+// a megabyte each, and the app only shows text. Events keep a placeholder with the size instead.
+// tool_use_result repeats the tool output and isn't used by the app, so it's dropped.
+function slimEvent(msg) {
+  const content = msg?.message?.content;
+  if (!msg?.tool_use_result && !Array.isArray(content)) return msg;
+  const slimBlock = (b) => {
+    if (typeof b?.source?.data === 'string') {
+      return { type: b.type, source: { type: b.source.type, media_type: b.source.media_type }, omittedBytes: Math.floor(b.source.data.length * 3 / 4) };
+    }
+    if (b?.type === 'tool_result' && Array.isArray(b.content)) return { ...b, content: b.content.map(slimBlock) };
+    return b;
+  };
+  const { tool_use_result, ...rest } = msg;
+  return Array.isArray(content) ? { ...rest, message: { ...msg.message, content: content.map(slimBlock) } } : rest;
+}
+
+/** The newest events that fit in MAX_HISTORY_BYTES, with a note in place of the rest. */
+function historyEvents(events) {
+  let bytes = 0;
+  let i = events.length;
+  while (i > 0) {
+    const n = JSON.stringify(events[i - 1]).length;
+    if (bytes + n > MAX_HISTORY_BYTES) break;
+    bytes += n;
+    i--;
+  }
+  if (i === 0) return events;
+  return [{ type: 'bridge', subtype: 'note', message: `${i} earlier events not shown: too large to load on the phone.` }, ...events.slice(i)];
+}
+
 /** @type {Map<string, Session>} */
 const sessions = new Map();
 /** @type {Set<Client>} */
 const clients = new Set();
 
 class Session {
-  constructor({ id, cwd, title, model, mode, createdAt, status, phone }) {
+  constructor({ id, cwd, title, model, effort, mode, createdAt, status, phone }) {
     this.id = id;
     this.cwd = cwd;
     this.title = title;
     this.model = model ?? null;
+    this.effort = EFFORTS.includes(effort) ? effort : null;
     this.mode = mode ?? 'default';
     this.phone = !!phone; // "Phone use": the phone MCP server is attached
     this.createdAt = createdAt ?? Date.now();
@@ -111,7 +148,7 @@ class Session {
 
   summary() {
     return {
-      id: this.id, cwd: this.cwd, title: this.title, model: this.model, mode: this.mode,
+      id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
       running: this.proc !== null, phone: this.phone,
@@ -151,6 +188,7 @@ class Session {
       '--allow-dangerously-skip-permissions',
     ];
     if (this.model) args.push('--model', this.model);
+    if (this.effort) args.push('--effort', this.effort);
     // Attachments are saved here; allowing the folder lets Claude Read them without asking.
     fs.mkdirSync(this.attachmentsDir, { recursive: true, mode: 0o700 });
     args.push('--add-dir', this.attachmentsDir);
@@ -218,6 +256,7 @@ class Session {
       msg = { type: 'system', subtype: 'init', model: msg.model, cwd: msg.cwd, permissionMode: msg.permissionMode, session_id: msg.session_id };
     }
 
+    msg = slimEvent(msg);
     this.record(msg);
     sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg });
 
@@ -242,6 +281,7 @@ class Session {
 
   // Events the bridge itself adds to a transcript (errors, user prompts).
   emitLocal(msg) {
+    msg = slimEvent(msg);
     this.record(msg);
     sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg });
   }
@@ -310,6 +350,15 @@ class Session {
     this.mode = mode;
     this.writeCli({ type: 'control_request', request_id: `mode-${randomUUID()}`, request: { subtype: 'set_permission_mode', mode } });
     this.emitLocal({ type: 'bridge', subtype: 'note', message: mode === 'bypassPermissions' ? 'YOLO mode on: tools run without asking' : `Permission mode: ${mode}` });
+    this.setStatus(this.status);
+  }
+
+  setEffort(effort) {
+    this.effort = effort;
+    // Applies from the next turn; null goes back to the model's default. A stopped session
+    // picks it up from --effort when it restarts.
+    if (this.proc) this.writeCli({ type: 'control_request', request_id: `effort-${randomUUID()}`, request: { subtype: 'apply_flag_settings', settings: { effortLevel: effort } } });
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: `Reasoning effort: ${effort ?? 'model default'}` });
     this.setStatus(this.status);
   }
 
@@ -506,7 +555,7 @@ function importCliSession(id) {
   s.updatedAt = info.updatedAt;
   s.lastActivity = 'Resumed from Claude Code';
   s.cliSize = fs.statSync(file).size;
-  const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean);
+  const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean).map(slimEvent);
   events.push({ type: 'bridge', subtype: 'note', message: 'Resumed from Claude Code. New messages continue this session.' });
   s.events = events.slice(-MAX_EVENTS);
   fs.writeFileSync(s.logFile, s.events.map((e) => JSON.stringify(e) + '\n').join(''));
@@ -637,7 +686,10 @@ function loadSessions() {
       s.cliSize = meta.cliSize;
       try {
         const lines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean).slice(-MAX_EVENTS);
-        s.events = lines.map((l) => JSON.parse(l));
+        s.events = lines.map((l) => slimEvent(JSON.parse(l)));
+        // Logs written before slimEvent() existed can be tens of megabytes; rewrite them once.
+        const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
+        if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
       } catch {}
       sessions.set(s.id, s);
     } catch {}
@@ -774,7 +826,7 @@ class Client {
         if (msg.phone && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
         const mode = MODES.includes(msg.mode) ? msg.mode : 'default';
         const title = prompt.split('\n')[0].slice(0, 100) || `Attached ${attachments.map((a) => a.name).join(', ')}`.slice(0, 100);
-        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, mode, phone: !!msg.phone });
+        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, phone: !!msg.phone });
         sessions.set(session.id, session);
         this.subs.add(session.id);
         try { session.sendUser(prompt, attachments); } catch (e) {
@@ -802,7 +854,7 @@ class Client {
       case 'subscribe':
         s.syncFromCli();
         this.subs.add(s.id);
-        this.send({ ev: 'history', sid: s.id, session: s.summary(), events: s.events, pending: [...s.pending.values()] });
+        this.send({ ev: 'history', sid: s.id, session: s.summary(), events: historyEvents(s.events), pending: [...s.pending.values()] });
         break;
       case 'unsubscribe': this.subs.delete(s.id); break;
       case 'send': s.sendUser(String(msg.text ?? ''), msg.attachments); break;
@@ -816,6 +868,10 @@ class Client {
       case 'mode':
         if (!MODES.includes(msg.mode)) throw new Error(`Unknown mode: ${msg.mode}`);
         s.setMode(msg.mode);
+        break;
+      case 'effort':
+        if (msg.effort != null && !EFFORTS.includes(msg.effort)) throw new Error(`Unknown effort: ${msg.effort}`);
+        s.setEffort(msg.effort ?? null);
         break;
       case 'interrupt': s.interrupt(); break;
       case 'stop': s.stop(); break;

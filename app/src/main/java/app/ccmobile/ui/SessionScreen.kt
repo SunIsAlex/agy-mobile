@@ -97,7 +97,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             Column(Modifier.weight(1f)) {
                 Text(session?.title ?: "Task", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    listOfNotNull(session?.let { statusStyle(it.status).label }, session?.repoName, session?.costUsd?.takeIf { it > 0 }?.let { "$%.2f".format(it) })
+                    listOfNotNull(session?.let { statusStyle(it.status).label }, session?.repoName, session?.effort?.let { "${effortLabel(it)} effort" }, session?.costUsd?.takeIf { it > 0 }?.let { "$%.2f".format(it) })
                         .joinToString(" · "),
                     color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1,
                 )
@@ -106,8 +106,13 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
             var menu by remember { mutableStateOf(false) }
+            var effortMenu by remember { mutableStateOf(false) }
             Box {
                 IconBtn(R.drawable.ic_more, "More options", { menu = true })
+                DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
+                    MenuHeading("Reasoning effort, from the next reply")
+                    EffortItems(session?.effort.orEmpty()) { effortMenu = false; repository.setEffort(sid, it) }
+                }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     if (session?.mode == YOLO) {
                         DropdownMenuItem(text = { Text("Turn off YOLO (ask first)") }, onClick = { menu = false; repository.setMode(sid, "default") })
@@ -125,6 +130,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                             onClick = { menu = false; repository.setPhone(sid, true) },
                         )
                     }
+                    DropdownMenuItem(
+                        text = { Text("Reasoning effort: ${effortLabel(session?.effort)}") },
+                        onClick = { menu = false; effortMenu = true },
+                    )
                     DropdownMenuItem(text = { Text("Stop session") }, onClick = { menu = false; repository.stop(sid) })
                     DropdownMenuItem(text = { Text("Archive") }, onClick = { menu = false; repository.archive(sid); onBack() })
                 }
