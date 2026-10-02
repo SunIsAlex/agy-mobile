@@ -184,6 +184,9 @@ class Session {
     this.rejectedResetAt = null; // reset time from this turn's rejected rate_limit_event
     this.limitRetryMs = 0;
     this.resumeTimer = null;
+    // Background jobs Claude started (Bash run_in_background). Claude wakes up by itself when one
+    // finishes, but only while its process lives, so the process must not be stopped meanwhile.
+    this.background = [];
   }
 
   summary() {
@@ -192,6 +195,7 @@ class Session {
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
       running: this.proc !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
+      background: this.background.map((t) => t.description),
     };
   }
 
@@ -256,6 +260,10 @@ class Session {
       this.proc = null;
       try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
       this.pending.clear();
+      if (this.background.length) {
+        this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with Claude's process: ${this.background.map((t) => t.description).join(', ')}` });
+        this.background = [];
+      }
       if (this.status === 'stopped') { this.setStatus('stopped'); return; }
       // Waiting out a usage limit survives the process ending (e.g. the bridge shutting down).
       if (this.status === 'limited') { this.setStatus('limited'); return; }
@@ -298,6 +306,11 @@ class Session {
       return;
     }
     if (msg.type === 'system' && msg.subtype === 'thinking_tokens') return;
+    if (msg.type === 'system' && msg.subtype === 'background_tasks_changed' && Array.isArray(msg.tasks)) {
+      this.background = msg.tasks.map((t) => ({ id: t.task_id, description: t.description || 'Background task' }));
+      if (this.status === 'idle') this.lastActivity = this.background.length ? `In the background: ${this.background[0].description}` : 'Waiting for you';
+      this.setStatus(this.status);
+    }
     if (msg.type === 'system' && msg.subtype === 'init') {
       msg = { type: 'system', subtype: 'init', model: msg.model, cwd: msg.cwd, permissionMode: msg.permissionMode, session_id: msg.session_id };
     }
@@ -327,7 +340,8 @@ class Session {
       if (limited) { this.onLimited(); this.rejectedResetAt = null; return; }
       this.rejectedResetAt = null;
       this.limitRetryMs = 0;
-      this.setStatus(msg.is_error ? 'error' : 'idle', msg.is_error ? (msg.result ?? 'Error') : 'Waiting for you');
+      const waiting = this.background.length ? `In the background: ${this.background[0].description}` : 'Waiting for you';
+      this.setStatus(msg.is_error ? 'error' : 'idle', msg.is_error ? (msg.result ?? 'Error') : waiting);
     }
   }
 

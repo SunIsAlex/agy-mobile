@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Restarts a running ccm-bridge once none of its tasks is working or waiting for approval, so a
+// Restarts a running ccm-bridge once none of its tasks is working, waiting for approval or running
+// background work (stopping the bridge stops Claude's processes and the jobs they started), so a
 // task that asked for the restart (e.g. Claude shipping a bridge change) can finish its reply.
 // Keeps the old bridge's arguments (minus --pair), environment and folder; logs to bridge.log.
 //
@@ -20,14 +21,17 @@ const state = i >= 0 ? path.resolve(cwd, args[i + 1]) : path.join(env.XDG_STATE_
 const log = fs.openSync(path.join(state, 'bridge.log'), 'a');
 const say = (m) => fs.writeSync(log, `[restart ${new Date().toISOString()}] ${m}\n`);
 const busy = () => fs.readdirSync(path.join(state, 'sessions')).filter((f) => f.endsWith('.json')).some((f) => {
-  try { return ['working', 'needs_approval'].includes(JSON.parse(fs.readFileSync(path.join(state, 'sessions', f), 'utf8')).status); } catch { return false; }
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(state, 'sessions', f), 'utf8'));
+    return ['working', 'needs_approval'].includes(meta.status) || meta.background?.length > 0;
+  } catch { return false; }
 });
 const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 await sleep(5000);
 while (busy()) await sleep(3000);
-say(`all tasks idle; stopping bridge ${pid}`);
+say(`all tasks idle, no background work; stopping bridge ${pid}`);
 process.kill(pid, 'SIGTERM');
 while (alive()) await sleep(500);
 const child = spawn(node, args.filter((a) => a !== '--pair'), { cwd, env, detached: true, stdio: ['ignore', log, log] });

@@ -574,3 +574,40 @@ test('images left out of older logs are recovered from Claude Code transcripts',
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('background work is tracked until Claude wakes up for it, and reported if it is cut off', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const meta = (id) => JSON.parse(fs.readFileSync(path.join(stateDir, 'sessions', id + '.json'), 'utf8'));
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'encode in the background', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    const waiting = (await c.next((m) => m.ev === 'session' && m.session.status === 'idle' && m.session.background.length)).session;
+    assert.deepEqual(waiting.background, ['Encode the film']);
+    assert.equal(waiting.lastActivity, 'In the background: Encode the film');
+    assert.deepEqual(meta(session.id).background, ['Encode the film']); // what restart-when-idle reads
+    // Claude wakes up by itself when the job is done.
+    await c.next((m) => m.ev === 'cli' && m.msg.type === 'assistant' && m.msg.message.content[0].text === 'The encode finished.');
+    const done = (await c.next((m) => m.ev === 'session' && m.session.status === 'idle' && m.session.lastActivity === 'Waiting for you')).session;
+    assert.deepEqual(done.background, []);
+
+    // Stopping Claude's process mid-job says so.
+    c.send({ op: 'send', sid: session.id, text: 'again in the background for 60000 ms' });
+    await c.next((m) => m.ev === 'session' && m.session.background.length);
+    c.send({ op: 'stop', sid: session.id });
+    const note = await c.next((m) => m.ev === 'cli' && m.msg.type === 'bridge' && m.msg.subtype === 'error');
+    assert.match(note.msg.message, /Background work stopped with Claude's process: Encode the film/);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

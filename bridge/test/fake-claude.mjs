@@ -42,6 +42,20 @@ rl.on('line', (line) => {
       out({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your limit", total_cost_usd: 0 });
       return;
     }
+    if (said.includes('in the background')) {
+      // Like Bash with run_in_background: the turn ends, and Claude wakes up when the job is done.
+      const task = { task_id: 'bg-1', task_type: 'local_bash', description: 'Encode the film' };
+      out({ type: 'system', subtype: 'background_tasks_changed', tasks: [task] });
+      out({ type: 'result', subtype: 'success', is_error: false, result: 'started', total_cost_usd: cost });
+      const ms = Number(said.match(/(\d+) ms/)?.[1] ?? 1000);
+      setTimeout(() => {
+        out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+        out({ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'completed' });
+        out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'The encode finished.' }] } });
+        out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: cost });
+      }, ms);
+      return;
+    }
     if (said.includes('screenshot')) {
       // Like Read on an image: the result carries base64 data, and tool_use_result repeats it.
       const data = Buffer.alloc(300_000, 7).toString('base64');

@@ -107,6 +107,12 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                     color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1,
                 )
                 if (session?.mode == YOLO) Text("YOLO · runs without asking", color = C.Red, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
+                session?.background?.takeIf { it.isNotEmpty() }?.let { jobs ->
+                    Text(
+                        "In the background: ${jobs.joinToString(", ")}", color = C.TextSoft, fontSize = 12.sp, fontFamily = Mono,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 if (session?.phone == true) Text("Phone use · can operate this phone", color = C.ClayText, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
