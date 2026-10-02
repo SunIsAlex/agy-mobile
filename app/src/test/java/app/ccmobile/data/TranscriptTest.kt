@@ -108,4 +108,13 @@ class TranscriptTest {
         assertEquals(ToolState.Done, tool.state)
         assertEquals(listOf(ImageRef("0123456789abcdef0123456789abcdef.png", "image/png"), ImageRef(null, "image/jpeg")), tool.images)
     }
+
+    @Test
+    fun turnEndShowsWhatTheTurnCostNotTheRunningTotal() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"result","subtype":"success","is_error":false,"duration_ms":2000,"total_cost_usd":11.40}"""))
+        t.apply(msg("""{"type":"result","subtype":"success","is_error":false,"duration_ms":4000,"total_cost_usd":11.87}"""))
+        val ends = t.snapshot().filterIsInstance<TurnEndItem>().map { it.text }
+        assertEquals(listOf("Done · 2s · \$11.40", "Done · 4s · \$0.47"), ends)
+    }
 }

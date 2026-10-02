@@ -38,6 +38,7 @@ class Transcript(private val sid: String, private val title: String) {
     private val items = mutableListOf<Item>()
     private val live = StringBuilder()
     private var counter = 0
+    private var lastCost = 0.0 // the session's running total at the previous result
 
     fun snapshot(): List<Item> = items.toList()
 
@@ -69,14 +70,17 @@ class Transcript(private val sid: String, private val title: String) {
                 dropLive()
                 val error = msg.bool("is_error") == true
                 val seconds = (msg.num("duration_ms") ?: 0.0) / 1000
-                val cost = msg.num("total_cost_usd")
+                // total_cost_usd is the session's running total; show what this turn added.
+                val total = msg.num("total_cost_usd") ?: 0.0
+                val cost = if (total >= lastCost) total - lastCost else total
+                if (total > 0) lastCost = total
                 val text = if (error) {
                     "Stopped: " + (msg.str("result") ?: msg.str("subtype") ?: "error")
                 } else {
                     listOfNotNull(
                         "Done",
                         if (seconds > 0) "%.0fs".format(seconds) else null,
-                        cost?.takeIf { it > 0 }?.let { "$%.2f".format(it) },
+                        cost.takeIf { it >= 0.005 }?.let { "$%.2f".format(it) },
                     ).joinToString(" · ")
                 }
                 add(TurnEndItem(nextKey(), text, error))

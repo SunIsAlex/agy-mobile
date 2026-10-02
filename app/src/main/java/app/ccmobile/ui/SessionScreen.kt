@@ -102,7 +102,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             Column(Modifier.weight(1f)) {
                 Text(session?.title ?: "Task", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    listOfNotNull(session?.let { statusStyle(it.status).label }, session?.repoName, session?.effort?.let { "${effortLabel(it)} effort" }, session?.costUsd?.takeIf { it > 0 }?.let { "$%.2f".format(it) })
+                    listOfNotNull(session?.let { statusStyle(it.status).label }, session?.repoName, session?.effort?.let { "${effortLabel(it)} effort" }, session?.costUsd?.takeIf { it > 0 }?.let { "$%.2f API".format(it) })
                         .joinToString(" · "),
                     color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1,
                 )

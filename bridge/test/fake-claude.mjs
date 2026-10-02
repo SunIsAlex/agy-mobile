@@ -6,6 +6,8 @@ import readline from 'node:readline';
 const sid = process.argv[process.argv.indexOf(process.argv.includes('--resume') ? '--resume' : '--session-id') + 1];
 const out = (o) => process.stdout.write(JSON.stringify({ session_id: sid, ...o }) + '\n');
 let n = 0;
+// Like Claude Code, total_cost_usd is the session's running total, not the turn's cost.
+let cost = 0;
 let mode = process.argv[process.argv.indexOf('--permission-mode') + 1];
 let effort = process.argv.includes('--effort') ? process.argv[process.argv.indexOf('--effort') + 1] : null;
 const canBypass = process.argv.includes('--allow-dangerously-skip-permissions');
@@ -52,7 +54,7 @@ rl.on('line', (line) => {
         type: 'rate_limit_event',
         rate_limit_info: { status: 'allowed', resetsAt: 2000000000, rateLimitType: 'five_hour', unifiedWindows: { five_hour: { utilization: 0.07, resetsAt: 2000000000 }, seven_day: { utilization: 0.85, resetsAt: 2000500000 } } },
       });
-      out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01 });
+      out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: (cost = Math.round((cost + 0.01) * 100) / 100) });
       return;
     }
     out({
@@ -65,7 +67,7 @@ rl.on('line', (line) => {
   } else if (msg.type === 'control_response') {
     const r = msg.response.response;
     out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: `${r.behavior}${r.updatedPermissions ? ' always' : ''}`, is_error: r.behavior !== 'allow' }] } });
-    out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01 });
+    out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: (cost = Math.round((cost + 0.01) * 100) / 100) });
   } else if (msg.type === 'control_request' && msg.request.subtype === 'apply_flag_settings') {
     if ('effortLevel' in msg.request.settings) effort = msg.request.settings.effortLevel;
   } else if (msg.type === 'control_request' && msg.request.subtype === 'interrupt') {

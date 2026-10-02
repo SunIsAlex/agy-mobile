@@ -174,6 +174,8 @@ class Session {
     this.stdoutBuf = '';
     this.started = false; // true once claude has created this session id on disk
     this.costUsd = 0;
+    this.costBase = 0; // totals from earlier processes, if one started counting from zero
+    this.costLast = 0;
     // Usage limits: a task that hits one waits in status 'limited' until resumeAt; with
     // autoContinue it then carries on by itself.
     this.autoContinue = !!autoContinue;
@@ -319,7 +321,7 @@ class Session {
         this.setStatus('working', tool ? `${tool.name}: ${describeInput(tool.input)}` : text ? text.text.slice(0, 120) : this.lastActivity);
       }
     } else if (msg.type === 'result') {
-      this.costUsd += msg.total_cost_usd ?? 0;
+      this.addCost(msg.total_cost_usd);
       const limited = this.limitHit;
       this.limitHit = false;
       if (limited) { this.onLimited(); this.rejectedResetAt = null; return; }
@@ -415,6 +417,17 @@ class Session {
 
   interrupt() {
     this.writeCli({ type: 'control_request', request_id: `int-${randomUUID()}`, request: { subtype: 'interrupt' } });
+  }
+
+  /**
+   * total_cost_usd is the session's running total at API list prices (it carries over --resume),
+   * not the turn's cost. If it ever drops, a process started from zero: keep the earlier total.
+   */
+  addCost(total) {
+    if (!(total > 0)) return; // interrupted or limited turns report 0
+    if (total < this.costLast) this.costBase += this.costLast;
+    this.costLast = total;
+    this.costUsd = this.costBase + total;
   }
 
   /** The turn ended because a usage limit was reached: wait for it to reset. */
@@ -826,6 +839,11 @@ function loadSessions() {
       try {
         const lines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean).slice(-MAX_EVENTS);
         s.events = lines.map((l) => slimEvent(JSON.parse(l), s.id));
+        // Recount from the turn results: costUsd used to add up running totals, overstating it.
+        if (s.events.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
+          s.costUsd = 0;
+          for (const e of s.events) if (e.type === 'result') s.addCost(e.total_cost_usd);
+        }
         // Logs written before slimEvent() existed can be tens of megabytes; rewrite them once.
         const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
         if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);

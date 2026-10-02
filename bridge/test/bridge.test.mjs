@@ -426,6 +426,10 @@ test('reasoning effort is set at launch and changed on a running session', async
     c.send({ op: 'send', sid: session.id, text: 'plain' });
     await c.next(said(/plain$/));
 
+    // Three turns at a running total of 0.01, 0.02, 0.03: the task cost is the last, not the sum.
+    const idle = await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.costUsd >= 0.025);
+    assert.equal(Math.round(idle.session.costUsd * 100), 3);
+
     c.send({ op: 'effort', ref: 2, sid: session.id, effort: 'huge' });
     assert.match((await c.next((m) => m.ev === 'error' && m.ref === 2)).message, /Unknown effort/);
     c.end();
