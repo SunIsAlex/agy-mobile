@@ -28,6 +28,19 @@ function startBridge(stateDir, repoRoot, port, env = {}) {
   return new Promise((resolve) => proc.stdout.once('data', () => resolve(proc)));
 }
 
+// Stops the bridge and the keepers it started, which would otherwise keep fake-claude running.
+async function stopAll(bridge, stateDir) {
+  bridge.kill('SIGTERM');
+  if (bridge.exitCode === null && bridge.signalCode === null) await new Promise((r) => bridge.once('exit', r));
+  const dir = path.join(stateDir, 'keepers');
+  let ids = [];
+  try { ids = fs.readdirSync(dir); } catch {}
+  for (const id of ids) {
+    try { process.kill(JSON.parse(fs.readFileSync(path.join(dir, id, 'keeper.json'), 'utf8')).pid, 'SIGTERM'); } catch {}
+  }
+  await new Promise((r) => setTimeout(r, 300));
+}
+
 function connect(port) {
   const socket = net.connect(port, '127.0.0.1');
   socket.setEncoding('utf8');
@@ -153,7 +166,7 @@ test('bridge runs a session through a permission round-trip', async () => {
     assert.deepEqual(fs.readdirSync(path.join(stateDir, 'sessions')), []);
     c3.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -229,7 +242,7 @@ test('bridge resumes a Claude Code session started in a terminal', async () => {
     assert.match((await c.next((m) => m.ev === 'error' && m.ref === 4)).message, /No Claude Code session/);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -269,7 +282,7 @@ test('YOLO mode runs tools without asking, and can be switched on mid-session', 
     assert.match((await c.next((m) => m.ev === 'error' && m.ref === 3)).message, /Unknown mode/);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -329,7 +342,7 @@ test('attachments are saved for Claude, images also sent inline; phone use attac
     assert.ok(!fs.existsSync(dir));
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -390,7 +403,7 @@ test('usage: plan limits from rate_limit_event, token totals from Claude Code tr
     assert.equal((await c.next((m) => m.ev === 'limits')).limits.windows[1].utilization, 0.85);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -434,7 +447,7 @@ test('reasoning effort is set at launch and changed on a running session', async
     assert.match((await c.next((m) => m.ev === 'error' && m.ref === 2)).message, /Unknown effort/);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -475,7 +488,7 @@ test('images Claude looked at are kept on the bridge and sent on request, not in
     assert.ok(fs.statSync(path.join(stateDir, 'sessions', session.id + '.jsonl')).size < 20_000);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -531,7 +544,7 @@ test('a task stopped by a usage limit waits, and continues by itself after the r
     await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.resumeAt === null);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     await new Promise((r) => (bridge.exitCode !== null || bridge.signalCode !== null ? r() : bridge.once('exit', r)));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -570,7 +583,7 @@ test('images left out of older logs are recovered from Claude Code transcripts',
     assert.equal((await c.next((m) => m.ev === 'image')).data, data);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
@@ -600,14 +613,89 @@ test('background work is tracked until Claude wakes up for it, and reported if i
     assert.deepEqual(done.background, []);
 
     // Stopping Claude's process mid-job says so.
+    const sentAt = Date.now();
     c.send({ op: 'send', sid: session.id, text: 'again in the background for 60000 ms' });
-    await c.next((m) => m.ev === 'session' && m.session.background.length);
+    await c.next((m) => m.ev === 'session' && m.session.background.length && m.session.updatedAt >= sentAt);
     c.send({ op: 'stop', sid: session.id });
     const note = await c.next((m) => m.ev === 'cli' && m.msg.type === 'bridge' && m.msg.subtype === 'error');
     assert.match(note.msg.message, /Background work stopped with Claude's process: Encode the film/);
     c.end();
   } finally {
-    bridge.kill('SIGTERM');
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('tasks survive the bridge restarting: Claude keeps running, and nothing it said is lost', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  let bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const keeperPid = (id) => JSON.parse(fs.readFileSync(path.join(stateDir, 'keepers', id, 'keeper.json'), 'utf8')).pid;
+  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const restart = async (signal) => {
+    bridge.kill(signal);
+    if (bridge.exitCode === null && bridge.signalCode === null) await new Promise((r) => bridge.once('exit', r));
+    bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    return c;
+  };
+  const said = (text) => (m) => m.ev === 'cli' && m.msg.type === 'assistant' && m.msg.message.content[0].text === text;
+  try {
+    let c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'encode in the background for 1500 ms', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    await c.next((m) => m.ev === 'session' && m.session.background.length);
+    const pid = keeperPid(session.id);
+    c.end();
+
+    // The bridge dies without warning; the job finishes and Claude replies while it's down.
+    bridge.kill('SIGKILL');
+    await new Promise((r) => bridge.once('exit', r));
+    assert.ok(isAlive(pid));
+    await new Promise((r) => setTimeout(r, 2500));
+    c = await restart('SIGTERM');
+    c.send({ op: 'subscribe', sid: session.id });
+    const history = await c.next((m) => m.ev === 'history');
+    const texts = history.events.filter((e) => e.type === 'assistant').map((e) => e.message.content[0].text);
+    assert.equal(texts.filter((x) => x === 'The encode finished.').length, 1);
+    assert.equal(history.session.status, 'idle');
+    assert.deepEqual(history.session.background, []);
+    assert.equal(history.session.running, true);
+
+    // The same Claude process carries on.
+    c.send({ op: 'send', sid: session.id, text: 'still there?' });
+    await c.next((m) => m.ev === 'cli' && m.msg.type === 'assistant' && /Looking at: still there\?/.test(m.msg.message.content[0].text ?? ''));
+    assert.equal(keeperPid(session.id), pid);
+
+    // A permission prompt pending across a restart can still be answered.
+    c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'careful', mode: 'default' });
+    const second = (await c.next((m) => m.ev === 'started' && m.ref === 2)).session;
+    const asked = await c.next((m) => m.ev === 'approval' && m.sid === second.id);
+    c.end();
+    c = await restart('SIGTERM');
+    const again = await c.next((m) => m.ev === 'approval' && m.sid === second.id);
+    assert.equal(again.request.request_id, asked.request.request_id);
+    c.send({ op: 'subscribe', sid: second.id });
+    c.send({ op: 'permission', sid: second.id, requestId: again.request.request_id, decision: 'allow' });
+    await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.status === 'idle');
+
+    // Stopping a task still ends its Claude process.
+    c.send({ op: 'stop', sid: session.id });
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'stopped' && !m.session.running);
+    // The keeper writes exit.json just before exiting; it must not linger.
+    for (let i = 0; i < 30 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(!isAlive(pid));
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

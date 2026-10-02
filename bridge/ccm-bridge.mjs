@@ -6,7 +6,7 @@
 // Each session is a `claude -p` process speaking stream-json on stdio, with
 // permission prompts routed to the app (--permission-prompt-tool stdio).
 
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -68,6 +68,9 @@ const attachmentsDir = path.join(stateDir, 'attachments');
 const imagesDir = path.join(stateDir, 'images');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
 const phoneMcp = path.join(path.dirname(fileURLToPath(import.meta.url)), 'phone-mcp.mjs');
+const keeperJs = path.join(path.dirname(fileURLToPath(import.meta.url)), 'keeper.mjs');
+// One folder per running Claude process; see keeper.mjs and KeeperLink.
+const keepersDir = path.join(stateDir, 'keepers');
 const claudeBin = process.env.CCM_CLAUDE_BIN ?? 'claude';
 const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects');
 // bypassPermissions is the app's "YOLO" mode: tools run without asking. Claude Code still sends
@@ -93,6 +96,130 @@ function tokenMatches(candidate) {
   const a = Buffer.from(candidate);
   const b = Buffer.from(token);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// ---------- keepers ----------
+
+/**
+ * The bridge's end of a keeper (keeper.mjs), which runs one Claude process detached from the
+ * bridge. Messages go to the keeper's pipe; Claude's output is read from the keeper's `out`
+ * file, and the position after the last line handled is saved in `read`, so a restarted
+ * bridge carries on from there without losing or repeating a line.
+ */
+class KeeperLink {
+  constructor(dir, { onLine, onExit }) {
+    this.dir = dir;
+    this.onLine = onLine;
+    this.onExit = onExit;
+    this.offset = Number(readText(path.join(dir, 'read'))) || 0;
+    this.partial = Buffer.alloc(0);
+    this.closed = false;
+    this.killRequested = false;
+    this.input = null;
+    this.queued = []; // lines written before the keeper opened its pipe
+    try { this.watcher = fs.watch(dir, () => this.poll()); } catch {}
+    this.timer = setInterval(() => this.poll(true), 1000);
+    this.poll();
+  }
+
+  get info() {
+    try { return JSON.parse(fs.readFileSync(path.join(this.dir, 'keeper.json'), 'utf8')); } catch { return null; }
+  }
+
+  write(line) {
+    if (this.openInput()) this.input.write(line + '\n');
+    else this.queued.push(line + '\n');
+  }
+
+  /**
+   * Opens the keeper's pipe without blocking (a blocking open waits forever if the keeper never
+   * reads it, and a stuck thread keeps Node from exiting). Fails until the keeper is reading.
+   */
+  openInput() {
+    if (this.input) return true;
+    if (this.closed) return false;
+    let fd;
+    try { fd = fs.openSync(path.join(this.dir, 'in'), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK); } catch { return false; }
+    this.input = new net.Socket({ fd, readable: false, writable: true });
+    this.input.on('error', () => {});
+    for (const line of this.queued.splice(0)) this.input.write(line);
+    return true;
+  }
+
+  kill() {
+    const pid = this.info?.pid;
+    if (!pid) { this.killRequested = true; return; } // not started yet; poll() kills it
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+
+  /** Stops reading (the bridge is shutting down); the keeper and Claude keep running. */
+  close() {
+    this.closed = true;
+    clearInterval(this.timer);
+    this.watcher?.close();
+    this.input?.end();
+  }
+
+  poll(tick = false) {
+    if (this.closed || this.polling) return;
+    this.polling = true;
+    try {
+      // Checked before reading: once exit.json exists, `out` is complete.
+      const exited = fs.existsSync(path.join(this.dir, 'exit.json'));
+      if (this.queued.length) this.openInput();
+      this.read();
+      if (this.closed) return;
+      const pid = this.info?.pid;
+      if (pid && this.killRequested) { this.killRequested = false; try { process.kill(pid, 'SIGTERM'); } catch {} }
+      if (exited) {
+        let code = null, signal = null;
+        try { ({ code, signal } = JSON.parse(fs.readFileSync(path.join(this.dir, 'exit.json'), 'utf8'))); } catch {}
+        this.finish(code, signal);
+      } else if (tick && pid && !alive(pid) && !fs.existsSync(path.join(this.dir, 'exit.json'))) {
+        this.read();
+        this.finish(null, 'SIGKILL'); // the keeper itself was killed
+      }
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  read() {
+    let fd;
+    try { fd = fs.openSync(path.join(this.dir, 'out'), 'r'); } catch { return; }
+    try {
+      const buf = Buffer.alloc(1 << 20);
+      let n;
+      while (!this.closed && (n = fs.readSync(fd, buf, 0, buf.length, this.offset + this.partial.length)) > 0) {
+        this.partial = Buffer.concat([this.partial, buf.subarray(0, n)]);
+        let nl;
+        while (!this.closed && (nl = this.partial.indexOf(10)) >= 0) {
+          const line = this.partial.subarray(0, nl).toString('utf8');
+          this.partial = this.partial.subarray(nl + 1);
+          this.offset += nl + 1;
+          this.onLine(line);
+        }
+        fs.writeFileSync(path.join(this.dir, 'read'), String(this.offset));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  finish(code, signal) {
+    const err = readText(path.join(this.dir, 'err')).slice(-4000);
+    this.close();
+    fs.rmSync(this.dir, { recursive: true, force: true });
+    this.onExit(code, signal, err);
+  }
+}
+
+function readText(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
+}
+
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
 // ---------- sessions ----------
@@ -170,8 +297,7 @@ class Session {
     this.lastActivity = '';
     this.events = [];
     this.pending = new Map(); // request_id -> control_request message
-    this.proc = null;
-    this.stdoutBuf = '';
+    this.link = null; // KeeperLink to the running Claude process
     this.started = false; // true once claude has created this session id on disk
     this.costUsd = 0;
     this.costBase = 0; // totals from earlier processes, if one started counting from zero
@@ -194,7 +320,7 @@ class Session {
       id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
-      running: this.proc !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
+      running: this.link !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
       background: this.background.map((t) => t.description),
     };
   }
@@ -204,7 +330,8 @@ class Session {
 
   persistMeta() {
     if (this.archived) return;
-    const meta = { ...this.summary(), started: this.started, cliSize: this.cliSize };
+    // Pending requests and background jobs are restored if the keeper is still running after a restart.
+    const meta = { ...this.summary(), started: this.started, cliSize: this.cliSize, pendingRequests: [...this.pending.values()], backgroundTasks: this.background };
     fs.writeFileSync(path.join(sessionsDir, `${this.id}.json`), JSON.stringify(meta));
   }
 
@@ -222,8 +349,10 @@ class Session {
     broadcast({ ev: 'session', session: this.summary() });
   }
 
+  get keeperDir() { return path.join(keepersDir, this.id); }
+
   ensureProcess() {
-    if (this.proc) return;
+    if (this.link) return;
     const args = [
       '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--include-partial-messages', '--permission-prompt-tool', 'stdio',
@@ -243,56 +372,54 @@ class Session {
     }
     args.push(...(this.started ? ['--resume', this.id] : ['--session-id', this.id]));
 
-    const proc = spawn(claudeBin, args, { cwd: this.cwd, stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
-    this.proc = proc;
+    // Claude runs under a keeper, detached, so it outlives the bridge (see keeper.mjs).
+    const dir = this.keeperDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    execFileSync('mkfifo', ['-m', '600', path.join(dir, 'in')]);
+    spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env: process.env }).unref();
     this.started = true;
+    this.attach();
     this.persistMeta();
-    let stderr = '';
-    proc.stdout.setEncoding('utf8');
-    proc.stdout.on('data', (chunk) => this.onStdout(chunk));
-    proc.stderr.setEncoding('utf8');
-    proc.stderr.on('data', (c) => { stderr = (stderr + c).slice(-4000); });
-    proc.stdin.on('error', () => {});
-    proc.on('error', (err) => {
-      this.emitLocal({ type: 'bridge', subtype: 'error', message: `Could not start claude: ${err.message}` });
-    });
-    proc.on('exit', (code, signal) => {
-      this.proc = null;
-      try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
-      this.pending.clear();
-      if (this.background.length) {
-        this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with Claude's process: ${this.background.map((t) => t.description).join(', ')}` });
-        this.background = [];
-      }
-      if (this.status === 'stopped') { this.setStatus('stopped'); return; }
-      // Waiting out a usage limit survives the process ending (e.g. the bridge shutting down).
-      if (this.status === 'limited') { this.setStatus('limited'); return; }
-      if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
-      else {
-        this.emitLocal({ type: 'bridge', subtype: 'error', message: `claude exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
-        this.setStatus('error', 'claude exited unexpectedly');
-      }
-    });
     this.writeCli({ type: 'control_request', request_id: `init-${randomUUID()}`, request: { subtype: 'initialize' } });
   }
 
+  attach() {
+    this.link = new KeeperLink(this.keeperDir, {
+      onLine: (line) => this.onLine(line),
+      onExit: (code, signal, stderr) => this.onProcessExit(code, signal, stderr),
+    });
+  }
+
+  onProcessExit(code, signal, stderr) {
+    this.link = null;
+    try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
+    this.pending.clear();
+    if (this.background.length) {
+      this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with Claude's process: ${this.background.map((t) => t.description).join(', ')}` });
+      this.background = [];
+    }
+    if (this.status === 'stopped') { this.setStatus('stopped'); return; }
+    if (this.status === 'limited') { this.setStatus('limited'); return; }
+    if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
+    else {
+      this.emitLocal({ type: 'bridge', subtype: 'error', message: `claude exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
+      this.setStatus('error', 'claude exited unexpectedly');
+    }
+  }
+
   writeCli(obj) {
-    if (!this.proc) return false;
-    this.proc.stdin.write(JSON.stringify(obj) + '\n');
+    if (!this.link) return false;
+    this.link.write(JSON.stringify(obj));
     return true;
   }
 
-  onStdout(chunk) {
-    this.stdoutBuf += chunk;
-    let nl;
-    while ((nl = this.stdoutBuf.indexOf('\n')) >= 0) {
-      const line = this.stdoutBuf.slice(0, nl).trim();
-      this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
-      if (!line) continue;
-      let msg;
-      try { msg = JSON.parse(line); } catch { continue; }
-      this.onCliMessage(msg);
-    }
+  onLine(line) {
+    line = line.trim();
+    if (!line) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    this.onCliMessage(msg);
   }
 
   onCliMessage(msg) {
@@ -395,7 +522,7 @@ class Session {
     if (on && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
     this.phone = on;
     // MCP servers are fixed at launch; the next message restarts claude with --resume.
-    if (this.proc) this.proc.kill('SIGTERM');
+    this.link?.kill();
     this.emitLocal({ type: 'bridge', subtype: 'note', message: on ? 'Phone use on: Claude can see and operate this phone' : 'Phone use off' });
     this.setStatus(this.status === 'working' || this.status === 'needs_approval' ? 'idle' : this.status);
   }
@@ -424,7 +551,7 @@ class Session {
     this.effort = effort;
     // Applies from the next turn; null goes back to the model's default. A stopped session
     // picks it up from --effort when it restarts.
-    if (this.proc) this.writeCli({ type: 'control_request', request_id: `effort-${randomUUID()}`, request: { subtype: 'apply_flag_settings', settings: { effortLevel: effort } } });
+    if (this.link) this.writeCli({ type: 'control_request', request_id: `effort-${randomUUID()}`, request: { subtype: 'apply_flag_settings', settings: { effortLevel: effort } } });
     this.emitLocal({ type: 'bridge', subtype: 'note', message: `Reasoning effort: ${effort ?? 'model default'}` });
     this.setStatus(this.status);
   }
@@ -486,7 +613,7 @@ class Session {
   stop() {
     this.clearResume();
     this.status = 'stopped';
-    if (this.proc) this.proc.kill('SIGTERM');
+    if (this.link) this.link.kill();
     else this.setStatus('stopped');
   }
 
@@ -534,7 +661,7 @@ class Session {
   }
 
   syncFromCli() {
-    if (this.proc) return;
+    if (this.link) return;
     const file = findCliTranscript(this.id);
     if (!file) return;
     const { size, mtimeMs } = fs.statSync(file);
@@ -863,7 +990,24 @@ function loadSessions() {
         if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
       } catch {}
       sessions.set(s.id, s);
+      // Claude still running under a keeper from before the restart (or finished meanwhile):
+      // restore what was in flight and carry on reading its output.
+      if (fs.existsSync(path.join(s.keeperDir, 'keeper.json'))) {
+        s.status = meta.status ?? 'idle';
+        s.pending = new Map((meta.pendingRequests ?? []).map((r) => [r.request_id, r]));
+        s.background = meta.backgroundTasks ?? [];
+        s.attach();
+      }
     } catch {}
+  }
+  // Keepers whose session is gone (archived while the bridge was down, or never saved).
+  let dirs = [];
+  try { dirs = fs.readdirSync(keepersDir); } catch {}
+  for (const id of dirs) {
+    if (sessions.get(id)?.link) continue;
+    const dir = path.join(keepersDir, id);
+    try { process.kill(JSON.parse(fs.readFileSync(path.join(dir, 'keeper.json'), 'utf8')).pid, 'SIGTERM'); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -1096,7 +1240,8 @@ server.listen(opts.port, opts.host, () => {
 });
 
 function shutdown() {
-  for (const s of sessions.values()) if (s.proc) s.proc.kill('SIGTERM');
+  // Claude processes keep running under their keepers; the next bridge reattaches to them.
+  for (const s of sessions.values()) if (s.link) { s.link.close(); s.persistMeta(); }
   server.close();
   process.exit(0);
 }

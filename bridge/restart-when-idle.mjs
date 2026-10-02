@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Restarts a running ccm-bridge once none of its tasks is working, waiting for approval or running
-// background work (stopping the bridge stops Claude's processes and the jobs they started), so a
-// task that asked for the restart (e.g. Claude shipping a bridge change) can finish its reply.
+// background work. Claude's processes run under keepers (keeper.mjs) and survive a restart, so
+// this is only a courtesy now: the reply asking for the restart ends before the bridge goes away.
 // Keeps the old bridge's arguments (minus --pair), environment and folder; logs to bridge.log.
 //
 //   setsid nohup node bridge/restart-when-idle.mjs <bridge pid> >/dev/null 2>&1 </dev/null &

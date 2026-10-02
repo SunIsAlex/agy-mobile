@@ -60,6 +60,11 @@ tool call; tap one for full screen, then swipe, pinch or double-tap to zoom. The
 from tasks before this was added are recovered from Claude Code's own transcript the first time
 the task is opened.
 
+**Restarting the bridge** doesn't stop tasks. Each Claude process runs under a small keeper
+(`bridge/keeper.mjs`) in `keepers/<session id>/`, which outlives the bridge and saves Claude's output
+while no bridge is attached. A restarted bridge picks up where it left off: replies, permission prompts
+and background jobs that finished in the meantime all arrive. Stopping or archiving a task ends its keeper.
+
 **Usage limits:** when a task hits your plan's limit it pauses ("Usage limit") with the reset time.
 Turn on *Continue after usage limits reset* (Settings for new tasks, or the switch on the paused
 task) and the bridge sends "Continue where you left off" a minute after the reset, even across a
