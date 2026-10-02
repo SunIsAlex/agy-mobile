@@ -195,7 +195,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 onAlways = { repository.answer(approval, allow = true, always = true) },
             )
         } else {
-            ReplyBar(onSend = { text, files -> repository.sendMessage(sid, text, files) }, onError = repository::reportError)
+            ReplyBar(
+                effort = session?.effort.orEmpty(), onEffort = { repository.setEffort(sid, it) },
+                onSend = { text, files -> repository.sendMessage(sid, text, files) }, onError = repository::reportError,
+            )
         }
     }
 }
@@ -329,9 +332,24 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
 }
 
 @Composable
-private fun ReplyBar(onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit) {
+private fun ReplyBar(
+    effort: String, onEffort: (String) -> Unit,
+    onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit,
+) {
     var text by rememberSaveable { mutableStateOf("") }
     val attachments = remember { mutableStateListOf<PendingAttachment>() }
+    // Effort applies from the next reply, so it sits with the message box rather than in a menu.
+    var effortMenu by remember { mutableStateOf(false) }
+    Box(Modifier.padding(start = 12.dp, top = 8.dp)) {
+        Chip(
+            if (effort.isEmpty()) "Default effort" else "${effortLabel(effort)} effort",
+            onClick = { effortMenu = true }, on = effort.isNotEmpty(),
+        )
+        DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
+            MenuHeading("Reasoning effort, from the next reply")
+            EffortItems(effort) { effortMenu = false; onEffort(it) }
+        }
+    }
     AttachmentChips(attachments, Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp))
     Row(Modifier.padding(start = 4.dp, end = 12.dp, top = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Box(Modifier.height(52.dp), contentAlignment = Alignment.Center) { AttachButton(attachments, onError) }
