@@ -28,6 +28,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -64,6 +66,7 @@ import app.ccmobile.data.NoteItem
 import app.ccmobile.data.PendingAttachment
 import app.ccmobile.data.PermissionItem
 import app.ccmobile.data.Repository
+import app.ccmobile.data.SessionSummary
 import app.ccmobile.data.ToolItem
 import app.ccmobile.data.ToolState
 import app.ccmobile.data.TurnEndItem
@@ -83,6 +86,8 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
     val items = allItems[sid]
     val approval = approvals.firstOrNull { it.sid == sid }
     val working = session?.status == "working"
+    val loadImage: ImageLoader = remember(sid) { { ref -> repository.image(sid, ref) } }
+    var viewing by remember { mutableStateOf<Pair<ToolItem, Int>?>(null) }
 
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
@@ -134,6 +139,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                         text = { Text("Reasoning effort: ${effortLabel(session?.effort)}") },
                         onClick = { menu = false; effortMenu = true },
                     )
+                    DropdownMenuItem(
+                        text = { Text(if (session?.autoContinue == true) "Don't continue after usage limits" else "Continue after usage limits reset") },
+                        onClick = { menu = false; repository.setAutoContinue(sid, session?.autoContinue != true) },
+                    )
                     DropdownMenuItem(text = { Text("Stop session") }, onClick = { menu = false; repository.stop(sid) })
                     DropdownMenuItem(text = { Text("Archive") }, onClick = { menu = false; repository.archive(sid); onBack() })
                 }
@@ -161,11 +170,17 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                items(items, key = { it.key }) { TranscriptItem(it, onDiff) }
+                items(items, key = { it.key }) { TranscriptItem(it, onDiff, loadImage) { tool, i -> viewing = tool to i } }
                 if (working && approval == null) item(key = "thinking") { ThinkingRow(session.lastActivity) }
             }
         }
 
+        viewing?.let { (tool, index) ->
+            ImageViewer(tool.images, index, tool.summary, loadImage) { viewing = null }
+        }
+        if (session?.status == "limited" && approval == null) {
+            LimitBanner(session) { repository.setAutoContinue(sid, it) }
+        }
         if (approval != null) {
             PermissionCard(
                 approval,
@@ -180,7 +195,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
 }
 
 @Composable
-private fun TranscriptItem(item: Item, onDiff: () -> Unit) {
+private fun TranscriptItem(item: Item, onDiff: () -> Unit, loadImage: ImageLoader, onImage: (ToolItem, Int) -> Unit) {
     when (item) {
         is UserItem -> Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             if (item.text.isNotBlank()) {
@@ -198,7 +213,7 @@ private fun TranscriptItem(item: Item, onDiff: () -> Unit) {
             if (item.attachments.isNotEmpty()) SentAttachments(item.attachments)
         }
         is AssistantItem -> RichText(item.text)
-        is ToolItem -> ToolRow(item, onDiff)
+        is ToolItem -> ToolRow(item, onDiff, loadImage) { onImage(item, it) }
         is PermissionItem -> {
             val (text, color) = when (item.decision) {
                 null -> "Waiting for your approval: ${item.approval.toolName}" to C.ClayPill
@@ -221,7 +236,7 @@ private fun TranscriptItem(item: Item, onDiff: () -> Unit) {
 }
 
 @Composable
-private fun ToolRow(item: ToolItem, onDiff: () -> Unit) {
+private fun ToolRow(item: ToolItem, onDiff: () -> Unit, loadImage: ImageLoader, onImage: (Int) -> Unit) {
     var expanded by rememberSaveable(item.key) { mutableStateOf(false) }
     Column(
         Modifier
@@ -248,6 +263,9 @@ private fun ToolRow(item: ToolItem, onDiff: () -> Unit) {
             Text(item.name, color = C.TextSoft, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Text(item.summary, color = C.Muted, fontSize = 13.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             item.delta?.let { (a, r) -> DeltaText(a, r) }
+        }
+        if (item.images.isNotEmpty()) {
+            ToolImages(item.images, loadImage, onImage, Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp))
         }
         if (expanded && !item.output.isNullOrBlank()) {
             CodeBlock(
@@ -337,5 +355,42 @@ private fun ReplyBar(onSend: (String, List<PendingAttachment>) -> Unit, onError:
                 .semantics { contentDescription = "Send" },
             contentAlignment = Alignment.Center,
         ) { CcIcon(R.drawable.ic_send, if (canSend) C.Bg else C.Faint) }
+    }
+}
+
+/** Shown while a usage limit pauses the task: when it resets, and whether Claude continues then. */
+@Composable
+private fun LimitBanner(session: SessionSummary, onAutoContinue: (Boolean) -> Unit) {
+    val at = session.resumeAt?.let { resetTime(it) }
+    Row(
+        Modifier
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(C.Card)
+            .border(1.dp, C.Border, RoundedCornerShape(14.dp))
+            .padding(start = 14.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        CcIcon(R.drawable.ic_alert, C.Amber, 18.dp)
+        Column(Modifier.weight(1f)) {
+            Text(session.lastActivity.ifBlank { "Usage limit reached" }, color = C.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(
+                when {
+                    session.autoContinue && at != null -> "Claude continues by itself at $at."
+                    at != null -> "Resets around $at. Send a message then, or continue automatically."
+                    else -> "Send a message to try again."
+                },
+                color = C.Muted, fontSize = 12.sp, lineHeight = 16.sp,
+            )
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Switch(
+                checked = session.autoContinue, onCheckedChange = onAutoContinue,
+                colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.Bg),
+            )
+            Text("Auto", color = C.Muted, fontSize = 11.sp)
+        }
     }
 }

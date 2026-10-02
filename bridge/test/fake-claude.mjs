@@ -32,6 +32,14 @@ rl.on('line', (line) => {
     const eff = effort ? ` [effort: ${effort}]` : '';
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Looking at: ${said}${mcp}${eff}` }] } });
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: `tool-${n}`, name: 'Bash', input: { command: 'touch x' } }] } });
+    if (said.includes('hit the limit')) {
+      // What Claude Code prints when a plan limit stops a turn.
+      const resetsAt = Math.ceil(Date.now() / 1000) + 2;
+      out({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt, rateLimitType: 'five_hour', unifiedWindows: { five_hour: { utilization: 1, resetsAt }, seven_day: { utilization: 0.4, resetsAt: resetsAt + 86400 } } } });
+      out({ type: 'assistant', message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: "You've hit your limit" }] }, error: 'rate_limit' });
+      out({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your limit", total_cost_usd: 0 });
+      return;
+    }
     if (said.includes('screenshot')) {
       // Like Read on an image: the result carries base64 data, and tool_use_result repeats it.
       const data = Buffer.alloc(300_000, 7).toString('base64');

@@ -31,8 +31,14 @@ data class SessionSummary(
     val running: Boolean = false,
     /** Phone use: Claude can see and operate the phone the bridge runs on. */
     val phone: Boolean = false,
+    /** Continue by itself once a usage limit resets. */
+    val autoContinue: Boolean = false,
+    /** When a task stopped by a usage limit can go on (status "limited"), epoch ms. */
+    val resumeAt: Long? = null,
 ) {
     val isActive: Boolean get() = status == "working" || status == "needs_approval"
+    /** Not finished: working, waiting for approval, or paused by a usage limit. */
+    val isOpen: Boolean get() = isActive || status == "limited"
     val repoName: String get() = cwd.trimEnd('/').substringAfterLast('/')
 }
 

@@ -11,6 +11,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import app.ccmobile.MainActivity
+import app.ccmobile.ui.resetTime
 import app.ccmobile.R
 import app.ccmobile.data.Approval
 import app.ccmobile.data.SessionSummary
@@ -121,6 +122,28 @@ object Notifier {
             .setContentText(session.title)
             .setSubText(session.repoName)
             .setStyle(NotificationCompat.BigTextStyle().bigText(listOf(session.title, session.lastActivity).filter { it.isNotBlank() }.joinToString("\n")))
+            .setContentIntent(openSessionIntent(context, session.id))
+            .setAutoCancel(true)
+            .build()
+        @Suppress("MissingPermission")
+        NotificationManagerCompat.from(context).notify(session.id, TASK_ID, notification)
+    }
+
+    /** Replaces a task's working notification when a usage limit pauses it. */
+    fun showLimited(context: Context, session: SessionSummary) {
+        if (!canPost(context)) return
+        val at = session.resumeAt?.let { resetTime(it) }
+        val text = when {
+            session.autoContinue && at != null -> "Continues by itself at $at."
+            at != null -> "Resets around $at. Open the task to continue."
+            else -> "Open the task to continue."
+        }
+        val notification = NotificationCompat.Builder(context, CHANNEL_ACTIVITY)
+            .setSmallIcon(R.drawable.ic_alert)
+            .setContentTitle("Paused: ${session.lastActivity.ifBlank { "usage limit reached" }.lowercase()}")
+            .setContentText(text)
+            .setSubText(session.repoName)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("${session.title}\n$text"))
             .setContentIntent(openSessionIntent(context, session.id))
             .setAutoCancel(true)
             .build()

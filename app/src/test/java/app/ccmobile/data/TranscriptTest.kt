@@ -98,4 +98,14 @@ class TranscriptTest {
         t.apply(msg("""{"type":"user","message":{"role":"user","content":""},"local":true,"attachments":[{"name":"shot.jpg","mime":"image/jpeg","size":9,"path":"/a/shot.jpg"},{"name":"log.txt","mime":"text/plain","size":2,"path":"/a/log.txt"}]}"""))
         assertEquals(UserItem("i0", "", listOf("shot.jpg", "log.txt")), t.snapshot().single())
     }
+
+    @Test
+    fun toolResultsKeepTheImagesTheyReturned() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Read","input":{"file_path":"/r/frame.png"}}]}}"""))
+        t.apply(msg("""{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":[{"type":"image","source":{"type":"base64","media_type":"image/png"},"omittedBytes":5,"ref":"0123456789abcdef0123456789abcdef.png"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg"},"omittedBytes":5,"missing":true}]}]}}"""))
+        val tool = t.snapshot().single() as ToolItem
+        assertEquals(ToolState.Done, tool.state)
+        assertEquals(listOf(ImageRef("0123456789abcdef0123456789abcdef.png", "image/png"), ImageRef(null, "image/jpeg")), tool.images)
+    }
 }

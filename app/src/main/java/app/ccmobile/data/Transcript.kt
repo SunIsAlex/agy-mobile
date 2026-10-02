@@ -11,6 +11,10 @@ sealed interface Item {
 data class UserItem(override val key: String, val text: String, val attachments: List<String> = emptyList()) : Item
 data class AssistantItem(override val key: String, val text: String, val streaming: Boolean = false) : Item
 enum class ToolState { Running, Done, Failed }
+
+/** An image a tool returned; [ref] fetches it from the bridge, null if the bridge didn't keep it. */
+data class ImageRef(val ref: String?, val mime: String)
+
 data class ToolItem(
     override val key: String,
     val name: String,
@@ -18,6 +22,7 @@ data class ToolItem(
     val delta: Pair<Int, Int>?,
     val state: ToolState = ToolState.Running,
     val output: String? = null,
+    val images: List<ImageRef> = emptyList(),
 ) : Item
 
 /** [decision] is null while waiting, else "allow", "deny" or "cancelled". */
@@ -126,6 +131,7 @@ class Transcript(private val sid: String, private val title: String) {
                         items[index] = tool.copy(
                             state = if (block.bool("is_error") == true) ToolState.Failed else ToolState.Done,
                             output = contentText(block["content"]).take(MAX_OUTPUT),
+                            images = imagesIn(block["content"]),
                         )
                     }
                 }
@@ -133,6 +139,14 @@ class Transcript(private val sid: String, private val title: String) {
             else -> {}
         }
     }
+
+    /** Image placeholders in a tool_result's content (the bridge replaces the data with a ref). */
+    private fun imagesIn(content: kotlinx.serialization.json.JsonElement?): List<ImageRef> =
+        (content as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { block ->
+            (block as? JsonObject)?.takeIf { it.str("type") == "image" }?.let {
+                ImageRef(it.str("ref"), it.obj("source")?.str("media_type") ?: "image/png")
+            }
+        }
 
     /** Names of files the bridge saved with this message (its `attachments` field). */
     private fun attachmentNames(msg: JsonObject) = msg.arr("attachments").orEmpty().mapNotNull { (it as? JsonObject)?.str("name") }

@@ -254,7 +254,7 @@ private fun LevelTag(text: String, fg: Color, bg: Color) {
 }
 
 /** "3:30 PM" today, "Fri 9:00 AM" within a week, else "Oct 12". */
-private fun resetTime(epochMs: Long, now: Long): String {
+fun resetTime(epochMs: Long, now: Long = System.currentTimeMillis()): String {
     val zone = ZoneId.systemDefault()
     val at = Instant.ofEpochMilli(epochMs).atZone(zone)
     val days = at.toLocalDate().toEpochDay() - Instant.ofEpochMilli(now).atZone(zone).toLocalDate().toEpochDay()

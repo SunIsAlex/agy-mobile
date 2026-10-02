@@ -124,6 +124,7 @@ fun statusStyle(status: String): StatusStyle = when (status) {
     "working" -> StatusStyle("Working", C.TextSoft, C.Surface2, C.TextSoft)
     "idle" -> StatusStyle("Ready to review", C.GreenPill, C.GreenBg, C.Green)
     "error" -> StatusStyle("Error", C.Red, C.DelBg, C.Red)
+    "limited" -> StatusStyle("Usage limit", C.Amber, C.AmberBg, C.Amber)
     else -> StatusStyle("Stopped", C.Muted, C.Surface2, C.Faint)
 }
 

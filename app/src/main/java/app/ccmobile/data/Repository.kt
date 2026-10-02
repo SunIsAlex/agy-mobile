@@ -16,6 +16,10 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import java.util.TimeZone
+import android.util.Base64
+import android.util.LruCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 data class DiffState(
     val loading: Boolean = false,
@@ -60,6 +64,10 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     val foreground = MutableStateFlow(false)
 
     private val transcripts = HashMap<String, Transcript>()
+    // Images are about a megabyte each; keep the recent ones so scrolling back doesn't refetch.
+    private val imageCache = object : LruCache<String, ByteArray>(32 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ByteArray) = value.size
+    }
     private val open = mutableSetOf<String>()
     private var nextRef = 1
     private val waiting = HashMap<Int, CompletableDeferred<JsonObject?>>()
@@ -94,11 +102,12 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     suspend fun start(
         cwd: String, prompt: String, mode: String, model: String?, effort: String?,
         phone: Boolean = false, attachments: List<PendingAttachment> = emptyList(),
+        autoContinue: Boolean = settings.autoContinue,
     ): String? {
         settings.lastRepo = cwd
         val reply = request(
             "start", "cwd" to cwd, "prompt" to prompt, "mode" to mode, "model" to model, "effort" to effort,
-            "phone" to phone.takeIf { it }, "attachments" to attachmentsJson(attachments),
+            "phone" to phone.takeIf { it }, "autoContinue" to autoContinue.takeIf { it }, "attachments" to attachmentsJson(attachments),
         )
         val session = reply?.obj("session") ?: return null
         val summary = json.decodeFromJsonElement(SessionSummary.serializer(), session)
@@ -134,6 +143,16 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         return json.decodeFromJsonElement(Usage.serializer(), reply)
     }
 
+    /** An image Claude looked at in session [sid], fetched from the bridge (see Transcript.imagesIn). */
+    suspend fun image(sid: String, ref: String): ByteArray? {
+        imageCache.get(ref)?.let { return it }
+        val reply = call("image", quiet = true, "sid" to sid, "image" to ref) ?: return null
+        val data = reply.str("data") ?: return null
+        val bytes = withContext(Dispatchers.Default) { Base64.decode(data, Base64.DEFAULT) }
+        imageCache.put(ref, bytes)
+        return bytes
+    }
+
     fun refreshClaudeSessions() = fire("claude_sessions")
 
     fun open(sid: String) {
@@ -147,6 +166,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     fun sendMessage(sid: String, text: String, attachments: List<PendingAttachment> = emptyList()) =
         fire("send", "sid" to sid, "text" to text, "attachments" to attachmentsJson(attachments))
     fun setPhone(sid: String, on: Boolean) = fire("phone", "sid" to sid, "on" to on)
+    fun setAutoContinue(sid: String, on: Boolean) = fire("auto_continue", "sid" to sid, "on" to on)
     fun reportError(message: String) { _errors.tryEmit(message) }
     fun interrupt(sid: String) = fire("interrupt", "sid" to sid)
     fun setMode(sid: String, mode: String) = fire("mode", "sid" to sid, "mode" to mode)

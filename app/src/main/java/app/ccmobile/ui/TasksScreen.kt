@@ -95,8 +95,8 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
     val attachments = remember { mutableStateListOf<PendingAttachment>() }
     val scope = rememberCoroutineScope()
 
-    val active = sessions.filter { it.isActive }
-    val done = sessions.filterNot { it.isActive }
+    val active = sessions.filter { it.isOpen }
+    val done = sessions.filterNot { it.isOpen }
     val shown = if (tab == 0) active else done
 
     LaunchedEffect(tab, conn is ConnState.Connected) {

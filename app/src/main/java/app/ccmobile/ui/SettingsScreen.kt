@@ -64,6 +64,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var mode by remember { mutableStateOf(settings.mode) }
     var model by remember { mutableStateOf(settings.model) }
     var effort by remember { mutableStateOf(settings.effort) }
+    var autoContinue by remember { mutableStateOf(settings.autoContinue) }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -127,6 +128,12 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 Text(effortDescription(effort), color = C.Muted, fontSize = 13.sp)
             }
 
+            SwitchRow(
+                "Continue after usage limits reset",
+                "When a task hits your plan's limit, Claude picks it up again once the limit resets. You can change this per task.",
+                autoContinue,
+            ) { autoContinue = it; settings.autoContinue = it }
+
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -157,6 +164,27 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SwitchRow(title: String, detail: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(C.Card)
+            .border(1.dp, C.Border, RoundedCornerShape(14.dp))
+            .clickable(role = Role.Switch) { onChange(!checked) }
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+            Text(detail, color = C.Muted, fontSize = 12.sp)
+        }
+        Switch(checked = checked, onCheckedChange = null, colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.Bg))
     }
 }
 

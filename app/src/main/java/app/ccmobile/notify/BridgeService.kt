@@ -83,6 +83,8 @@ class BridgeService : LifecycleService() {
             val session = sessions.firstOrNull { it.id == sid }
             if (connected && !foreground && session != null && session.status in setOf("idle", "error")) {
                 Notifier.showFinished(this, session)
+            } else if (connected && !foreground && session?.status == "limited") {
+                Notifier.showLimited(this, session)
             } else {
                 Notifier.cancelTask(this, sid)
             }

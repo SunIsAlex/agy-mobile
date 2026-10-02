@@ -53,7 +53,12 @@ function connect(port) {
       return new Promise((resolve, reject) => {
         const w = { pred, resolve };
         waiters.push(w);
-        setTimeout(() => reject(new Error("timed out at " + where)), ms).unref();
+        setTimeout(() => {
+          // A timed-out waiter must not swallow a later message.
+          const j = waiters.indexOf(w);
+          if (j >= 0) waiters.splice(j, 1);
+          reject(new Error("timed out at " + where));
+        }, ms).unref();
       });
     },
     closed: new Promise((r) => socket.on('close', r)),
@@ -430,7 +435,7 @@ test('reasoning effort is set at launch and changed on a running session', async
   }
 });
 
-test('image data in tool results is left out of events and history', async () => {
+test('images Claude looked at are kept on the bridge and sent on request, not inline', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
   const stateDir = path.join(tmp, 'state');
   const repo = path.join(tmp, 'repos', 'demo');
@@ -446,14 +451,119 @@ test('image data in tool results is left out of events and history', async () =>
     c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'take a screenshot', mode: 'bypassPermissions' });
     const { session } = await c.next((m) => m.ev === 'started');
     const live = (await c.next((m) => m.ev === 'cli' && isImageResult(m.msg))).msg;
-    assert.deepEqual(live.message.content[0].content[0], { type: 'image', source: { type: 'base64', media_type: 'image/png' }, omittedBytes: 300_000 });
+    const placeholder = live.message.content[0].content[0];
+    assert.match(placeholder.ref, /^[0-9a-f]{32}\.png$/);
+    assert.deepEqual({ ...placeholder, ref: undefined }, { type: 'image', source: { type: 'base64', media_type: 'image/png' }, omittedBytes: 300_000, ref: undefined });
     assert.equal(live.tool_use_result, undefined);
+    c.send({ op: 'image', ref: 5, sid: session.id, image: placeholder.ref });
+    const fetched = await c.next((m) => m.ev === 'image' && m.ref === 5);
+    assert.equal(fetched.mime, 'image/png');
+    assert.deepEqual(Buffer.from(fetched.data, 'base64'), Buffer.alloc(300_000, 7));
+    for (const image of ['../token', 'nope.png']) {
+      c.send({ op: 'image', ref: 6, sid: session.id, image });
+      assert.equal((await c.next((m) => m.ev === 'error' && m.ref === 6)).ref, 6);
+    }
     await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
 
     c.send({ op: 'subscribe', sid: session.id });
     const history = await c.next((m) => m.ev === 'history');
     assert.equal(history.events.find(isImageResult).message.content[0].content[0].omittedBytes, 300_000);
     assert.ok(fs.statSync(path.join(stateDir, 'sessions', session.id + '.jsonl')).size < 20_000);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a task stopped by a usage limit waits, and continues by itself after the reset when asked to', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const env = { CCM_LIMIT_GRACE_MS: '0' };
+  let bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, env);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const continued = (m) => m.ev === 'cli' && m.msg.type === 'assistant' && /Looking at: Your usage limit has reset/.test(m.msg.message.content[0].text ?? '');
+  try {
+    let c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+
+    // Off by default: the task waits for the user even after the reset.
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hit the limit', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    const limited = (await c.next((m) => m.ev === 'session' && m.session.status === 'limited')).session;
+    assert.equal(limited.lastActivity, 'Usage limit reached');
+    assert.ok(limited.resumeAt > Date.now() && limited.resumeAt < Date.now() + 4000);
+    assert.equal(limited.autoContinue, false);
+    await assert.rejects(c.next(continued, 3000), /timed out/);
+    // Turning it on after the reset continues straight away.
+    c.send({ op: 'auto_continue', sid: session.id, on: true });
+    await c.next(continued, 5000);
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle' && m.session.resumeAt === null);
+
+    // On from the start, and the wait survives a bridge restart.
+    c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'hit the limit again', mode: 'bypassPermissions', autoContinue: true });
+    const second = (await c.next((m) => m.ev === 'started' && m.ref === 2)).session;
+    await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.status === 'limited');
+    c.end();
+    bridge.kill('SIGTERM');
+    await new Promise((r) => bridge.once('exit', r));
+    bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, env);
+    c = connect(port);
+    c.send({ op: 'hello', token });
+    const restored = (await c.next((m) => m.ev === 'sessions')).sessions.find((s) => s.id === second.id);
+    assert.equal(restored.status, 'limited');
+    c.send({ op: 'subscribe', sid: second.id });
+    await c.next(continued, 6000);
+    await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.status === 'idle');
+
+    // Sending a message yourself cancels the wait.
+    c.send({ op: 'send', sid: second.id, text: 'hit the limit once more' });
+    await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.status === 'limited');
+    c.send({ op: 'send', sid: second.id, text: 'never mind' });
+    await c.next((m) => m.ev === 'session' && m.session.id === second.id && m.session.resumeAt === null);
+    c.end();
+  } finally {
+    bridge.kill('SIGTERM');
+    await new Promise((r) => (bridge.exitCode !== null || bridge.signalCode !== null ? r() : bridge.once('exit', r)));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('images left out of older logs are recovered from Claude Code transcripts', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const id = '11111111-2222-3333-4444-555555555555';
+  const data = Buffer.from('frame-bytes').toString('base64');
+  const block = (extra) => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', ...extra } });
+  const result = (images) => ({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: images }] } });
+  // The bridge's log, slimmed before images were kept: a placeholder without a ref.
+  fs.mkdirSync(path.join(stateDir, 'sessions'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'sessions', id + '.json'), JSON.stringify({ id, cwd: repo, title: 'Old', started: true }));
+  fs.writeFileSync(path.join(stateDir, 'sessions', id + '.jsonl'), JSON.stringify(result([{ ...block(), omittedBytes: 11 }])) + '\n');
+  // Claude Code's transcript still has the data.
+  const projects = path.join(tmp, 'claude-config', 'projects', '-demo');
+  fs.mkdirSync(projects, { recursive: true });
+  fs.writeFileSync(path.join(projects, id + '.jsonl'), JSON.stringify({ ...result([block({ data })]), uuid: 'u1', cwd: repo }) + '\n');
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'subscribe', sid: id });
+    const history = await c.next((m) => m.ev === 'history');
+    const image = history.events[0].message.content[0].content[0].ref;
+    assert.match(image, /^[0-9a-f]{32}\.jpg$/);
+    c.send({ op: 'image', ref: 1, sid: id, image });
+    assert.equal((await c.next((m) => m.ev === 'image')).data, data);
     c.end();
   } finally {
     bridge.kill('SIGTERM');

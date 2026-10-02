@@ -7,7 +7,7 @@
 // permission prompts routed to the app (--permission-prompt-tool stdio).
 
 import { spawn, execFile } from 'node:child_process';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -21,6 +21,12 @@ const MAX_DIFF_BYTES = 1_000_000;
 // History sent when the app opens a task; older events are left out past this. The app reads
 // each message as one line, and a 61 MB history crashed it with OutOfMemoryError.
 const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
+// Sent for the user when a task continues after a usage limit resets.
+const CONTINUE_PROMPT = 'Your usage limit has reset. Continue where you left off.';
+// When a limit's reset time is unknown, retry after this long, doubling up to an hour.
+const LIMIT_RETRY_MS = 10 * 60_000;
+// Wait this long past a reset before continuing, so the first request isn't refused again.
+const LIMIT_GRACE_MS = Number(process.env.CCM_LIMIT_GRACE_MS ?? 60_000);
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 // Image types and size the Messages API takes inline; other files are only saved for Claude to Read.
@@ -58,6 +64,8 @@ const opts = parseArgs(process.argv.slice(2));
 const stateDir = opts.stateDir ?? path.join(process.env.XDG_STATE_HOME ?? path.join(os.homedir(), '.local', 'state'), 'ccm-bridge');
 const sessionsDir = path.join(stateDir, 'sessions');
 const attachmentsDir = path.join(stateDir, 'attachments');
+// Images Claude looked at, per session, named by content hash (see saveImage()).
+const imagesDir = path.join(stateDir, 'images');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
 const phoneMcp = path.join(path.dirname(fileURLToPath(import.meta.url)), 'phone-mcp.mjs');
 const claudeBin = process.env.CCM_CLAUDE_BIN ?? 'claude';
@@ -89,15 +97,37 @@ function tokenMatches(candidate) {
 
 // ---------- sessions ----------
 
+const IMAGE_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const IMAGE_REF = /^[0-9a-f]{32}\.(png|jpg|gif|webp)$/;
+const IMAGE_MIME = Object.fromEntries(Object.entries(IMAGE_EXT).map(([m, e]) => [e, m]));
+
+/** Saves a base64 image for [sid] and returns its ref (file name), or null for other types. */
+function saveImage(sid, mediaType, data) {
+  const ext = IMAGE_EXT[mediaType];
+  if (!ext || !sid) return null;
+  const ref = `${createHash('sha256').update(data).digest('hex').slice(0, 32)}.${ext}`;
+  const file = path.join(imagesDir, sid, ref);
+  if (!fs.existsSync(file)) {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, Buffer.from(data, 'base64'), { mode: 0o600 });
+  }
+  return ref;
+}
+
 // Images and documents in transcripts (screenshots, video frames Claude Reads) are base64, often
-// a megabyte each, and the app only shows text. Events keep a placeholder with the size instead.
+// a megabyte each, too much to send with every message. Images are saved to disk and events keep
+// a placeholder with a ref the app can fetch ('image' op); other data is only described.
 // tool_use_result repeats the tool output and isn't used by the app, so it's dropped.
-function slimEvent(msg) {
+function slimEvent(msg, sid) {
   const content = msg?.message?.content;
   if (!msg?.tool_use_result && !Array.isArray(content)) return msg;
   const slimBlock = (b) => {
     if (typeof b?.source?.data === 'string') {
-      return { type: b.type, source: { type: b.source.type, media_type: b.source.media_type }, omittedBytes: Math.floor(b.source.data.length * 3 / 4) };
+      const ref = b.type === 'image' ? saveImage(sid, b.source.media_type, b.source.data) : null;
+      return {
+        type: b.type, source: { type: b.source.type, media_type: b.source.media_type },
+        omittedBytes: Math.floor(b.source.data.length * 3 / 4), ...(ref ? { ref } : {}),
+      };
     }
     if (b?.type === 'tool_result' && Array.isArray(b.content)) return { ...b, content: b.content.map(slimBlock) };
     return b;
@@ -126,7 +156,7 @@ const sessions = new Map();
 const clients = new Set();
 
 class Session {
-  constructor({ id, cwd, title, model, effort, mode, createdAt, status, phone }) {
+  constructor({ id, cwd, title, model, effort, mode, createdAt, status, phone, autoContinue, resumeAt }) {
     this.id = id;
     this.cwd = cwd;
     this.title = title;
@@ -144,6 +174,14 @@ class Session {
     this.stdoutBuf = '';
     this.started = false; // true once claude has created this session id on disk
     this.costUsd = 0;
+    // Usage limits: a task that hits one waits in status 'limited' until resumeAt; with
+    // autoContinue it then carries on by itself.
+    this.autoContinue = !!autoContinue;
+    this.resumeAt = resumeAt ?? null;
+    this.limitHit = false; // this turn ended on a rate_limit error
+    this.rejectedResetAt = null; // reset time from this turn's rejected rate_limit_event
+    this.limitRetryMs = 0;
+    this.resumeTimer = null;
   }
 
   summary() {
@@ -151,7 +189,7 @@ class Session {
       id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
-      running: this.proc !== null, phone: this.phone,
+      running: this.proc !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
     };
   }
 
@@ -217,6 +255,8 @@ class Session {
       try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
       this.pending.clear();
       if (this.status === 'stopped') { this.setStatus('stopped'); return; }
+      // Waiting out a usage limit survives the process ending (e.g. the bridge shutting down).
+      if (this.status === 'limited') { this.setStatus('limited'); return; }
       if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
       else {
         this.emitLocal({ type: 'bridge', subtype: 'error', message: `claude exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
@@ -250,13 +290,17 @@ class Session {
     if (msg.type === 'control_response') return;
     // Partial deltas are forwarded live but not stored; the final message replaces them.
     if (msg.type === 'stream_event') { sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg }); return; }
-    if (msg.type === 'rate_limit_event') { onRateLimit(msg.rate_limit_info); return; }
+    if (msg.type === 'rate_limit_event') {
+      onRateLimit(msg.rate_limit_info);
+      if (msg.rate_limit_info?.status === 'rejected') this.rejectedResetAt = limitResetAt(msg.rate_limit_info);
+      return;
+    }
     if (msg.type === 'system' && msg.subtype === 'thinking_tokens') return;
     if (msg.type === 'system' && msg.subtype === 'init') {
       msg = { type: 'system', subtype: 'init', model: msg.model, cwd: msg.cwd, permissionMode: msg.permissionMode, session_id: msg.session_id };
     }
 
-    msg = slimEvent(msg);
+    msg = slimEvent(msg, this.id);
     this.record(msg);
     sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg });
 
@@ -268,6 +312,7 @@ class Session {
       this.pending.delete(msg.request_id);
       if (this.pending.size === 0 && this.status === 'needs_approval') this.setStatus('working');
     } else if (msg.type === 'assistant') {
+      if (msg.error === 'rate_limit') this.limitHit = true;
       const tool = msg.message?.content?.find((c) => c.type === 'tool_use');
       const text = msg.message?.content?.find((c) => c.type === 'text');
       if (this.status !== 'needs_approval') {
@@ -275,18 +320,24 @@ class Session {
       }
     } else if (msg.type === 'result') {
       this.costUsd += msg.total_cost_usd ?? 0;
+      const limited = this.limitHit;
+      this.limitHit = false;
+      if (limited) { this.onLimited(); this.rejectedResetAt = null; return; }
+      this.rejectedResetAt = null;
+      this.limitRetryMs = 0;
       this.setStatus(msg.is_error ? 'error' : 'idle', msg.is_error ? (msg.result ?? 'Error') : 'Waiting for you');
     }
   }
 
   // Events the bridge itself adds to a transcript (errors, user prompts).
   emitLocal(msg) {
-    msg = slimEvent(msg);
+    msg = slimEvent(msg, this.id);
     this.record(msg);
     sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg });
   }
 
   sendUser(text, attachments = []) {
+    this.clearResume();
     const saved = this.saveAttachments(attachments);
     this.ensureProcess();
     let content = text;
@@ -366,7 +417,47 @@ class Session {
     this.writeCli({ type: 'control_request', request_id: `int-${randomUUID()}`, request: { subtype: 'interrupt' } });
   }
 
+  /** The turn ended because a usage limit was reached: wait for it to reset. */
+  onLimited() {
+    const now = Date.now();
+    const resetAt = this.rejectedResetAt > now ? this.rejectedResetAt : null;
+    this.limitRetryMs = resetAt ? 0 : Math.min(this.limitRetryMs ? this.limitRetryMs * 2 : LIMIT_RETRY_MS, 60 * 60_000);
+    this.resumeAt = resetAt ? resetAt + LIMIT_GRACE_MS : now + this.limitRetryMs;
+    this.setStatus('limited', resetAt ? 'Usage limit reached' : 'Rate limited');
+    this.armResume();
+  }
+
+  armResume() {
+    clearTimeout(this.resumeTimer);
+    this.resumeTimer = null;
+    if (!this.autoContinue || this.status !== 'limited' || !this.resumeAt || this.archived) return;
+    // setTimeout can't wait longer than ~24.8 days; re-arm in steps.
+    const wait = Math.min(Math.max(this.resumeAt - Date.now(), 0), 2 ** 31 - 1);
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      if (Date.now() < this.resumeAt) return this.armResume();
+      if (this.status !== 'limited' || !this.autoContinue || this.archived) return;
+      this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Usage limit reset: continuing automatically' });
+      this.sendUser(CONTINUE_PROMPT);
+    }, wait);
+    this.resumeTimer.unref?.();
+  }
+
+  clearResume() {
+    clearTimeout(this.resumeTimer);
+    this.resumeTimer = null;
+    this.resumeAt = null;
+  }
+
+  setAutoContinue(on) {
+    this.autoContinue = on;
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: on ? 'Will continue automatically when usage limits reset' : 'Won\'t continue automatically after usage limits' });
+    this.armResume();
+    this.setStatus(this.status);
+  }
+
   stop() {
+    this.clearResume();
     this.status = 'stopped';
     if (this.proc) this.proc.kill('SIGTERM');
     else this.setStatus('stopped');
@@ -374,6 +465,47 @@ class Session {
 
   // Appends turns taken outside the bridge (e.g. `claude --resume` in a terminal) from
   // Claude Code's own transcript, picking up after the last message the bridge has seen.
+  /**
+   * Gives image placeholders that have no ref (logs slimmed before images were kept) their
+   * image back from Claude Code's transcript, which still has them. Runs once per session.
+   */
+  backfillImages() {
+    if (this.imagesBackfilled) return;
+    this.imagesBackfilled = true;
+    const missing = (b) => b?.type === 'image' && b.omittedBytes && !b.ref && !b.missing;
+    const results = (e) => (e.type === 'user' && Array.isArray(e.message?.content) ? e.message.content : [])
+      .filter((b) => b?.type === 'tool_result' && Array.isArray(b.content) && b.content.some(missing));
+    if (!this.events.some((e) => results(e).length)) return;
+    const found = new Map(); // tool_use_id -> image blocks with data
+    const file = findCliTranscript(this.id);
+    if (file) {
+      for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+        if (!line.includes('"image"')) continue;
+        let r;
+        try { r = JSON.parse(line); } catch { continue; }
+        for (const b of Array.isArray(r.message?.content) ? r.message.content : []) {
+          if (b?.type !== 'tool_result' || !Array.isArray(b.content)) continue;
+          const images = b.content.filter((x) => x?.type === 'image' && typeof x.source?.data === 'string');
+          if (images.length) found.set(b.tool_use_id, images);
+        }
+      }
+    }
+    for (const e of this.events) {
+      for (const result of results(e)) {
+        const images = found.get(result.tool_use_id) ?? [];
+        let i = 0;
+        result.content = result.content.map((b) => {
+          if (b?.type !== 'image') return b;
+          const src = images[i++];
+          if (!missing(b)) return b;
+          const ref = src ? saveImage(this.id, src.source.media_type, src.source.data) : null;
+          return ref ? { ...b, ref } : { ...b, missing: true };
+        });
+      }
+    }
+    fs.writeFileSync(this.logFile, this.events.map((e) => JSON.stringify(e) + '\n').join(''));
+  }
+
   syncFromCli() {
     if (this.proc) return;
     const file = findCliTranscript(this.id);
@@ -555,7 +687,7 @@ function importCliSession(id) {
   s.updatedAt = info.updatedAt;
   s.lastActivity = 'Resumed from Claude Code';
   s.cliSize = fs.statSync(file).size;
-  const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean).map(slimEvent);
+  const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean).map((e) => slimEvent(e, id));
   events.push({ type: 'bridge', subtype: 'note', message: 'Resumed from Claude Code. New messages continue this session.' });
   s.events = events.slice(-MAX_EVENTS);
   fs.writeFileSync(s.logFile, s.events.map((e) => JSON.stringify(e) + '\n').join(''));
@@ -571,6 +703,13 @@ function importCliSession(id) {
 const limitsFile = path.join(stateDir, 'limits.json');
 let limits = null;
 try { limits = JSON.parse(fs.readFileSync(limitsFile, 'utf8')); } catch {}
+
+/** When a rejected rate_limit_event's limit resets (ms), or null if it doesn't say. */
+function limitResetAt(info) {
+  const full = Object.values(info.unifiedWindows ?? {}).filter((w) => w?.utilization >= 1 && w.resetsAt);
+  const at = full.length ? Math.max(...full.map((w) => w.resetsAt)) : info.resetsAt;
+  return at ? at * 1000 : null;
+}
 
 function onRateLimit(info) {
   if (!info) return;
@@ -678,7 +817,7 @@ function loadSessions() {
     if (!f.endsWith('.json')) continue;
     try {
       const meta = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8'));
-      const s = new Session({ ...meta, status: meta.status === 'stopped' || meta.status === 'error' ? meta.status : 'idle' });
+      const s = new Session({ ...meta, status: ['stopped', 'error', 'limited'].includes(meta.status) ? meta.status : 'idle' });
       s.updatedAt = meta.updatedAt ?? s.createdAt;
       s.lastActivity = meta.lastActivity ?? '';
       s.costUsd = meta.costUsd ?? 0;
@@ -686,7 +825,7 @@ function loadSessions() {
       s.cliSize = meta.cliSize;
       try {
         const lines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean).slice(-MAX_EVENTS);
-        s.events = lines.map((l) => slimEvent(JSON.parse(l)));
+        s.events = lines.map((l) => slimEvent(JSON.parse(l), s.id));
         // Logs written before slimEvent() existed can be tens of megabytes; rewrite them once.
         const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
         if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
@@ -826,7 +965,7 @@ class Client {
         if (msg.phone && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
         const mode = MODES.includes(msg.mode) ? msg.mode : 'default';
         const title = prompt.split('\n')[0].slice(0, 100) || `Attached ${attachments.map((a) => a.name).join(', ')}`.slice(0, 100);
-        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, phone: !!msg.phone });
+        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, phone: !!msg.phone, autoContinue: !!msg.autoContinue });
         sessions.set(session.id, session);
         this.subs.add(session.id);
         try { session.sendUser(prompt, attachments); } catch (e) {
@@ -853,12 +992,22 @@ class Client {
       }
       case 'subscribe':
         s.syncFromCli();
+        s.backfillImages();
         this.subs.add(s.id);
         this.send({ ev: 'history', sid: s.id, session: s.summary(), events: historyEvents(s.events), pending: [...s.pending.values()] });
         break;
       case 'unsubscribe': this.subs.delete(s.id); break;
+      case 'image': {
+        const image = String(msg.image ?? '');
+        if (!IMAGE_REF.test(image)) throw new Error('Bad image ref');
+        let data;
+        try { data = fs.readFileSync(path.join(imagesDir, s.id, image)).toString('base64'); } catch { throw new Error('That image is no longer on the bridge.'); }
+        this.send({ ev: 'image', ref, sid: s.id, image, mime: IMAGE_MIME[image.split('.').pop()], data });
+        break;
+      }
       case 'send': s.sendUser(String(msg.text ?? ''), msg.attachments); break;
       case 'phone': s.setPhone(!!msg.on); break;
+      case 'auto_continue': s.setAutoContinue(!!msg.on); break;
       case 'permission':
         if (!s.answer(msg.requestId, msg.decision === 'allow' ? 'allow' : 'deny', !!msg.always, msg.message)) {
           this.send({ ev: 'error', ref, message: 'That request was already answered.' });
@@ -881,6 +1030,7 @@ class Client {
         sessions.delete(s.id);
         for (const ext of ['.json', '.jsonl']) fs.rm(path.join(sessionsDir, s.id + ext), { force: true }, () => {});
         fs.rm(s.attachmentsDir, { recursive: true, force: true }, () => {});
+        fs.rm(path.join(imagesDir, s.id), { recursive: true, force: true }, () => {});
         broadcast({ ev: 'removed', sid: s.id });
         break;
       case 'diff': this.send({ ev: 'diff', ref, sid: s.id, ...(await workingDiff(s.cwd)) }); break;
@@ -895,6 +1045,7 @@ function sendToSubscribers(sid, obj) { for (const c of clients) if (c.subs.has(s
 // ---------- main ----------
 
 loadSessions();
+for (const s of sessions.values()) s.armResume();
 phoneAvailable = await detectPhone();
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {

@@ -54,6 +54,17 @@ repo. The chip only shows when the bridge's `su -c id` returns 0 (override with 
 Max, or the model's default; passed as `--effort`). In a running task, *Reasoning effort* in the menu
 changes it from the next reply without restarting Claude. The default for new tasks is in Settings.
 
+**Images Claude looked at** (screenshots, files it Read, video frames) show as thumbnails under the
+tool call; tap one for full screen, then swipe, pinch or double-tap to zoom. The bridge keeps them in
+`images/<session id>/` and sends each one when the app asks, not inline with the transcript. Images
+from tasks before this was added are recovered from Claude Code's own transcript the first time
+the task is opened.
+
+**Usage limits:** when a task hits your plan's limit it pauses ("Usage limit") with the reset time.
+Turn on *Continue after usage limits reset* (Settings for new tasks, or the switch on the paused
+task) and the bridge sends "Continue where you left off" a minute after the reset, even across a
+bridge restart. Sending a message yourself cancels the wait.
+
 **Usage** (gauge icon on the task list): plan limits (the 5-hour and weekly windows, with reset
 times) come from the `rate_limit_event` Claude Code sends with each reply, so they appear after the
 first reply through the bridge and cover all your Claude use. Below that: tokens in and out per day,

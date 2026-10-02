@@ -29,6 +29,10 @@ class Settings(context: Context) {
     var effort: String
         get() = prefs.getString("effort", "")!!
         set(v) = prefs.edit { putString("effort", v) }
+    /** Whether new tasks continue by themselves once a usage limit resets. */
+    var autoContinue: Boolean
+        get() = prefs.getBoolean("autoContinue", false)
+        set(v) = prefs.edit { putBoolean("autoContinue", v) }
     /** Whether new tasks start with Phone use on (only offered when the bridge has root). */
     var phone: Boolean
         get() = prefs.getBoolean("phone", false)
