@@ -1023,6 +1023,146 @@ function loadSessions() {
   }
 }
 
+// ---------- processes ----------
+
+// The processes running as this user, for the app's Processes screen. Without root Android shows
+// only our own uid's entries in /proc, which is exactly Termux's processes.
+const CLK_TCK = 100; // USER_HZ, fixed on Linux and Android
+const INTERPRETERS = new Set(['node', 'python', 'python3', 'bash', 'sh', 'zsh', 'perl', 'ruby']);
+const SIGNALS = ['SIGTERM', 'SIGKILL', 'SIGSTOP', 'SIGCONT'];
+const processLogsDir = path.join(stateDir, 'process-logs');
+const cpuSamples = new Map(); // pid -> { ticks, at }
+
+function procStat(pid) {
+  const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  const close = s.lastIndexOf(')');
+  const f = s.slice(close + 2).split(' ');
+  return { state: f[0], ppid: Number(f[1]), ticks: Number(f[11]) + Number(f[12]), start: Number(f[19]) };
+}
+
+// /proc/uptime is off limits, so boot time comes from our own start time in clock ticks.
+const bootWall = Date.now() - process.uptime() * 1000 - procStat(process.pid).start * 1000 / CLK_TCK;
+
+/** A short name: the program, or interpreter plus script ("python3 render.py"), not the glibc loader. */
+function processName(args) {
+  const base = (s) => (s ?? '').split('/').pop();
+  let i = 0;
+  if (/^ld-linux/.test(base(args[0]))) i = args.findIndex((a, k) => k > 0 && !a.startsWith('-') && args[k - 1] !== '--library-path');
+  const name = base(args[Math.max(i, 0)]).replace(/-native$/, '');
+  const script = args.slice(i + 1).find((a) => !a.startsWith('-'));
+  return INTERPRETERS.has(name.replace(/[\d.]+$/, '')) && script && !script.includes(' ') ? `${name} ${base(script)}` : name;
+}
+
+function readEnviron(pid) {
+  try { return fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').filter(Boolean); } catch { return []; }
+}
+
+/**
+ * The executable a command line starts, or null. Programs that rename themselves (npm sets its
+ * title to "npm run dev ...") no longer show a runnable command, so they can't be restarted.
+ */
+function resolveProgram(arg0, env) {
+  const runnable = (f) => { try { fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; } };
+  if (!arg0 || /\s/.test(arg0)) return null;
+  if (arg0.includes('/')) return runnable(arg0) ? arg0 : null;
+  for (const dir of (env.PATH ?? process.env.PATH ?? '').split(':')) {
+    if (dir && runnable(path.join(dir, arg0))) return path.join(dir, arg0);
+  }
+  return null;
+}
+
+function envObject(pid) {
+  return Object.fromEntries(readEnviron(pid).map((kv) => [kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1)]));
+}
+
+function listProcesses() {
+  const now = Date.now();
+  const roles = new Map(); // pid -> { role, sid }
+  roles.set(process.pid, { role: 'bridge' });
+  for (const s of sessions.values()) {
+    const info = s.link?.info;
+    if (info?.pid) roles.set(info.pid, { role: 'keeper', sid: s.id });
+    if (info?.claudePid) roles.set(info.claudePid, { role: 'claude', sid: s.id });
+  }
+  const list = [];
+  for (const entry of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    try {
+      const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+      if (!args.length) continue; // kernel threads
+      const st = procStat(pid);
+      let cwd = null;
+      try { cwd = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
+      const rss = Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/VmRSS:\s+(\d+)/)?.[1] ?? 0);
+      const prev = cpuSamples.get(pid);
+      const cpu = prev && now > prev.at ? Math.max(0, ((st.ticks - prev.ticks) / CLK_TCK) / ((now - prev.at) / 1000) * 100) : null;
+      cpuSamples.set(pid, { ticks: st.ticks, at: now });
+      const env = envObject(pid);
+      const sid = env.CLAUDE_CODE_SESSION_ID ?? null;
+      list.push({
+        pid, ppid: st.ppid, name: processName(args), args, cwd, state: st.state,
+        startedAt: Math.round(bootWall + st.start * 1000 / CLK_TCK), cpuSeconds: st.ticks / CLK_TCK, cpu, rssKb: rss,
+        envSid: sid, runnable: !!resolveProgram(args[0], env), ...(roles.get(pid) ?? {}),
+      });
+    } catch {} // gone meanwhile
+  }
+  // Everything Claude started belongs to its task: by parentage, or by the session id Claude Code
+  // puts in each command's environment (which detached nohup/setsid jobs keep).
+  const byPid = new Map(list.map((p) => [p.pid, p]));
+  for (const p of list) {
+    if (p.role) continue;
+    for (let q = byPid.get(p.ppid), n = 0; q && n < 50; q = byPid.get(q.ppid), n++) {
+      if (q.role === 'claude') { p.role = 'job'; p.sid = q.sid; break; }
+    }
+    if (!p.role && p.envSid && sessions.has(p.envSid)) { p.role = 'job'; p.sid = p.envSid; p.detached = true; }
+    p.role ??= 'other';
+    delete p.envSid;
+  }
+  for (const p of list) {
+    delete p.envSid;
+    p.restartable = p.runnable && (p.role === 'job' || p.role === 'other');
+    delete p.runnable;
+  }
+  for (const pid of cpuSamples.keys()) if (!byPid.has(pid)) cpuSamples.delete(pid);
+  return list.sort((a, b) => a.startedAt - b.startedAt);
+}
+
+function ownProcess(pid) {
+  const p = listProcesses().find((x) => x.pid === pid);
+  if (!p) throw new Error('No such process (it may have ended).');
+  return p;
+}
+
+function signalProcess(pid, signal) {
+  if (!SIGNALS.includes(signal)) throw new Error(`Unknown signal: ${signal}`);
+  const p = ownProcess(pid);
+  if (p.role === 'bridge') throw new Error("That's the bridge itself.");
+  process.kill(pid, signal);
+}
+
+/** Stops a process and runs its command again in the same folder and environment; returns the new pid. */
+async function restartProcess(pid) {
+  const p = ownProcess(pid);
+  if (['bridge', 'keeper', 'claude'].includes(p.role)) throw new Error("Restart a task's Claude by stopping the task and sending it a message.");
+  const env = envObject(pid);
+  // Checked before anything is stopped, so a restart that can't work leaves the process running.
+  const program = resolveProgram(p.args[0], env);
+  if (!program) throw new Error(`Can't restart ${p.name}: it renamed itself, so its original command isn't known. Stop it and start it again from its task.`);
+  const gone = () => { try { return procStat(pid).state === 'Z'; } catch { return true; } };
+  try { process.kill(pid, 'SIGCONT'); process.kill(pid, 'SIGTERM'); } catch {}
+  for (let i = 0; i < 50 && !gone(); i++) await new Promise((r) => setTimeout(r, 100));
+  if (!gone()) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  fs.mkdirSync(processLogsDir, { recursive: true, mode: 0o700 });
+  const log = path.join(processLogsDir, `${p.name.replace(/[^\w.-]+/g, '_')}-${Date.now()}.log`);
+  const fd = fs.openSync(log, 'a', 0o600);
+  const child = spawn(program, p.args.slice(1), { argv0: p.args[0], cwd: p.cwd ?? os.homedir(), env, detached: true, stdio: ['ignore', fd, fd] });
+  fs.closeSync(fd);
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  child.unref();
+  return { pid: child.pid, log };
+}
+
 // ---------- repos & git ----------
 
 function currentBranch(repo) {
@@ -1165,6 +1305,13 @@ class Client {
         }
         session.persistMeta();
         this.send({ ev: 'started', ref, session: session.summary() });
+        break;
+      }
+      case 'processes': this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
+      case 'signal': signalProcess(Number(msg.pid), String(msg.signal)); this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
+      case 'restart_process': {
+        const started = await restartProcess(Number(msg.pid));
+        this.send({ ev: 'processes', ref, processes: listProcesses(), started });
         break;
       }
       case 'usage': this.send({ ev: 'usage', ref, limits, ...usageSummary(msg.days, msg.tzOffsetMin) }); break;

@@ -60,6 +60,12 @@ tool call; tap one for full screen, then swipe, pinch or double-tap to zoom. The
 from tasks before this was added are recovered from Claude Code's own transcript the first time
 the task is opened.
 
+**Processes** (terminal icon on the task list): everything running as Termux's user, grouped by the task
+that started it, including jobs Claude detached with nohup/setsid (found by the session id Claude Code
+puts in their environment). Each shows its command, folder, CPU, memory and age, and can be stopped,
+force-killed, paused/resumed, or restarted with the same command, folder and environment (output then
+goes to `process-logs/`). Programs that rename themselves, like npm, can't be restarted from here.
+
 **Restarting the bridge** doesn't stop tasks. Each Claude process runs under a small keeper
 (`bridge/keeper.mjs`) in `keepers/<session id>/`, which outlives the bridge and saves Claude's output
 while no bridge is attached. A restarted bridge picks up where it left off: replies, permission prompts

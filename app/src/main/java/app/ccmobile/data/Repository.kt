@@ -156,6 +156,26 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     /** Asks the bridge to continue tasks whose usage limit has reset (see ResumeAlarm). */
     suspend fun tick(): Boolean = send("tick")
 
+    /** The bridge user's processes, or null if the bridge didn't answer. */
+    suspend fun processes(): List<ProcInfo>? = call("processes", quiet = true)?.let(::processList)
+
+    /** Sends [signal] (SIGTERM, SIGKILL, SIGSTOP, SIGCONT) and returns the new list, or the bridge's error. */
+    suspend fun signal(pid: Int, signal: String): Result<List<ProcInfo>> =
+        processReply(call("signal", quiet = true, "pid" to pid, "signal" to signal))
+
+    /** Stops [pid] and runs its command again; returns the new list, or the bridge's error. */
+    suspend fun restartProcess(pid: Int): Result<List<ProcInfo>> =
+        processReply(call("restart_process", quiet = true, "pid" to pid))
+
+    private fun processList(reply: JsonObject): List<ProcInfo>? =
+        reply.arr("processes")?.let { json.decodeFromJsonElement(ListSerializer(ProcInfo.serializer()), it) }
+
+    private fun processReply(reply: JsonObject?): Result<List<ProcInfo>> = when {
+        reply == null -> Result.failure(Exception("The bridge didn't answer."))
+        reply.str("ev") == "error" -> Result.failure(Exception(reply.str("message") ?: "Failed"))
+        else -> processList(reply)?.let { Result.success(it) } ?: Result.failure(Exception("Bad reply"))
+    }
+
     fun refreshClaudeSessions() = fire("claude_sessions")
 
     fun open(sid: String) {

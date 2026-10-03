@@ -768,3 +768,76 @@ test('one bridge per state folder, and a task whose keeper vanished recovers on 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('processes: listed with their task, paused, resumed, restarted and killed', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  let job;
+  const pids = [];
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hello', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
+
+    // Like Claude running \`nohup ... &\`: detached, but carrying its session id.
+    job = spawn('sleep', ['300'], { cwd: repo, detached: true, stdio: 'ignore', env: { ...process.env, CLAUDE_CODE_SESSION_ID: session.id } });
+    job.unref();
+    pids.push(job.pid);
+    let n = 10;
+    const list = async () => { c.send({ op: 'processes', ref: ++n }); return (await c.next((m) => m.ev === 'processes' && m.ref === n)).processes; };
+    let procs = await list();
+    const find = (pid) => procs.find((p) => p.pid === pid);
+    assert.equal(procs.find((p) => p.role === 'bridge')?.pid, bridge.pid);
+    assert.equal(procs.find((p) => p.role === 'claude')?.sid, session.id);
+    assert.deepEqual([find(job.pid)?.role, find(job.pid)?.sid, find(job.pid)?.detached, find(job.pid)?.name, find(job.pid)?.cwd], ['job', session.id, true, 'sleep', repo]);
+    assert.deepEqual(find(job.pid).args, ['sleep', '300']);
+    assert.ok(Math.abs(find(job.pid).startedAt - Date.now()) < 10_000);
+    assert.ok(procs.every((p) => !('env' in p) && !('envSid' in p))); // environments stay on the bridge
+
+    c.send({ op: 'signal', ref: 20, pid: job.pid, signal: 'SIGSTOP' });
+    procs = (await c.next((m) => m.ev === 'processes' && m.ref === 20)).processes;
+    assert.equal(find(job.pid).state, 'T');
+    c.send({ op: 'signal', ref: 21, pid: job.pid, signal: 'SIGCONT' });
+    procs = (await c.next((m) => m.ev === 'processes' && m.ref === 21)).processes;
+    assert.notEqual(find(job.pid).state, 'T');
+
+    c.send({ op: 'restart_process', ref: 22, pid: job.pid });
+    const restarted = await c.next((m) => m.ev === 'processes' && m.ref === 22, 10_000);
+    const fresh = restarted.processes.find((p) => p.pid === restarted.started.pid);
+    pids.push(fresh.pid);
+    assert.ok(!restarted.processes.some((p) => p.pid === job.pid));
+    assert.deepEqual([fresh.args, fresh.cwd, fresh.sid], [['sleep', '300'], repo, session.id]);
+
+    c.send({ op: 'signal', ref: 23, pid: fresh.pid, signal: 'SIGKILL' });
+    procs = (await c.next((m) => m.ev === 'processes' && m.ref === 23)).processes;
+    assert.ok(!find(fresh.pid) || find(fresh.pid).state === 'Z');
+
+    // A program that renames itself, as npm does, can't be restarted, and a refused restart leaves it running.
+    const renamed = spawn(process.execPath, ['-e', "process.title = 'npm run dev --no-pdf'; setInterval(() => {}, 1e6)"], { detached: true, stdio: 'ignore' });
+    renamed.unref();
+    pids.push(renamed.pid);
+    await new Promise((r) => setTimeout(r, 500));
+    procs = await list();
+    assert.deepEqual([find(renamed.pid)?.name, find(renamed.pid)?.restartable], ['npm run dev --no-pdf', false]);
+    assert.equal(fresh.restartable, true);
+    c.send({ op: 'restart_process', ref: 25, pid: renamed.pid });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 25)).message, /renamed itself/);
+    process.kill(renamed.pid, 0); // still running
+
+    c.send({ op: 'signal', ref: 24, pid: bridge.pid, signal: 'SIGKILL' });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 24)).message, /the bridge itself/);
+    c.end();
+  } finally {
+    for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -43,6 +43,7 @@ import app.ccmobile.ui.SessionScreen
 import app.ccmobile.ui.SettingsScreen
 import app.ccmobile.ui.TasksScreen
 import app.ccmobile.ui.UsageScreen
+import app.ccmobile.ui.ProcessesScreen
 
 sealed interface Screen {
     data object Tasks : Screen
@@ -50,6 +51,7 @@ sealed interface Screen {
     data class Diff(val sid: String) : Screen
     data object Settings : Screen
     data object Usage : Screen
+    data object Processes : Screen
 }
 
 class Nav : ViewModel() {
@@ -153,10 +155,12 @@ private fun AppRoot(repository: Repository, nav: Nav) {
             Screen.Tasks -> TasksScreen(
                 repository, onOpen = { nav.push(Screen.Session(it)) },
                 onSettings = { nav.push(Screen.Settings) }, onUsage = { nav.push(Screen.Usage) },
+                onProcesses = { nav.push(Screen.Processes) },
             )
             is Screen.Session -> SessionScreen(repository, screen.sid, onBack = nav::pop, onDiff = { nav.push(Screen.Diff(screen.sid)) })
             is Screen.Diff -> DiffScreen(repository, screen.sid, onBack = nav::pop)
             Screen.Usage -> UsageScreen(repository, onBack = nav::pop)
+            Screen.Processes -> ProcessesScreen(repository, onBack = nav::pop, onOpenTask = { nav.push(Screen.Session(it)) })
             Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null)
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 80.dp)) {

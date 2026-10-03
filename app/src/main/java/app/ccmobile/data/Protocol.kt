@@ -91,6 +91,32 @@ data class Usage(
     val sessions: Int = 0,
 )
 
+/** A process running as the bridge's user (see listProcesses() in ccm-bridge.mjs). */
+@Serializable
+data class ProcInfo(
+    val pid: Int,
+    val ppid: Int = 0,
+    val name: String,
+    val args: List<String> = emptyList(),
+    val cwd: String? = null,
+    /** Linux state letter: R running, S sleeping, T stopped (paused), Z zombie. */
+    val state: String = "S",
+    val startedAt: Long = 0,
+    val cpuSeconds: Double = 0.0,
+    /** CPU use since the previous listing, in percent of one core; null on the first listing. */
+    val cpu: Double? = null,
+    val rssKb: Long = 0,
+    /** bridge, keeper, claude, job (started by a task's Claude) or other. */
+    val role: String = "other",
+    val sid: String? = null,
+    /** A job that left its task's process tree (nohup/setsid), found by its environment. */
+    val detached: Boolean = false,
+    /** Its command can be run again (false for programs that rename themselves, like npm). */
+    val restartable: Boolean = false,
+) {
+    val paused: Boolean get() = state == "T" || state == "t"
+}
+
 @Serializable
 data class Repo(val path: String, val name: String, val branch: String? = null)
 

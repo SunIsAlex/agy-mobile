@@ -70,7 +70,7 @@ import app.ccmobile.data.SessionSummary
 import kotlinx.coroutines.launch
 
 @Composable
-fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: () -> Unit, onUsage: () -> Unit) {
+fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: () -> Unit, onUsage: () -> Unit, onProcesses: () -> Unit) {
     val sessions by repository.sessions.collectAsStateWithLifecycle()
     val repos by repository.repos.collectAsStateWithLifecycle()
     val conn by repository.client.state.collectAsStateWithLifecycle()
@@ -144,6 +144,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
                 R.drawable.ic_gauge, if (peak >= 0.8) "Usage, ${Math.round(peak * 100)}% of a limit used" else "Usage", onUsage,
                 tint = if (peak >= 1.0) C.Red else if (peak >= 0.8) C.Amber else C.Text,
             )
+            IconBtn(R.drawable.ic_terminal, "Processes", onProcesses)
             IconBtn(R.drawable.ic_settings, "Settings", onSettings)
         }
         ConnectionBanner(conn, onSettings)
