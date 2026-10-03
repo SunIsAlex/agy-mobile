@@ -86,6 +86,27 @@ project and model over 7 or 30 days, read from Claude Code's transcripts in `~/.
 and enter host, port and token in the app's Settings. Traffic is not encrypted, so only bind a
 private network (or use an SSH tunnel to `127.0.0.1`).
 
+## Rooted phones: a Debian chroot instead of Termux
+
+On a rooted phone (KernelSU or Magisk), `chroot/ccm-chroot` sets up Debian 13 arm64 in `/data/ccm` and
+runs the bridge there on port 8766. Claude Code is the official glibc build, tools come from apt
+(node, python3, ffmpeg, git, gh, build tools…), and the bridge starts at boot without the Termux app.
+
+```sh
+sh chroot/ccm-chroot install     # ~1 GB: Debian, packages, Claude Code
+sh chroot/ccm-chroot login       # sign in to Claude Code once
+sh chroot/ccm-chroot start       # mount and start the bridge on 127.0.0.1:8766
+sh chroot/ccm-chroot pair        # pair the app with it
+sh chroot/ccm-chroot boot on     # start at boot (KernelSU/Magisk service.d)
+```
+
+Claude runs as user `claude`, which has Termux's uid, so your Termux home is mounted at its usual path
+and files keep Termux's ownership. It has no capabilities and can't gain any, but it keeps the root
+shell's SELinux domain, so this is not a sandbox: keep YOLO for tasks you trust. Phone use isn't
+available in the chroot (there's no `su` inside). `shell` opens a shell as `claude`, `stop` ends
+everything and unmounts, and `uninstall` deletes `/data/ccm` after checking nothing is still mounted.
+The Termux bridge keeps working alongside; pair with whichever you want to use.
+
 ## Build the app
 
 ```sh
@@ -143,6 +164,8 @@ the same session.
 
 - `bridge/ccm-bridge.mjs` — the bridge (Node, no dependencies); `bridge/test/` runs it against a fake CLI.
 - `bridge/phone-mcp.mjs` — the Phone use MCP server (stdio, no dependencies).
+- `bridge/keeper.mjs` — runs one Claude process detached from the bridge, so restarts don't stop tasks.
+- `chroot/ccm-chroot` — the optional Debian chroot runtime for rooted phones.
 - `app/src/main/java/app/ccmobile/data/` — socket client, repository, stream-json → transcript reducer, diff parser.
 - `app/src/main/java/app/ccmobile/ui/` — Compose screens.
 - `app/src/main/java/app/ccmobile/notify/` — foreground service and approval notifications.

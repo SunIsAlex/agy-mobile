@@ -1,0 +1,220 @@
+#!/system/bin/sh
+# ccm-chroot: a Debian arm64 chroot for Claude Code and ccm-bridge on rooted Android (KernelSU or
+# Magisk). Compared with Termux it runs the official glibc Claude Code, installs tools with apt, and
+# doesn't depend on the Termux app staying alive.
+#
+# Claude runs as user `claude`, which has Termux's uid, so the Termux home (bind-mounted at its usual
+# path) stays readable and writable and new files keep Termux's ownership. It has no capabilities and
+# can't regain any (no_new_privs); it's in Android's inet groups so it can use the network. Note that
+# processes keep the root shell's SELinux domain, so the uid and capabilities are the containment.
+#
+#   ccm-chroot install      download Debian, add the claude user, apt packages and Claude Code
+#   ccm-chroot login        run Claude Code once in a terminal to sign in (needed before tasks run)
+#   ccm-chroot start|stop   mount and start the bridge on port 8766 / stop everything and unmount
+#   ccm-chroot pair         open CC Mobile's pairing screen for this bridge
+#   ccm-chroot shell        a shell as claude inside the chroot
+#   ccm-chroot status
+#   ccm-chroot boot on|off  start at boot (KernelSU/Magisk service.d)
+#   ccm-chroot uninstall    stop, unmount, and delete /data/ccm (refuses while anything is mounted)
+#
+# Run it from Termux (it asks for root) or as root. Everything happens in the global mount namespace,
+# so mounts made at boot and by hand are the same mounts.
+set -e
+
+BASE=/data/ccm
+ROOT=$BASE/rootfs
+TERMUX_HOME=/data/data/com.termux/files/home
+PORT=${CCM_CHROOT_PORT:-8766}
+RELEASE=trixie
+IMAGES=https://images.linuxcontainers.org/images/debian/$RELEASE/arm64/default
+PACKAGES="ca-certificates curl wget git openssh-client gh nodejs npm python3 python3-pip python3-venv
+  ffmpeg imagemagick ripgrep fd-find jq less procps psmisc file unzip zip xz-utils zstd build-essential
+  pkg-config sqlite3 locales tzdata"
+
+SELF=$(readlink -f "$0")
+BB=/data/adb/ksu/bin/busybox
+[ -x "$BB" ] || BB=/data/adb/magisk/busybox
+
+die() { echo "ccm-chroot: $*" >&2; exit 1; }
+
+# Root, in init's mount namespace.
+if [ "$(id -u)" != 0 ]; then exec su -M -c "/system/bin/sh '$SELF' $*"; fi
+if [ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]; then exec "$BB" nsenter -t 1 -m -- /system/bin/sh "$SELF" "$@"; fi
+[ -x "$BB" ] || die "no busybox found (KernelSU or Magisk)"
+
+TUID=$("$BB" stat -c %u "$TERMUX_HOME" 2>/dev/null) || die "Termux home not found at $TERMUX_HOME"
+BRIDGE=$(dirname "$(dirname "$SELF")")/bridge/ccm-bridge.mjs
+[ -f "$BASE/bridge-path" ] && BRIDGE=$(cat "$BASE/bridge-path")
+STATE=$ROOT/home/claude/.local/state/ccm-bridge
+
+mounted() { "$BB" grep -q " $1 " /proc/self/mounts; }
+
+do_mount() {
+  [ -d "$ROOT/usr" ] || die "not installed; run: ccm-chroot install"
+  mkdir -p "$ROOT$TERMUX_HOME"
+  mounted "$ROOT/proc" || "$BB" mount -t proc -o hidepid=2 proc "$ROOT/proc"   # each uid sees only its own
+  mounted "$ROOT/sys" || "$BB" mount -t sysfs sysfs "$ROOT/sys"
+  mounted "$ROOT/dev" || "$BB" mount --bind /dev "$ROOT/dev"
+  mounted "$ROOT/dev/pts" || "$BB" mount --bind /dev/pts "$ROOT/dev/pts"
+  mounted "$ROOT$TERMUX_HOME" || "$BB" mount --bind "$TERMUX_HOME" "$ROOT$TERMUX_HOME"
+}
+
+do_umount() {
+  for m in "$ROOT$TERMUX_HOME" "$ROOT/dev/pts" "$ROOT/dev" "$ROOT/sys" "$ROOT/proc"; do
+    mounted "$m" && { "$BB" umount "$m" 2>/dev/null || "$BB" umount -l "$m"; }
+  done
+  if "$BB" grep -q " $ROOT[/ ]" /proc/self/mounts; then die "still mounted under $ROOT"; fi
+}
+
+# Runs a command inside the chroot as claude, without capabilities.
+as_claude() {
+  "$BB" chroot "$ROOT" /usr/bin/setpriv --reuid=claude --regid=claude --init-groups \
+    --inh-caps=-all --bounding-set=-all --no-new-privs -- \
+    /usr/bin/env -i HOME=/home/claude USER=claude LOGNAME=claude SHELL=/bin/bash LANG=C.UTF-8 \
+    TERM="${TERM:-xterm-256color}" TMPDIR=/tmp \
+    PATH=/home/claude/.local/bin:/usr/local/bin:/usr/bin:/bin "$@"
+}
+
+in_root() {
+  "$BB" chroot "$ROOT" /usr/bin/env -i HOME=/root LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
+}
+
+bridge_pid() {
+  pid=$(cat "$STATE/bridge.pid" 2>/dev/null) || return 1
+  [ -n "$pid" ] && "$BB" grep -q ccm-bridge "/proc/$pid/cmdline" 2>/dev/null && echo "$pid"
+}
+
+cmd_install() {
+  [ -d "$ROOT/usr" ] && die "already installed in $ROOT"
+  mkdir -p "$BASE"
+  chmod 755 "$BASE"
+  curl=/data/data/com.termux/files/usr/bin/curl
+  [ -x "$curl" ] || die "needs Termux's curl to download (pkg install curl)"
+  build=$("$curl" -fsSL "$IMAGES/" | "$BB" grep -o 'href="[0-9_%A-Z]*/"' | "$BB" tail -1 | "$BB" cut -d'"' -f2)
+  [ -n "$build" ] || die "couldn't find a Debian $RELEASE image"
+  echo "Downloading Debian $RELEASE arm64 ($build)…"
+  "$curl" -fL --progress-bar -o "$BASE/rootfs.tar.xz" "$IMAGES/${build}rootfs.tar.xz"
+  want=$("$curl" -fsSL "$IMAGES/${build}SHA256SUMS" | "$BB" grep ' rootfs.tar.xz$' | "$BB" cut -d' ' -f1)
+  have=$("$BB" sha256sum "$BASE/rootfs.tar.xz" | "$BB" cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$have" ] || die "checksum mismatch for rootfs.tar.xz"
+  echo "Unpacking…"
+  mkdir -p "$ROOT"
+  "$BB" xz -dc "$BASE/rootfs.tar.xz" | "$BB" tar -x -p -f - -C "$ROOT"
+  rm "$BASE/rootfs.tar.xz"
+  echo "$BRIDGE" > "$BASE/bridge-path"
+  cp "$SELF" "$BASE/ccm-chroot"
+
+  # Android has no resolv.conf to share; its own resolver isn't reachable from glibc.
+  rm -f "$ROOT/etc/resolv.conf"
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\n' > "$ROOT/etc/resolv.conf"
+  printf '127.0.0.1 localhost\n::1 localhost\n' > "$ROOT/etc/hosts"
+  do_mount
+
+  echo "Setting up users…"
+  # Android only lets members of these groups open network sockets.
+  in_root sh -c "groupadd -g 3003 aid_inet && groupadd -g 3004 aid_net_raw \
+    && usermod -a -G aid_inet,aid_net_raw root && usermod -a -G aid_inet,aid_net_raw _apt \
+    && groupadd -g $TUID claude && useradd -u $TUID -g $TUID -G aid_inet,aid_net_raw -m -d /home/claude -s /bin/bash claude"
+
+  echo "Installing packages (this takes a while)…"
+  in_root apt-get update
+  in_root apt-get install -y --no-install-recommends $PACKAGES
+  in_root sh -c "sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen >/dev/null"
+  # Debian calls it fdfind.
+  in_root ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+  echo "Installing Claude Code…"
+  as_claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+  as_claude bash -lc 'claude --version'
+  echo
+  echo "Installed. Next: ccm-chroot login (sign in once), then ccm-chroot start and ccm-chroot pair."
+}
+
+cmd_start() {
+  do_mount
+  if pid=$(bridge_pid); then echo "bridge already running (pid $pid) on port $PORT"; return; fi
+  as_claude test -x /home/claude/.local/bin/claude || die "Claude Code isn't installed in the chroot"
+  as_claude mkdir -p /home/claude/.local/state/ccm-bridge
+  # In its own session, so it outlives the su that started it.
+  "$BB" setsid /system/bin/sh "$SELF" _bridge < /dev/null > /dev/null 2>&1 &
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if pid=$(bridge_pid); then echo "bridge running (pid $pid) on 127.0.0.1:$PORT"; return; fi
+  done
+  "$BB" tail -5 "$STATE/bridge.log" 2>/dev/null
+  die "the bridge didn't start"
+}
+
+cmd_stop() {
+  # Everything whose root is the chroot: the bridge, keepers, Claude and the jobs it started.
+  for sig in TERM KILL; do
+    found=
+    for p in /proc/[0-9]*; do
+      [ "$(readlink "$p/root" 2>/dev/null)" = "$ROOT" ] || continue
+      kill -$sig "${p#/proc/}" 2>/dev/null && found=1
+    done
+    [ -n "$found" ] && [ $sig = TERM ] && sleep 3
+  done
+  do_umount
+  echo "stopped"
+}
+
+cmd_status() {
+  [ -d "$ROOT/usr" ] || { echo "not installed"; return; }
+  mounted "$ROOT$TERMUX_HOME" && echo "mounted" || echo "not mounted"
+  if pid=$(bridge_pid); then echo "bridge running (pid $pid) on 127.0.0.1:$PORT"; else echo "bridge not running"; fi
+  as_claude bash -lc 'claude --version 2>/dev/null || echo "Claude Code: not installed"' 2>/dev/null || true
+  [ -f /data/adb/service.d/ccm-chroot.sh ] && echo "starts at boot" || echo "doesn't start at boot"
+}
+
+cmd_pair() {
+  token=$(cat "$STATE/token" 2>/dev/null) || die "no token yet; run: ccm-chroot start"
+  token=$(echo "$token" | "$BB" tr -d '[:space:]')
+  url="ccmobile://pair?host=127.0.0.1&port=$PORT&token=$token"
+  am start -a android.intent.action.VIEW -d "$url" >/dev/null 2>&1 || echo "Pair link: $url"
+}
+
+cmd_boot() {
+  case "$1" in
+    on)
+      cp "$SELF" "$BASE/ccm-chroot"
+      mkdir -p /data/adb/service.d
+      cat > /data/adb/service.d/ccm-chroot.sh <<EOF
+#!/system/bin/sh
+# Starts CC Mobile's chroot bridge once Android has booted and /data is unlocked.
+until [ "\$(getprop sys.boot_completed)" = 1 ] && [ -d $TERMUX_HOME ]; do sleep 5; done
+/system/bin/sh $BASE/ccm-chroot start > $BASE/boot.log 2>&1
+EOF
+      chmod 755 /data/adb/service.d/ccm-chroot.sh
+      echo "starts at boot" ;;
+    off) rm -f /data/adb/service.d/ccm-chroot.sh; echo "doesn't start at boot" ;;
+    *) die "usage: ccm-chroot boot on|off" ;;
+  esac
+}
+
+cmd_uninstall() {
+  [ -d "$BASE" ] || { echo "not installed"; return; }
+  cmd_stop
+  # Never delete through a bind mount into the Termux home.
+  if "$BB" grep -q " $BASE[/ ]" /proc/self/mounts; then die "something is still mounted under $BASE; not deleting"; fi
+  rm -f /data/adb/service.d/ccm-chroot.sh
+  rm -rf "$BASE"
+  echo "removed $BASE"
+}
+
+case "$1" in
+  install) cmd_install ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  pair) cmd_pair ;;
+  boot) cmd_boot "$2" ;;
+  uninstall) cmd_uninstall ;;
+  shell) do_mount; as_claude bash -l ;;
+  login) do_mount; as_claude bash -lc claude ;;
+  mount) do_mount ;;
+  _bridge) as_claude sh -c "exec node '$BRIDGE' --port $PORT --roots '$TERMUX_HOME' >> /home/claude/.local/state/ccm-bridge/bridge.log 2>&1" ;;
+  umount) do_umount ;;
+  *) sed -n '2,/^set -e/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;
+esac

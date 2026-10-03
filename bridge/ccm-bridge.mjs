@@ -222,7 +222,8 @@ class KeeperLink {
           this.offset += nl + 1;
           this.onLine(line);
         }
-        fs.writeFileSync(path.join(this.dir, 'read'), String(this.offset));
+        // The folder can vanish under us (see poll()); the next tick notices and ends the link.
+        try { fs.writeFileSync(path.join(this.dir, 'read'), String(this.offset)); } catch {}
       }
     } finally {
       fs.closeSync(fd);
