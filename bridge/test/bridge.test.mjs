@@ -728,3 +728,43 @@ test('a tick from the app continues a task whose reset has passed, without waiti
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('one bridge per state folder, and a task whose keeper vanished recovers on the next message', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    // A second bridge on the same folder refuses to start.
+    const second = spawn(process.execPath, [bridgePath, '--port', String(port + 1), '--state-dir', stateDir], { env: { ...process.env, CCM_PHONE: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    second.stderr.on('data', (d) => { stderr += d; });
+    const code = await new Promise((r) => second.once('exit', r));
+    assert.equal(code, 1);
+    assert.match(stderr, /Another ccm-bridge \(pid \d+\) is already using/);
+
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'first', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
+
+    // Its keeper and folder disappear behind the bridge's back.
+    const dir = path.join(stateDir, 'keepers', session.id);
+    process.kill(JSON.parse(fs.readFileSync(path.join(dir, 'keeper.json'), 'utf8')).pid, 'SIGKILL');
+    fs.rmSync(dir, { recursive: true, force: true });
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && !m.session.running, 5000);
+
+    // The next message starts a fresh Claude instead of waiting on a pipe nobody reads.
+    c.send({ op: 'send', sid: session.id, text: 'go on' });
+    await c.next((m) => m.ev === 'cli' && m.msg.type === 'assistant' && /Looking at: go on/.test(m.msg.message.content[0].text ?? ''));
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

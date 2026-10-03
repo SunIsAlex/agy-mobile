@@ -91,6 +91,12 @@ class BridgeClientIntegrationTest {
         } finally {
             scope.cancel()
             proc.destroy()
+            proc.waitFor()
+            // Claude (here fake-claude) runs under keepers that outlive the bridge; stop them too.
+            File(tmp, "state/keepers").listFiles().orEmpty().forEach { dir ->
+                val pid = Regex("\"pid\":(\\d+)").find(File(dir, "keeper.json").takeIf { it.exists() }?.readText().orEmpty())?.groupValues?.get(1)?.toLong()
+                pid?.let { ProcessHandle.of(it).ifPresent(ProcessHandle::destroy) }
+            }
             tmp.deleteRecursively()
         }
     }

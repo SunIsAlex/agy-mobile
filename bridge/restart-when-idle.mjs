@@ -4,12 +4,15 @@
 // this is only a courtesy now: the reply asking for the restart ends before the bridge goes away.
 // Keeps the old bridge's arguments (minus --pair), environment and folder; logs to bridge.log.
 //
-//   setsid nohup node bridge/restart-when-idle.mjs <bridge pid> >/dev/null 2>&1 </dev/null &
+//   setsid nohup node bridge/restart-when-idle.mjs <bridge pid> [--now] >/dev/null 2>&1 </dev/null &
+//
+// --now skips the wait (e.g. when a task is stuck showing 'working').
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 const pid = Number(process.argv[2]);
+const now = process.argv.includes('--now');
 if (!pid) { console.error('Usage: restart-when-idle.mjs <bridge pid>'); process.exit(2); }
 const proc = (file) => fs.readFileSync(`/proc/${pid}/${file}`, 'utf8').split('\0').filter(Boolean);
 const [node, ...args] = proc('cmdline');
@@ -29,9 +32,11 @@ const busy = () => fs.readdirSync(path.join(state, 'sessions')).filter((f) => f.
 const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-await sleep(5000);
-while (busy()) await sleep(3000);
-say(`all tasks idle, no background work; stopping bridge ${pid}`);
+if (!now) {
+  await sleep(5000);
+  while (busy()) await sleep(3000);
+}
+say(now ? `restarting bridge ${pid} now` : `all tasks idle, no background work; stopping bridge ${pid}`);
 process.kill(pid, 'SIGTERM');
 while (alive()) await sleep(500);
 const child = spawn(node, args.filter((a) => a !== '--pair'), { cwd, env, detached: true, stdio: ['ignore', log, log] });

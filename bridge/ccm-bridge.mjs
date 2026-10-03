@@ -95,6 +95,21 @@ function loadToken() {
 }
 const token = loadToken();
 
+// Only one bridge may use a state folder: two would both read the keepers' output and clean up
+// each other's keepers (a second bridge started by hand while a restart was under way did that).
+const pidFile = path.join(stateDir, 'bridge.pid');
+{
+  let other = 0;
+  try { other = Number(fs.readFileSync(pidFile, 'utf8')); } catch {}
+  let running = false;
+  try { running = other > 0 && other !== process.pid && fs.readFileSync(`/proc/${other}/cmdline`, 'utf8').includes('ccm-bridge'); } catch {}
+  if (running) {
+    console.error(`Another ccm-bridge (pid ${other}) is already using ${stateDir}. Stop it first, or use a different --state-dir.`);
+    process.exit(1);
+  }
+  fs.writeFileSync(pidFile, String(process.pid));
+}
+
 function tokenMatches(candidate) {
   if (typeof candidate !== 'string') return false;
   const a = Buffer.from(candidate);
@@ -119,6 +134,7 @@ class KeeperLink {
     this.partial = Buffer.alloc(0);
     this.closed = false;
     this.killRequested = false;
+    this.since = Date.now();
     this.input = null;
     this.queued = []; // lines written before the keeper opened its pipe
     try { this.watcher = fs.watch(dir, () => this.poll()); } catch {}
@@ -182,6 +198,9 @@ class KeeperLink {
       } else if (tick && pid && !alive(pid) && !fs.existsSync(path.join(this.dir, 'exit.json'))) {
         this.read();
         this.finish(null, 'SIGKILL'); // the keeper itself was killed
+      } else if (tick && (!fs.existsSync(this.dir) || (!pid && Date.now() - this.since > 15_000))) {
+        // The folder was removed under us, or the keeper never started: nothing will ever answer.
+        this.finish(null, 'SIGKILL');
       }
     } finally {
       this.polling = false;
@@ -1237,6 +1256,7 @@ server.listen(opts.port, opts.host, () => {
 });
 
 function shutdown() {
+  try { if (Number(fs.readFileSync(pidFile, 'utf8')) === process.pid) fs.rmSync(pidFile); } catch {}
   // Claude processes keep running under their keepers; the next bridge reattaches to them.
   for (const s of sessions.values()) if (s.link) { s.link.close(); s.persistMeta(); }
   server.close();
