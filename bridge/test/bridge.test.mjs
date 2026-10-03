@@ -499,7 +499,7 @@ test('a task stopped by a usage limit waits, and continues by itself after the r
   const repo = path.join(tmp, 'repos', 'demo');
   fs.mkdirSync(repo, { recursive: true });
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const env = { CCM_LIMIT_GRACE_MS: '0' };
+  const env = { CCM_LIMIT_GRACE_MS: '0', CCM_RESUME_CHECK_MS: '200' };
   let bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, env);
   const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
   const continued = (m) => m.ev === 'cli' && m.msg.type === 'assistant' && /Looking at: Your usage limit has reset/.test(m.msg.message.content[0].text ?? '');
@@ -693,6 +693,35 @@ test('tasks survive the bridge restarting: Claude keeps running, and nothing it 
     // The keeper writes exit.json just before exiting; it must not linger.
     for (let i = 0; i < 30 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
     assert.ok(!isAlive(pid));
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a tick from the app continues a task whose reset has passed, without waiting for the next check', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  // As if the phone slept: the bridge's own check doesn't come round in time.
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_LIMIT_GRACE_MS: '0', CCM_RESUME_CHECK_MS: '3600000' });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hit the limit', mode: 'bypassPermissions', autoContinue: true });
+    const { session } = await c.next((m) => m.ev === 'started');
+    const limited = (await c.next((m) => m.ev === 'session' && m.session.status === 'limited')).session;
+    await new Promise((r) => setTimeout(r, limited.resumeAt - Date.now() + 300));
+    await assert.rejects(c.next((m) => m.ev === 'session' && m.session.status === 'working' && m.session.updatedAt > limited.updatedAt, 500), /timed out/);
+    c.send({ op: 'tick', ref: 2 });
+    await c.next((m) => m.ev === 'tock' && m.ref === 2);
+    await c.next((m) => m.ev === 'cli' && m.msg.type === 'assistant' && /Looking at: Your usage limit has reset/.test(m.msg.message.content[0].text ?? ''));
+    assert.equal(session.id, limited.id);
     c.end();
   } finally {
     await stopAll(bridge, stateDir);

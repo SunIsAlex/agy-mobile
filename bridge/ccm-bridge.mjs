@@ -27,6 +27,10 @@ const CONTINUE_PROMPT = 'Your usage limit has reset. Continue where you left off
 const LIMIT_RETRY_MS = 10 * 60_000;
 // Wait this long past a reset before continuing, so the first request isn't refused again.
 const LIMIT_GRACE_MS = Number(process.env.CCM_LIMIT_GRACE_MS ?? 60_000);
+// How often waiting tasks compare resumeAt with the wall clock. Not one long setTimeout: Node's
+// timers stop while Android is in deep sleep, so a 3-hour wait could fire hours late. The app
+// also wakes the phone at resumeAt and sends 'tick' (see ResumeAlarm in the app).
+const RESUME_CHECK_MS = Number(process.env.CCM_RESUME_CHECK_MS ?? 30_000);
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 // Image types and size the Messages API takes inline; other files are only saved for Claude to Read.
@@ -309,7 +313,6 @@ class Session {
     this.limitHit = false; // this turn ended on a rate_limit error
     this.rejectedResetAt = null; // reset time from this turn's rejected rate_limit_event
     this.limitRetryMs = 0;
-    this.resumeTimer = null;
     // Background jobs Claude started (Bash run_in_background). Claude wakes up by itself when one
     // finishes, but only while its process lives, so the process must not be stopped meanwhile.
     this.background = [];
@@ -578,35 +581,25 @@ class Session {
     this.limitRetryMs = resetAt ? 0 : Math.min(this.limitRetryMs ? this.limitRetryMs * 2 : LIMIT_RETRY_MS, 60 * 60_000);
     this.resumeAt = resetAt ? resetAt + LIMIT_GRACE_MS : now + this.limitRetryMs;
     this.setStatus('limited', resetAt ? 'Usage limit reached' : 'Rate limited');
-    this.armResume();
+    this.resumeIfDue();
   }
 
-  armResume() {
-    clearTimeout(this.resumeTimer);
-    this.resumeTimer = null;
+  /** Continues a task waiting out a usage limit once its reset time has passed, if it should. */
+  resumeIfDue() {
     if (!this.autoContinue || this.status !== 'limited' || !this.resumeAt || this.archived) return;
-    // setTimeout can't wait longer than ~24.8 days; re-arm in steps.
-    const wait = Math.min(Math.max(this.resumeAt - Date.now(), 0), 2 ** 31 - 1);
-    this.resumeTimer = setTimeout(() => {
-      this.resumeTimer = null;
-      if (Date.now() < this.resumeAt) return this.armResume();
-      if (this.status !== 'limited' || !this.autoContinue || this.archived) return;
-      this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Usage limit reset: continuing automatically' });
-      this.sendUser(CONTINUE_PROMPT);
-    }, wait);
-    this.resumeTimer.unref?.();
+    if (Date.now() < this.resumeAt) return;
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Usage limit reset: continuing automatically' });
+    this.sendUser(CONTINUE_PROMPT);
   }
 
   clearResume() {
-    clearTimeout(this.resumeTimer);
-    this.resumeTimer = null;
     this.resumeAt = null;
   }
 
   setAutoContinue(on) {
     this.autoContinue = on;
     this.emitLocal({ type: 'bridge', subtype: 'note', message: on ? 'Will continue automatically when usage limits reset' : 'Won\'t continue automatically after usage limits' });
-    this.armResume();
+    this.resumeIfDue();
     this.setStatus(this.status);
   }
 
@@ -1184,6 +1177,8 @@ class Client {
       case 'send': s.sendUser(String(msg.text ?? ''), msg.attachments); break;
       case 'phone': s.setPhone(!!msg.on); break;
       case 'auto_continue': s.setAutoContinue(!!msg.on); break;
+      // From the app's alarm at a task's resumeAt, which wakes the phone: check now.
+      case 'tick': resumeDue(); this.send({ ev: 'tock', ref }); break;
       case 'permission':
         if (!s.answer(msg.requestId, msg.decision === 'allow' ? 'allow' : 'deny', !!msg.always, msg.message)) {
           this.send({ ev: 'error', ref, message: 'That request was already answered.' });
@@ -1221,7 +1216,9 @@ function sendToSubscribers(sid, obj) { for (const c of clients) if (c.subs.has(s
 // ---------- main ----------
 
 loadSessions();
-for (const s of sessions.values()) s.armResume();
+function resumeDue() { for (const s of sessions.values()) s.resumeIfDue(); }
+resumeDue();
+setInterval(resumeDue, RESUME_CHECK_MS);
 phoneAvailable = await detectPhone();
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {

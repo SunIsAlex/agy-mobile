@@ -153,6 +153,9 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         return bytes
     }
 
+    /** Asks the bridge to continue tasks whose usage limit has reset (see ResumeAlarm). */
+    suspend fun tick(): Boolean = send("tick")
+
     fun refreshClaudeSessions() = fire("claude_sessions")
 
     fun open(sid: String) {

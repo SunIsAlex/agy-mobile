@@ -3,6 +3,7 @@ package app.ccmobile.notify
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
@@ -13,6 +14,7 @@ import app.ccmobile.R
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.SessionSummary
 import app.ccmobile.repository
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
@@ -25,6 +27,14 @@ class BridgeService : LifecycleService() {
     /** Active sessions with a working notification: when each was first seen working, and what it last showed. */
     private val working = HashMap<String, Long>()
     private val posted = HashMap<String, List<String>>()
+    // Held while Claude works or runs background jobs: with the screen off, Android's deep sleep
+    // would otherwise pause the bridge in Termux and the task with it.
+    private val wakeLock by lazy {
+        getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ccmobile:working")
+            .apply { setReferenceCounted(false) }
+    }
+    private var keepAwake = false
 
     override fun onCreate() {
         super.onCreate()
@@ -46,6 +56,25 @@ class BridgeService : LifecycleService() {
             combine(repo.client.state, repo.sessions, repo.foreground) { state, sessions, foreground ->
                 Triple(state is ConnState.Connected, sessions, foreground)
             }.collect { (connected, sessions, foreground) -> showWorking(connected, sessions, foreground) }
+        }
+        lifecycleScope.launch {
+            combine(repo.client.state, repo.sessions) { state, sessions -> (state is ConnState.Connected) to sessions }
+                .collect { (connected, sessions) ->
+                    if (!connected) return@collect // statuses are stale; keep the last decision
+                    keepAwake = sessions.any { it.status == "working" || it.background.isNotEmpty() }
+                    if (keepAwake) wakeLock.acquire(WAKE_LOCK_MS) else if (wakeLock.isHeld) wakeLock.release()
+                    ResumeAlarm.schedule(
+                        this@BridgeService,
+                        sessions.filter { it.status == "limited" && it.autoContinue }.mapNotNull { it.resumeAt }.minOrNull(),
+                    )
+                }
+        }
+        lifecycleScope.launch {
+            // The wake lock times out as a safety net; renew it while long work (an encode) goes on.
+            while (true) {
+                delay(WAKE_LOCK_MS / 2)
+                if (keepAwake) wakeLock.acquire(WAKE_LOCK_MS)
+            }
         }
         lifecycleScope.launch {
             combine(repo.client.state, repo.sessions) { state, sessions ->
@@ -99,6 +128,7 @@ class BridgeService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        if (wakeLock.isHeld) wakeLock.release()
         working.keys.forEach { Notifier.cancelTask(this, it) }
         super.onDestroy()
     }
@@ -112,6 +142,8 @@ class BridgeService : LifecycleService() {
         .build()
 
     companion object {
+        private const val WAKE_LOCK_MS = 30 * 60_000L
+
         fun start(context: Context) = ContextCompat.startForegroundService(context, Intent(context, BridgeService::class.java))
         fun stop(context: Context) = context.stopService(Intent(context, BridgeService::class.java))
     }
