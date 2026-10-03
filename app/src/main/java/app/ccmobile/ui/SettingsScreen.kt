@@ -65,6 +65,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var model by remember { mutableStateOf(settings.model) }
     var effort by remember { mutableStateOf(settings.effort) }
     var autoContinue by remember { mutableStateOf(settings.autoContinue) }
+    var keepAwake by remember { mutableStateOf(settings.keepAwake) }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -126,6 +127,21 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
             Section("Default reasoning effort") {
                 Segmented(effortShortLabels, effort, { effort = it; settings.effort = it })
                 Text(effortDescription(effort), color = C.Muted, fontSize = 13.sp)
+            }
+
+            Section("Keep phone awake while Claude works") {
+                Segmented(
+                    listOf("never" to "Never", "charging" to "Charging", "always" to "Always"), keepAwake,
+                    { keepAwake = it; settings.keepAwake = it },
+                )
+                Text(
+                    when (keepAwake) {
+                        "always" -> "Tasks keep running with the screen off, even on battery. Long renders or encodes can use a lot of battery."
+                        "never" -> "When the screen is off, Android pauses tasks until the phone wakes."
+                        else -> "Tasks keep running with the screen off while the phone charges. On battery, Android pauses them until the phone wakes."
+                    },
+                    color = C.Muted, fontSize = 13.sp,
+                )
             }
 
             SwitchRow(

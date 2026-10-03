@@ -2,7 +2,10 @@ package app.ccmobile.notify
 
 import android.content.Context
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.os.BatteryManager
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -15,6 +18,7 @@ import app.ccmobile.data.ConnState
 import app.ccmobile.data.SessionSummary
 import app.ccmobile.repository
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
@@ -35,12 +39,20 @@ class BridgeService : LifecycleService() {
             .apply { setReferenceCounted(false) }
     }
     private var keepAwake = false
+    private val charging = MutableStateFlow(false)
+    private val power = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            charging.value = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         ServiceCompat.startForeground(this, Notifier.SERVICE_ID, status("Connecting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         val repo = this.repository
         if (repo.client.state.value is ConnState.Idle) repo.connect()
+        // Sticky: delivers the current state at once, then every change (plugged in or not).
+        registerReceiver(power, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
 
         lifecycleScope.launch {
             combine(repo.approvals, repo.foreground) { approvals, foreground ->
@@ -58,10 +70,15 @@ class BridgeService : LifecycleService() {
             }.collect { (connected, sessions, foreground) -> showWorking(connected, sessions, foreground) }
         }
         lifecycleScope.launch {
-            combine(repo.client.state, repo.sessions) { state, sessions -> (state is ConnState.Connected) to sessions }
-                .collect { (connected, sessions) ->
+            combine(repo.client.state, repo.sessions, charging) { state, sessions, plugged -> Triple(state is ConnState.Connected, sessions, plugged) }
+                .collect { (connected, sessions, plugged) ->
                     if (!connected) return@collect // statuses are stale; keep the last decision
-                    keepAwake = sessions.any { it.status == "working" || it.background.isNotEmpty() }
+                    val allowed = when (repo.settings.keepAwake) {
+                        "always" -> true
+                        "never" -> false
+                        else -> plugged
+                    }
+                    keepAwake = allowed && sessions.any { it.status == "working" || it.background.isNotEmpty() }
                     if (keepAwake) wakeLock.acquire(WAKE_LOCK_MS) else if (wakeLock.isHeld) wakeLock.release()
                     ResumeAlarm.schedule(
                         this@BridgeService,
@@ -128,6 +145,7 @@ class BridgeService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        unregisterReceiver(power)
         if (wakeLock.isHeld) wakeLock.release()
         working.keys.forEach { Notifier.cancelTask(this, it) }
         super.onDestroy()

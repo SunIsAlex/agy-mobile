@@ -37,6 +37,13 @@ class Settings(context: Context) {
     var phone: Boolean
         get() = prefs.getBoolean("phone", false)
         set(v) = prefs.edit { putBoolean("phone", v) }
+    /**
+     * When to hold a wake lock while Claude works: "never", "charging" or "always". Long renders
+     * keep the CPU busy for hours, so on battery the default lets the phone sleep (pausing them).
+     */
+    var keepAwake: String
+        get() = prefs.getString("keepAwake", "charging")!!
+        set(v) = prefs.edit { putString("keepAwake", v) }
     var notify: Boolean
         get() = prefs.getBoolean("notify", true)
         set(v) = prefs.edit { putBoolean("notify", v) }
