@@ -45,6 +45,10 @@ class Settings(context: Context) {
     var keepAwake: String
         get() = prefs.getString("keepAwake", "charging")!!
         set(v) = prefs.edit { putString("keepAwake", v) }
+    /** Start this phone's bridge again through Termux when it stops (Android kills background processes). */
+    var reviveBridge: Boolean
+        get() = prefs.getBoolean("reviveBridge", true)
+        set(v) = prefs.edit { putBoolean("reviveBridge", v) }
     var notify: Boolean
         get() = prefs.getBoolean("notify", true)
         set(v) = prefs.edit { putBoolean("notify", v) }

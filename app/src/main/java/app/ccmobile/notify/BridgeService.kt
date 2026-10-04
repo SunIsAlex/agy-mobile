@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import app.ccmobile.R
+import app.ccmobile.data.BridgeLauncher
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.SessionSummary
 import app.ccmobile.repository
@@ -54,6 +55,18 @@ class BridgeService : LifecycleService() {
         // Sticky: delivers the current state at once, then every change (plugged in or not).
         registerReceiver(power, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
 
+        lifecycleScope.launch {
+            // Android kills background processes (the phantom process limit, low memory, Termux being
+            // closed). When nothing listens on this phone's bridge port any more, start it again.
+            var lastRevive = 0L
+            repo.client.state.collect { state ->
+                if (state !is ConnState.Failed || !state.refused || !repo.settings.reviveBridge) return@collect
+                val kind = BridgeLauncher.localKind(repo.settings) ?: return@collect
+                if (!BridgeLauncher.permitted(this@BridgeService) || System.currentTimeMillis() - lastRevive < 120_000) return@collect
+                lastRevive = System.currentTimeMillis()
+                runCatching { BridgeLauncher.start(this@BridgeService, kind, pair = false) }
+            }
+        }
         lifecycleScope.launch {
             combine(repo.approvals, repo.foreground) { approvals, foreground ->
                 if (foreground) emptyList() else approvals

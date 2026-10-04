@@ -67,6 +67,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var model by remember { mutableStateOf(settings.model) }
     var effort by remember { mutableStateOf(settings.effort) }
     var autoContinue by remember { mutableStateOf(settings.autoContinue) }
+    var reviveBridge by remember { mutableStateOf(settings.reviveBridge) }
     var keepAwake by remember { mutableStateOf(settings.keepAwake) }
     var starting by remember { mutableStateOf<BridgeKind?>(null) }
     var waitingFor by remember { mutableStateOf<BridgeKind?>(null) }
@@ -123,6 +124,12 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                     BridgeCard(kind, active, starting = starting == kind, onCopy = { copy(context, kind.command) }, onStart = { start(kind) })
                 }
             }
+
+            SwitchRow(
+                "Restart the bridge if it stops",
+                "Android sometimes kills background processes. When this phone's bridge stops answering, start it again through Termux.",
+                reviveBridge,
+            ) { reviveBridge = it; settings.reviveBridge = it }
 
             Section("Connect") {
                 ConnectionLine(conn)

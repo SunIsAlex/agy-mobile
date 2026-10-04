@@ -37,16 +37,23 @@ object BridgeLauncher {
     fun permitted(context: Context): Boolean =
         context.checkSelfPermission(PERMISSION) == PackageManager.PERMISSION_GRANTED
 
-    /** What Termux runs: the Termux bridge detached, so the command returns while it keeps running. */
-    private fun script(kind: BridgeKind): String = when (kind) {
+    /**
+     * What Termux runs: the Termux bridge detached, so the command returns while it keeps running.
+     * Without [pair] it starts the bridge only, so nothing opens on screen.
+     */
+    private fun script(kind: BridgeKind, pair: Boolean): String = when (kind) {
         BridgeKind.Termux -> "mkdir -p ~/.local/state/ccm-bridge && " +
-            "(setsid nohup ${kind.command} >> ~/.local/state/ccm-bridge/bridge.log 2>&1 < /dev/null &) && " +
+            "(setsid nohup ${if (pair) kind.command else kind.command.removeSuffix(" --pair")} >> ~/.local/state/ccm-bridge/bridge.log 2>&1 < /dev/null &) && " +
             "sleep 3 && tail -n 3 ~/.local/state/ccm-bridge/bridge.log"
-        BridgeKind.Chroot -> kind.command
+        BridgeKind.Chroot -> if (pair) kind.command else kind.command.substringBefore(" && ")
     }
 
-    /** Asks Termux to start [kind]; throws if Termux can't be reached. */
-    fun start(context: Context, kind: BridgeKind) {
+    /** The bridge this app is set up for, if it's one of this phone's. */
+    fun localKind(settings: Settings): BridgeKind? =
+        BridgeKind.entries.firstOrNull { it.port == settings.port }?.takeIf { settings.host == "127.0.0.1" || settings.host == "localhost" }
+
+    /** Asks Termux to start [kind] (and pair this app with it, unless not [pair]); throws if Termux can't be reached. */
+    fun start(context: Context, kind: BridgeKind, pair: Boolean = true) {
         val result = PendingIntent.getBroadcast(
             context, kind.ordinal,
             Intent(context, BridgeStartReceiver::class.java).putExtra(EXTRA_KIND, kind.name),
@@ -56,11 +63,11 @@ object BridgeLauncher {
         val intent = Intent("com.termux.RUN_COMMAND")
             .setClassName(TERMUX, "com.termux.app.RunCommandService")
             .putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash")
-            .putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script(kind)))
+            .putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script(kind, pair)))
             .putExtra("com.termux.RUN_COMMAND_WORKDIR", HOME)
             .putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
             .putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", result)
-        context.repository.expectPairing(kind.port)
+        if (pair) context.repository.expectPairing(kind.port)
         context.startService(intent)
     }
 

@@ -33,7 +33,8 @@ sealed interface ConnState {
     data object Idle : ConnState
     data object Connecting : ConnState
     data class Connected(val host: String) : ConnState
-    data class Failed(val message: String, val retrying: Boolean) : ConnState
+    /** [refused]: nothing listens on the port, so the bridge isn't running (see BridgeService). */
+    data class Failed(val message: String, val retrying: Boolean, val refused: Boolean = false) : ConnState
 }
 
 /** Longest bridge message the app reads; the bridge keeps history well under this. */
@@ -115,7 +116,7 @@ class BridgeClient(private val scope: CoroutineScope) {
                 _state.value = ConnState.Failed("The bridge closed the connection.", retrying = true)
             } catch (e: IOException) {
                 if (!currentCoroutineContext().isActive) return
-                _state.value = ConnState.Failed(describe(e, config), retrying = true)
+                _state.value = ConnState.Failed(describe(e, config), retrying = true, refused = e is ConnectException)
             } finally {
                 writer = null
                 runCatching { s.close() }
