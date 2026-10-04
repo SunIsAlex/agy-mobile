@@ -19,6 +19,12 @@
 #   ccm-chroot root on|off  let Claude run root commands on Android with su (on by default)
 #   ccm-chroot uninstall    stop, unmount, and delete /data/ccm (refuses while anything is mounted)
 #
+# Storage: the chroot keeps its own files in /data/ccm/home (claude's home; /home/claude links there),
+# separate from the Termux home. Each sees the other's at the same path: the Termux home is mounted
+# into the chroot, and /data/ccm/home is mounted into the chroot and labelled so Termux can reach it
+# (Termux also gets a ~/chroot link). Because paths match, Claude Code's session records and project
+# memory (~/.claude/projects) are shared: the chroot's is a link to Termux's. Logins stay separate.
+#
 # Run it from Termux (it asks for root) or as root. Everything happens in the global mount namespace,
 # so mounts made at boot and by hand are the same mounts.
 set -e
@@ -26,6 +32,7 @@ set -e
 BASE=/data/ccm
 ROOT=$BASE/rootfs
 TERMUX_HOME=/data/data/com.termux/files/home
+CHOME=$BASE/home
 PORT=${CCM_CHROOT_PORT:-8766}
 RELEASE=trixie
 IMAGES=https://images.linuxcontainers.org/images/debian/$RELEASE/arm64/default
@@ -59,10 +66,95 @@ do_mount() {
   mounted "$ROOT/dev" || "$BB" mount --bind /dev "$ROOT/dev"
   mounted "$ROOT/dev/pts" || "$BB" mount --bind /dev/pts "$ROOT/dev/pts"
   mounted "$ROOT$TERMUX_HOME" || "$BB" mount --bind "$TERMUX_HOME" "$ROOT$TERMUX_HOME"
+  if [ -d "$CHOME" ]; then
+    mkdir -p "$ROOT$CHOME"
+    mounted "$ROOT$CHOME" || "$BB" mount --bind "$CHOME" "$ROOT$CHOME"
+  fi
+}
+
+chroot_running() {
+  for p in /proc/[0-9]*; do [ "$(readlink "$p/root" 2>/dev/null)" = "$ROOT" ] && return 0; done
+  return 1
+}
+
+# Moves claude's home out of the rootfs into $CHOME the first time, keeps Termux able to reach it,
+# and shares Claude Code's projects folder (session records, project memory) with Termux.
+setup_storage() {
+  label=$(ls -dZ "$TERMUX_HOME" | "$BB" awk '{print $1}')
+  if [ ! -L "$ROOT/home/claude" ]; then
+    chroot_running && die "the chroot is running; run ccm-chroot stop first"
+    mkdir -p "$CHOME"
+    if [ -d "$ROOT/home/claude" ]; then
+      for f in "$ROOT/home/claude"/* "$ROOT/home/claude"/.[!.]* "$ROOT/home/claude"/..?*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        mv "$f" "$CHOME/"
+      done
+      rmdir "$ROOT/home/claude"
+    fi
+    ln -s "$CHOME" "$ROOT/home/claude"
+  fi
+  "$BB" chown "$TUID:$TUID" "$CHOME"
+  chmod 700 "$CHOME"
+  # Termux (an app, under SELinux) can only enter folders labelled as its own data. The rootfs keeps
+  # its system label; Android may reset these on an update, so they're set on every start.
+  chcon "$label" "$BASE"
+  # -h: label links themselves; many point to paths that only exist inside the chroot.
+  [ "$(ls -dZ "$CHOME" | "$BB" awk '{print $1}')" = "$label" ] || chcon -hR "$label" "$CHOME" || true
+  share_projects "$label"
+  if [ ! -e "$TERMUX_HOME/chroot" ] && [ ! -L "$TERMUX_HOME/chroot" ]; then
+    ln -s "$CHOME" "$TERMUX_HOME/chroot"
+    "$BB" chown -h "$TUID:$TUID" "$TERMUX_HOME/chroot"
+    # Links get no app categories when root makes them, and Termux may not read such a link.
+    chcon -h "$label" "$TERMUX_HOME/chroot" || true
+  fi
+}
+
+# The chroot's ~/.claude/projects becomes a link to Termux's. What the chroot had is merged in first
+# without overwriting anything (a differing memory file is kept as NAME.chroot.md) and kept as a backup.
+share_projects() {
+  mine=$CHOME/.claude/projects
+  theirs=$TERMUX_HOME/.claude/projects
+  [ -L "$mine" ] && return 0
+  mkdir -p "$CHOME/.claude" "$theirs"
+  if [ -d "$mine" ]; then
+    for d in "$mine"/*; do
+      [ -d "$d" ] || continue
+      key=$(basename -- "$d")
+      mkdir -p "$theirs/$key"
+      for f in "$d"/* "$d"/.[!.]*; do
+        [ -e "$f" ] || continue
+        name=$(basename -- "$f")
+        if [ "$name" = memory ] && [ -d "$f" ]; then
+          mkdir -p "$theirs/$key/memory"
+          for m in "$f"/*; do
+            [ -f "$m" ] || continue
+            mname=$(basename -- "$m")
+            target=$theirs/$key/memory/$mname
+            if [ "$mname" = MEMORY.md ] && [ -f "$target" ]; then
+              # The index: add the chroot's entries that aren't there yet.
+              while IFS= read -r line; do
+                [ -n "$line" ] && ! "$BB" grep -qxF -- "$line" "$target" && printf '%s\n' "$line" >> "$target"
+              done < "$m"
+            elif [ ! -e "$target" ]; then cp -a "$m" "$target"
+            elif ! cmp -s "$m" "$target"; then cp -a "$m" "${target%.md}.chroot.md"
+            fi
+          done
+        elif [ ! -e "$theirs/$key/$name" ]; then
+          cp -a "$f" "$theirs/$key/"
+        fi
+      done
+      "$BB" chown -R "$TUID:$TUID" "$theirs/$key"
+      chcon -hR "$1" "$theirs/$key" || true
+    done
+    mv "$mine" "$CHOME/.claude/projects.before-sharing"
+  fi
+  ln -s "$theirs" "$mine"
+  "$BB" chown -h "$TUID:$TUID" "$mine"
+  chcon -h "$1" "$mine" || true
 }
 
 do_umount() {
-  for m in "$ROOT$TERMUX_HOME" "$ROOT/dev/pts" "$ROOT/dev" "$ROOT/sys" "$ROOT/proc"; do
+  for m in "$ROOT$CHOME" "$ROOT$TERMUX_HOME" "$ROOT/dev/pts" "$ROOT/dev" "$ROOT/sys" "$ROOT/proc"; do
     mounted "$m" && { "$BB" umount "$m" 2>/dev/null || "$BB" umount -l "$m"; }
   done
   if "$BB" grep -q " $ROOT[/ ]" /proc/self/mounts; then die "still mounted under $ROOT"; fi
@@ -121,6 +213,10 @@ You run in a Debian 13 arm64 chroot on a rooted Android phone, as user \`claude\
 pm, am, cmd, settings, dumpsys, logcat, screencap and input work there. Its filesystem is Android's:
 $TERMUX_HOME has the same path in both, but other chroot paths are under /data/ccm/rootfs
 (\$CCM_ROOTFS), so put files for Android (APKs to install, for example) in $TERMUX_HOME.
+
+Your files live in /data/ccm/home (your home), separate from Termux's home at $TERMUX_HOME; both have
+the same paths here and in Termux. ~/.claude/projects (session records and project memory) is shared with
+Claude Code in Termux.
 
 To install Debian packages, run apt as root in this chroot from the Android side:
 su -c 'chroot /data/ccm/rootfs /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive apt-get install -y PACKAGE'
@@ -181,6 +277,8 @@ cmd_install() {
 }
 
 cmd_start() {
+  [ -d "$ROOT/usr" ] || die "not installed; run: ccm-chroot install"
+  setup_storage
   do_mount
   install_helpers
   start_rootd
@@ -260,6 +358,8 @@ cmd_uninstall() {
   # Never delete through a bind mount into the Termux home.
   if "$BB" grep -q " $BASE[/ ]" /proc/self/mounts; then die "something is still mounted under $BASE; not deleting"; fi
   rm -f /data/adb/service.d/ccm-chroot.sh
+  [ "$(readlink "$TERMUX_HOME/chroot" 2>/dev/null)" = "$CHOME" ] && rm -f "$TERMUX_HOME/chroot"
+  # Removes the chroot's own storage too ($CHOME); its projects link into Termux isn't followed.
   rm -rf "$BASE"
   echo "removed $BASE"
 }
@@ -273,12 +373,12 @@ case "$1" in
   boot) cmd_boot "$2" ;;
   root) cmd_root "$2" ;;
   uninstall) cmd_uninstall ;;
-  shell) do_mount; as_claude bash -l ;;
-  login) do_mount; as_claude bash -lc claude ;;
+  shell) setup_storage; do_mount; as_claude bash -l ;;
+  login) setup_storage; do_mount; as_claude bash -lc claude ;;
   mount) do_mount ;;
   _rootd) "$BB" chroot "$ROOT" /usr/bin/env -i HOME=/root LANG=C.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       node "$(dirname "$BRIDGE")/../chroot/ccm-rootd.mjs" /run/ccm-root.sock "$ROOT" "$TERMUX_HOME" "$TUID" >> "$BASE/rootd.log" 2>&1 ;;
-  _bridge) as_claude sh -c "exec node '$BRIDGE' --port $PORT --roots '$TERMUX_HOME' >> /home/claude/.local/state/ccm-bridge/bridge.log 2>&1" ;;
+  _bridge) as_claude sh -c "exec node '$BRIDGE' --port $PORT --roots '$CHOME,$TERMUX_HOME' >> /home/claude/.local/state/ccm-bridge/bridge.log 2>&1" ;;
   umount) do_umount ;;
   *) sed -n '2,/^set -e/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;
 esac

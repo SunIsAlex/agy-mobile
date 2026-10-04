@@ -40,7 +40,11 @@ const MAX_INLINE_IMAGE_BYTES = 3_750_000; // 5 MB once base64-encoded
 // ---------- args & config ----------
 
 function parseArgs(argv) {
-  const opts = { host: '127.0.0.1', port: 8765, roots: [os.homedir()], pair: false, showToken: false };
+  // The Debian chroot's own storage (chroot/ccm-chroot) is a default root too, when this side can read it.
+  const chrootHome = '/data/ccm/home';
+  const readable = (d) => { try { fs.accessSync(d, fs.constants.R_OK | fs.constants.X_OK); return fs.statSync(d).isDirectory(); } catch { return false; } };
+  const roots = [os.homedir(), ...(readable(chrootHome) && fs.realpathSync(chrootHome) !== fs.realpathSync(os.homedir()) ? [chrootHome] : [])];
+  const opts = { host: '127.0.0.1', port: 8765, roots, pair: false, showToken: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];

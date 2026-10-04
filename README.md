@@ -115,6 +115,13 @@ with `su -c 'chroot /data/ccm/rootfs … apt-get install …'` (see the note it 
 `~/.claude/CLAUDE.md`). `root off` turns this off. It's root access, not a sandbox: approvals still
 apply unless the task is in YOLO. `shell` opens a shell as `claude`, `stop` ends everything and
 unmounts, and `uninstall` deletes `/data/ccm` after checking nothing is still mounted.
+The chroot keeps its own files in `/data/ccm/home` (its user's home), separate from the Termux home. Each
+sees the other's at the same path: the Termux home is mounted into the chroot, `/data/ccm/home` is
+mounted into it and labelled so Termux can reach it too (with a `~/chroot` link), and both bridges list
+projects in both. Because the paths match, Claude Code's session records and project memory
+(`~/.claude/projects`) are shared: the chroot's is a link to Termux's, so a session started on one side
+can be resumed on the other. Logins and settings stay separate.
+
 The Termux bridge keeps working alongside; pair with whichever you want to use.
 
 ## Build the app
