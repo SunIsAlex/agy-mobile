@@ -5,6 +5,7 @@ import androidx.core.content.edit
 
 class Settings(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    private val drafts = context.getSharedPreferences("drafts", Context.MODE_PRIVATE)
 
     var host: String
         get() = prefs.getString("host", "127.0.0.1")!!
@@ -50,6 +51,13 @@ class Settings(context: Context) {
     var lastRepo: String
         get() = prefs.getString("lastRepo", "")!!
         set(v) = prefs.edit { putString("lastRepo", v) }
+
+    /**
+     * Unsent message text, by task id ("" for the new-task box). Saved as it's typed so it
+     * survives leaving the screen, and Android killing the app while it's in the background.
+     */
+    fun draft(key: String): String = drafts.getString(key, "")!!
+    fun setDraft(key: String, text: String) = drafts.edit { if (text.isEmpty()) remove(key) else putString(key, text) }
 
     fun config(): BridgeConfig? = if (token.isBlank()) null else BridgeConfig(host, port, token)
 }

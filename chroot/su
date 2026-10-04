@@ -1,0 +1,61 @@
+#!/usr/bin/node
+// su for CC Mobile's chroot: runs a command as root on Android itself (outside the chroot), through
+// ccm-rootd (see ccm-rootd.mjs). Installed as /usr/local/bin/su, ahead of Debian's own.
+//
+//   su -c 'pm install /data/data/com.termux/files/home/app.apk'
+//   su root -c CMD, su 0 -c CMD, su -c CMD - ; plain `su` reads commands from stdin (no terminal)
+//
+// Commands see Android's filesystem: the Termux home has the same path, other chroot files are under
+// $CCM_ROOTFS (/data/ccm/rootfs).
+import net from 'node:net';
+
+const SOCKET = '/run/ccm-root.sock';
+let cmd = null;
+const args = process.argv.slice(2);
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '-c' || a === '--command') cmd = args[++i] ?? '';
+  else if (a.startsWith('--command=')) cmd = a.slice(10);
+  else if (a === '-s' || a === '--shell' || a === '-g' || a === '-G' || a === '--group' || a === '--supp-group') i++;
+  else if (['-', '-l', '--login', '-p', '-m', '--preserve-environment', '-M', '--mount-master', 'root', '0'].includes(a)) continue;
+  else if (a === '-h' || a === '--help') { console.log('usage: su [-c COMMAND] (runs as root on Android, outside the chroot)'); process.exit(0); }
+  else { console.error(`su: only root is available here (got ${a})`); process.exit(1); }
+}
+
+const sock = net.connect(SOCKET);
+sock.on('error', (e) => {
+  console.error(`su: root isn't available in this chroot (${e.code}). Turn it on with: ccm-chroot root on`);
+  process.exit(1);
+});
+sock.on('connect', () => {
+  sock.write(JSON.stringify({ cmd, cwd: process.cwd() }) + '\n');
+  process.stdin.on('data', (d) => sock.write(d));
+  process.stdin.on('end', () => sock.end());
+  process.stdin.on('error', () => sock.end());
+  if (process.stdin.isTTY && cmd !== null) process.stdin.pause(); // `su -c` from a terminal: don't hold its input
+});
+
+// Whoever reads our output went away (`su -c ... | head`): stop the command and exit like SIGPIPE.
+for (const out of [process.stdout, process.stderr]) out.on('error', () => { sock.destroy(); process.exit(141); });
+
+let buf = Buffer.alloc(0);
+sock.on('data', (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+  while (buf.length >= 5) {
+    const len = buf.readUInt32BE(1);
+    if (buf.length < 5 + len) break;
+    const type = buf[0];
+    const data = buf.subarray(5, 5 + len);
+    buf = buf.subarray(5 + len);
+    if (type === 1) process.stdout.write(data);
+    else if (type === 2) process.stderr.write(data);
+    else if (type === 3) {
+      const { code, signal } = JSON.parse(data.toString('utf8'));
+      const signals = { SIGHUP: 1, SIGINT: 2, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGTERM: 15 };
+      process.exitCode = code ?? 128 + (signals[signal] ?? 1);
+      process.stdin.destroy();
+      sock.destroy();
+    }
+  }
+});
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { sock.destroy(); process.exit(130); });

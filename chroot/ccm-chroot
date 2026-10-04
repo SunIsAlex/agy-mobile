@@ -4,9 +4,10 @@
 # doesn't depend on the Termux app staying alive.
 #
 # Claude runs as user `claude`, which has Termux's uid, so the Termux home (bind-mounted at its usual
-# path) stays readable and writable and new files keep Termux's ownership. It has no capabilities and
-# can't regain any (no_new_privs); it's in Android's inet groups so it can use the network. Note that
-# processes keep the root shell's SELinux domain, so the uid and capabilities are the containment.
+# path) stays readable and writable and new files keep Termux's ownership. It has no capabilities of
+# its own (no_new_privs); it's in Android's inet groups so it can use the network. Like Termux, it can
+# get root through `su`: the chroot's su (chroot/su) asks ccm-rootd, a root helper, to run the command
+# in Android itself, so pm, am, settings and phone use work. `ccm-chroot root off` turns that off.
 #
 #   ccm-chroot install      download Debian, add the claude user, apt packages and Claude Code
 #   ccm-chroot login        run Claude Code once in a terminal to sign in (needed before tasks run)
@@ -15,6 +16,7 @@
 #   ccm-chroot shell        a shell as claude inside the chroot
 #   ccm-chroot status
 #   ccm-chroot boot on|off  start at boot (KernelSU/Magisk service.d)
+#   ccm-chroot root on|off  let Claude run root commands on Android with su (on by default)
 #   ccm-chroot uninstall    stop, unmount, and delete /data/ccm (refuses while anything is mounted)
 #
 # Run it from Termux (it asks for root) or as root. Everything happens in the global mount namespace,
@@ -80,6 +82,53 @@ in_root() {
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
 }
 
+# The root helper (ccm-rootd.mjs) runs as root inside the chroot; see chroot/su.
+rootd_pid() {
+  for p in /proc/[0-9]*; do
+    [ "$(readlink "$p/root" 2>/dev/null)" = "$ROOT" ] || continue
+    "$BB" grep -q ccm-rootd "$p/cmdline" 2>/dev/null && { echo "${p#/proc/}"; return 0; }
+  done
+  return 1
+}
+
+start_rootd() {
+  [ -f "$BASE/root-off" ] && return 0
+  rootd_pid >/dev/null && return 0
+  "$BB" setsid /system/bin/sh "$SELF" _rootd < /dev/null > /dev/null 2>&1 &
+  # The bridge checks for root (phone use) when it starts, so wait for the helper to listen.
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$ROOT/run/ccm-root.sock" ] && return 0; sleep 1; done
+  echo "ccm-chroot: the root helper didn't start (see $BASE/rootd.log)" >&2
+}
+
+stop_rootd() {
+  pid=$(rootd_pid) && kill "$pid" 2>/dev/null
+  rm -f "$ROOT/run/ccm-root.sock"
+}
+
+# Files Claude in the chroot relies on: the su shim and a note on what it does.
+install_helpers() {
+  cp "$(dirname "$SELF")/su" "$ROOT/usr/local/bin/su" 2>/dev/null || cp "$(dirname "$BRIDGE")/../chroot/su" "$ROOT/usr/local/bin/su"
+  chmod 755 "$ROOT/usr/local/bin/su"
+  notes=$ROOT/home/claude/.claude/CLAUDE.md
+  if [ ! -f "$notes" ]; then
+    mkdir -p "$ROOT/home/claude/.claude"
+    cat > "$notes" <<EON
+# Environment
+
+You run in a Debian 13 arm64 chroot on a rooted Android phone, as user \`claude\` (no root inside).
+
+\`su -c 'COMMAND'\` runs COMMAND as root on Android itself (outside this chroot), like Termux's su:
+pm, am, cmd, settings, dumpsys, logcat, screencap and input work there. Its filesystem is Android's:
+$TERMUX_HOME has the same path in both, but other chroot paths are under /data/ccm/rootfs
+(\$CCM_ROOTFS), so put files for Android (APKs to install, for example) in $TERMUX_HOME.
+
+To install Debian packages, run apt as root in this chroot from the Android side:
+su -c 'chroot /data/ccm/rootfs /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive apt-get install -y PACKAGE'
+EON
+    "$BB" chown -R "$TUID:$TUID" "$ROOT/home/claude/.claude"
+  fi
+}
+
 bridge_pid() {
   pid=$(cat "$STATE/bridge.pid" 2>/dev/null) || return 1
   [ -n "$pid" ] && "$BB" grep -q ccm-bridge "/proc/$pid/cmdline" 2>/dev/null && echo "$pid"
@@ -133,6 +182,8 @@ cmd_install() {
 
 cmd_start() {
   do_mount
+  install_helpers
+  start_rootd
   if pid=$(bridge_pid); then echo "bridge already running (pid $pid) on port $PORT"; return; fi
   as_claude test -x /home/claude/.local/bin/claude || die "Claude Code isn't installed in the chroot"
   as_claude mkdir -p /home/claude/.local/state/ccm-bridge
@@ -166,6 +217,7 @@ cmd_status() {
   if pid=$(bridge_pid); then echo "bridge running (pid $pid) on 127.0.0.1:$PORT"; else echo "bridge not running"; fi
   as_claude bash -lc 'claude --version 2>/dev/null || echo "Claude Code: not installed"' 2>/dev/null || true
   [ -f /data/adb/service.d/ccm-chroot.sh ] && echo "starts at boot" || echo "doesn't start at boot"
+  if pid=$(rootd_pid); then echo "root on (helper pid $pid)"; elif [ -f "$BASE/root-off" ]; then echo "root off"; else echo "root helper not running"; fi
 }
 
 cmd_pair() {
@@ -173,6 +225,15 @@ cmd_pair() {
   token=$(echo "$token" | "$BB" tr -d '[:space:]')
   url="ccmobile://pair?host=127.0.0.1&port=$PORT&token=$token"
   am start -a android.intent.action.VIEW -d "$url" >/dev/null 2>&1 || echo "Pair link: $url"
+}
+
+cmd_root() {
+  case "$1" in
+    on) rm -f "$BASE/root-off"; do_mount; install_helpers; start_rootd; sleep 1
+        rootd_pid >/dev/null && echo "root on: su in the chroot runs commands as root on Android" || die "the root helper didn't start" ;;
+    off) touch "$BASE/root-off"; stop_rootd; echo "root off" ;;
+    *) die "usage: ccm-chroot root on|off" ;;
+  esac
 }
 
 cmd_boot() {
@@ -210,10 +271,13 @@ case "$1" in
   status) cmd_status ;;
   pair) cmd_pair ;;
   boot) cmd_boot "$2" ;;
+  root) cmd_root "$2" ;;
   uninstall) cmd_uninstall ;;
   shell) do_mount; as_claude bash -l ;;
   login) do_mount; as_claude bash -lc claude ;;
   mount) do_mount ;;
+  _rootd) "$BB" chroot "$ROOT" /usr/bin/env -i HOME=/root LANG=C.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      node "$(dirname "$BRIDGE")/../chroot/ccm-rootd.mjs" /run/ccm-root.sock "$ROOT" "$TERMUX_HOME" "$TUID" >> "$BASE/rootd.log" 2>&1 ;;
   _bridge) as_claude sh -c "exec node '$BRIDGE' --port $PORT --roots '$TERMUX_HOME' >> /home/claude/.local/state/ccm-bridge/bridge.log 2>&1" ;;
   umount) do_umount ;;
   *) sed -n '2,/^set -e/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;

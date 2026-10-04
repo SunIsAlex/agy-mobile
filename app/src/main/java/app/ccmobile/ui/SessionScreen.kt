@@ -39,11 +39,11 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -195,7 +195,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 onAlways = { repository.answer(approval, allow = true, always = true) },
             )
         } else {
+            var draft by remember(sid) { mutableStateOf(repository.settings.draft(sid)) }
             ReplyBar(
+                text = draft, onText = { draft = it; repository.settings.setDraft(sid, it) },
+                attachments = repository.draftAttachments(sid),
                 effort = session?.effort.orEmpty(), onEffort = { repository.setEffort(sid, it) },
                 onSend = { text, files -> repository.sendMessage(sid, text, files) }, onError = repository::reportError,
             )
@@ -333,11 +336,10 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
 
 @Composable
 private fun ReplyBar(
+    text: String, onText: (String) -> Unit, attachments: SnapshotStateList<PendingAttachment>,
     effort: String, onEffort: (String) -> Unit,
     onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit,
 ) {
-    var text by rememberSaveable { mutableStateOf("") }
-    val attachments = remember { mutableStateListOf<PendingAttachment>() }
     // Effort applies from the next reply, so it sits with the message box rather than in a menu.
     var effortMenu by remember { mutableStateOf(false) }
     Box(Modifier.padding(start = 12.dp, top = 8.dp)) {
@@ -354,7 +356,7 @@ private fun ReplyBar(
     Row(Modifier.padding(start = 4.dp, end = 12.dp, top = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Box(Modifier.height(52.dp), contentAlignment = Alignment.Center) { AttachButton(attachments, onError) }
         TextField(
-            value = text, onValueChange = { text = it },
+            value = text, onValueChange = onText,
             placeholder = { Text("Steer Claude, or /command…", color = C.Faint) },
             maxLines = 6,
             textStyle = TextStyle(fontSize = 15.sp, color = C.Text),
@@ -373,7 +375,7 @@ private fun ReplyBar(
                 .background(if (canSend) C.Clay else C.Surface)
                 .clickable(enabled = canSend, role = Role.Button) {
                     onSend(text.trim(), attachments.toList())
-                    text = ""
+                    onText("")
                     attachments.clear()
                 }
                 .semantics { contentDescription = "Send" },

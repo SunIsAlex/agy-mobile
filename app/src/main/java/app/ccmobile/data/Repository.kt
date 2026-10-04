@@ -18,6 +18,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.util.TimeZone
 import android.util.Base64
 import android.util.LruCache
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -69,6 +71,8 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         override fun sizeOf(key: String, value: ByteArray) = value.size
     }
     private val open = mutableSetOf<String>()
+    // Picked but unsent attachments, by task id like Settings.draft; memory only, as they can be megabytes.
+    private val draftAttachments = HashMap<String, SnapshotStateList<PendingAttachment>>()
     private var nextRef = 1
     private val waiting = HashMap<Int, CompletableDeferred<JsonObject?>>()
     private val quietRefs = mutableSetOf<Int>()
@@ -185,6 +189,8 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     fun close(sid: String) {
         if (open.remove(sid)) scope.launch { send("unsubscribe", "sid" to sid) }
     }
+
+    fun draftAttachments(key: String): SnapshotStateList<PendingAttachment> = draftAttachments.getOrPut(key) { mutableStateListOf() }
 
     fun sendMessage(sid: String, text: String, attachments: List<PendingAttachment> = emptyList()) =
         fire("send", "sid" to sid, "text" to text, "attachments" to attachmentsJson(attachments))

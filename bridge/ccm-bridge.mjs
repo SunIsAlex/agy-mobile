@@ -721,8 +721,10 @@ const PHONE_PROMPT = `You are also acting as the user's Android assistant. You r
 let phoneAvailable = false;
 async function detectPhone() {
   if (process.env.CCM_PHONE) return process.env.CCM_PHONE === '1';
-  if (process.platform !== 'android') return false;
-  return new Promise((resolve) => execFile(process.env.CCM_SU ?? 'su', ['-c', 'id -u'], { timeout: 10_000 }, (err, out) => resolve(!err && out.trim() === '0')));
+  // Root on Android, not just root: Termux's su, or the chroot's su (chroot/su) whose commands run
+  // on Android although this Node reports linux.
+  return new Promise((resolve) => execFile(process.env.CCM_SU ?? 'su', ['-c', 'id -u; getprop ro.build.version.sdk'], { timeout: 10_000 },
+    (err, out) => resolve(!err && /^0\n\d+\s*$/.test(out))));
 }
 
 // ---------- Claude Code's own transcripts (~/.claude/projects/<cwd>/<session id>.jsonl) ----------

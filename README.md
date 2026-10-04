@@ -101,10 +101,14 @@ sh chroot/ccm-chroot boot on     # start at boot (KernelSU/Magisk service.d)
 ```
 
 Claude runs as user `claude`, which has Termux's uid, so your Termux home is mounted at its usual path
-and files keep Termux's ownership. It has no capabilities and can't gain any, but it keeps the root
-shell's SELinux domain, so this is not a sandbox: keep YOLO for tasks you trust. Phone use isn't
-available in the chroot (there's no `su` inside). `shell` opens a shell as `claude`, `stop` ends
-everything and unmounts, and `uninstall` deletes `/data/ccm` after checking nothing is still mounted.
+and files keep Termux's ownership. Like Termux, it gets root through `su`: the chroot's `su -c '…'`
+asks a root helper (`chroot/ccm-rootd.mjs`) to run the command on Android itself, so `pm install`,
+`am`, `settings`, `logcat` and Phone use all work. Paths in your Termux home are the same on both sides;
+other chroot files are under `/data/ccm/rootfs` on Android. Claude can also install Debian packages
+with `su -c 'chroot /data/ccm/rootfs … apt-get install …'` (see the note it gets in
+`~/.claude/CLAUDE.md`). `root off` turns this off. It's root access, not a sandbox: approvals still
+apply unless the task is in YOLO. `shell` opens a shell as `claude`, `stop` ends everything and
+unmounts, and `uninstall` deletes `/data/ccm` after checking nothing is still mounted.
 The Termux bridge keeps working alongside; pair with whichever you want to use.
 
 ## Build the app

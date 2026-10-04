@@ -39,7 +39,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.remember
@@ -82,7 +81,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
 
     var repoPath by rememberSaveable { mutableStateOf(settings.lastRepo) }
     val repo = repos.firstOrNull { it.path == repoPath } ?: repos.firstOrNull()
-    var prompt by rememberSaveable { mutableStateOf("") }
+    var prompt by remember { mutableStateOf(settings.draft("")) }
     var mode by rememberSaveable { mutableStateOf(settings.mode) }
     var model by rememberSaveable { mutableStateOf(settings.model) }
     var effort by rememberSaveable { mutableStateOf(settings.effort) }
@@ -92,7 +91,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
     var newFolder by rememberSaveable { mutableStateOf(false) }
     var phone by rememberSaveable { mutableStateOf(settings.phone) }
     val phoneOn = phone && phoneAvailable
-    val attachments = remember { mutableStateListOf<PendingAttachment>() }
+    val attachments = repository.draftAttachments("")
     val scope = rememberCoroutineScope()
 
     val active = sessions.filter { it.isOpen }
@@ -114,6 +113,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
             starting = false
             if (sid != null) {
                 prompt = ""
+                settings.setDraft("", "")
                 attachments.clear()
                 onOpen(sid)
             }
@@ -157,7 +157,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
                         color = C.Text, modifier = Modifier.padding(bottom = 12.dp),
                     )
                     Composer(
-                        prompt = prompt, onPrompt = { prompt = it },
+                        prompt = prompt, onPrompt = { prompt = it; settings.setDraft("", it) },
                         mode = mode, onMode = { mode = it },
                         model = model, onModel = { model = it },
                         effort = effort, onEffort = { effort = it },
