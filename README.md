@@ -66,6 +66,12 @@ puts in their environment). Each shows its command, folder, CPU, memory and age,
 force-killed, paused/resumed, or restarted with the same command, folder and environment (output then
 goes to `process-logs/`). Programs that rename themselves, like npm, can't be restarted from here.
 
+**If Android kills the bridge:** Android 12+ kills background child processes past a limit of 32 across
+all apps ("phantom processes"); a headless browser alone can use ten. Turn that off with Developer
+options › *Disable child process restrictions*, or as root: `settings put global settings_enable_monitor_phantom_procs false`.
+The app also starts this phone's bridge again through Termux when it stops answering, and starts its
+background service after a reboot or update (Settings › *Restart the bridge if it stops*).
+
 **Restarting the bridge** doesn't stop tasks. Each Claude process runs under a small keeper
 (`bridge/keeper.mjs`) in `keepers/<session id>/`, which outlives the bridge and saves Claude's output
 while no bridge is attached. A restarted bridge picks up where it left off: replies, permission prompts
