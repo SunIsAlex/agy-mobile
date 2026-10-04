@@ -93,6 +93,19 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         settings.config()?.let(client::connect)
     }
 
+    private var expectedPairing: Pair<Int, Long>? = null
+
+    /** The user just asked to start the bridge on [port]; its pairing link may skip the confirmation. */
+    fun expectPairing(port: Int) { expectedPairing = port to System.currentTimeMillis() + 60_000 }
+
+    /** True (once) for a pairing link from the bridge the user just started on this phone. */
+    fun isExpectedPairing(host: String, port: Int): Boolean {
+        val (p, until) = expectedPairing ?: return false
+        val ok = p == port && System.currentTimeMillis() < until && (host == "127.0.0.1" || host == "localhost")
+        if (ok) expectedPairing = null
+        return ok
+    }
+
     fun pair(host: String, port: Int, token: String) {
         settings.host = host
         settings.port = port

@@ -104,8 +104,20 @@ const pidFile = path.join(stateDir, 'bridge.pid');
   let running = false;
   try { running = other > 0 && other !== process.pid && fs.readFileSync(`/proc/${other}/cmdline`, 'utf8').includes('ccm-bridge'); } catch {}
   if (running) {
-    console.error(`Another ccm-bridge (pid ${other}) is already using ${stateDir}. Stop it first, or use a different --state-dir.`);
-    process.exit(1);
+    // --pair or --show-token for the bridge that's already running: that's what the user wants.
+    if (opts.pair || opts.showToken) {
+      const args = fs.readFileSync(`/proc/${other}/cmdline`, 'utf8').split('\0');
+      const arg = (name, fallback) => (args.includes(name) ? args[args.indexOf(name) + 1] : fallback);
+      const host = arg('--host', '127.0.0.1');
+      const url = `ccmobile://pair?host=${encodeURIComponent(host === '0.0.0.0' ? '127.0.0.1' : host)}&port=${arg('--port', '8765')}&token=${encodeURIComponent(token)}`;
+      console.log(`ccm-bridge is already running (pid ${other}).`);
+      if (opts.showToken) console.log(`Token: ${token}\nPair link: ${url}`);
+      if (opts.pair) await new Promise((done) => execFile('am', ['start', '-a', 'android.intent.action.VIEW', '-d', url], (err) => { if (err) console.log(`Pair link: ${url}`); done(); }));
+      process.exit(0);
+    } else {
+      console.error(`Another ccm-bridge (pid ${other}) is already using ${stateDir}. Stop it first, or use a different --state-dir.`);
+      process.exit(1);
+    }
   }
   fs.writeFileSync(pidFile, String(process.pid));
 }

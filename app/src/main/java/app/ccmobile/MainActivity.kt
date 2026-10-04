@@ -139,7 +139,16 @@ class MainActivity : ComponentActivity() {
             val host = uri.getQueryParameter("host")
             val port = uri.getQueryParameter("port")?.toIntOrNull()
             val token = uri.getQueryParameter("token")
-            if (!host.isNullOrBlank() && port != null && !token.isNullOrBlank()) pairRequest = PairRequest(host, port, token)
+            if (host.isNullOrBlank() || port == null || token.isNullOrBlank()) return
+            if (repository.isExpectedPairing(host, port)) {
+                // Started from the Start button a moment ago: connect without asking again.
+                repository.pair(host, port, token)
+                startNotifications()
+                nav.stack.clear()
+                nav.stack.add(Screen.Tasks)
+            } else {
+                pairRequest = PairRequest(host, port, token)
+            }
         }
     }
 }

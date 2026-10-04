@@ -29,6 +29,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,12 +46,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
+import app.ccmobile.data.BridgeKind
+import app.ccmobile.data.BridgeLauncher
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.Repository
 import app.ccmobile.notify.BridgeService
 import app.ccmobile.notify.Notifier
 
-const val SETUP_COMMAND = "node ~/claude-code-mobile/bridge/ccm-bridge.mjs --pair"
 
 @Composable
 fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
@@ -66,6 +68,33 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var effort by remember { mutableStateOf(settings.effort) }
     var autoContinue by remember { mutableStateOf(settings.autoContinue) }
     var keepAwake by remember { mutableStateOf(settings.keepAwake) }
+    var starting by remember { mutableStateOf<BridgeKind?>(null) }
+    var waitingFor by remember { mutableStateOf<BridgeKind?>(null) }
+    fun launch(kind: BridgeKind) {
+        starting = kind
+        runCatching { BridgeLauncher.start(context, kind) }.onFailure {
+            starting = null
+            repository.reportError("Couldn't reach Termux: ${it.message}")
+        }
+    }
+    val termuxPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val kind = waitingFor ?: return@rememberLauncherForActivityResult
+        waitingFor = null
+        if (granted) launch(kind)
+        else repository.reportError("CC Mobile needs permission to run commands in Termux (App info › Permissions).")
+    }
+    fun start(kind: BridgeKind) {
+        when {
+            !BridgeLauncher.termuxInstalled(context) -> repository.reportError("Termux isn't installed.")
+            BridgeLauncher.permitted(context) -> launch(kind)
+            else -> { waitingFor = kind; termuxPermission.launch(BridgeLauncher.PERMISSION) }
+        }
+    }
+    // Starting ends once the app connects (the bridge's pairing link does that) or after a while.
+    LaunchedEffect(starting, conn) {
+        if (starting != null && conn is ConnState.Connected && settings.port == starting?.port) starting = null
+        else if (starting != null) { kotlinx.coroutines.delay(45_000); starting = null }
+    }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -87,12 +116,15 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 )
             }
 
-            Section("Connect") {
-                Text("Run this in Termux. It opens this app and pairs it:", color = C.TextSoft, fontSize = 14.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    CodeBlock(SETUP_COMMAND, modifier = Modifier.weight(1f))
-                    IconBtn(R.drawable.ic_copy, "Copy command", { copy(context, SETUP_COMMAND) })
+            Section("Start a bridge on this phone") {
+                Text("Tap Start, or run the command in Termux. Either way the bridge pairs with this app.", color = C.TextSoft, fontSize = 14.sp)
+                BridgeKind.entries.forEach { kind ->
+                    val active = conn is ConnState.Connected && settings.port == kind.port && settings.host in setOf("127.0.0.1", "localhost")
+                    BridgeCard(kind, active, starting = starting == kind, onCopy = { copy(context, kind.command) }, onStart = { start(kind) })
                 }
+            }
+
+            Section("Connect") {
                 ConnectionLine(conn)
                 Field("Host", host, { host = it })
                 Field("Port", port, { port = it.filter(Char::isDigit).take(5) }, keyboard = KeyboardType.Number)
@@ -180,6 +212,34 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun BridgeCard(kind: BridgeKind, active: Boolean, starting: Boolean, onCopy: () -> Unit, onStart: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(C.Card)
+            .border(1.dp, if (active) C.Clay else C.Border, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(kind.label, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Text("Port ${kind.port}", color = C.Faint, fontSize = 12.sp, fontFamily = Mono)
+            }
+            if (active) Text("Connected", color = C.GreenPill, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+        Text(kind.detail, color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CodeBlock(kind.command, modifier = Modifier.weight(1f))
+            IconBtn(R.drawable.ic_copy, "Copy ${kind.label} command", onCopy)
+        }
+        if (active) SecondaryButton("Pair again", onStart, modifier = Modifier.fillMaxWidth())
+        else PrimaryButton(if (starting) "Starting…" else "Start ${kind.label} bridge", onStart, modifier = Modifier.fillMaxWidth(), enabled = !starting)
     }
 }
 
