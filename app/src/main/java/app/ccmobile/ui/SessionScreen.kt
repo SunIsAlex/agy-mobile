@@ -380,7 +380,7 @@ private fun ReplyBar(
                 }
                 .semantics { contentDescription = "Send" },
             contentAlignment = Alignment.Center,
-        ) { CcIcon(R.drawable.ic_send, if (canSend) C.Bg else C.Faint) }
+        ) { CcIcon(R.drawable.ic_send, if (canSend) C.OnClay else C.Faint) }
     }
 }
 
@@ -414,7 +414,7 @@ private fun LimitBanner(session: SessionSummary, onAutoContinue: (Boolean) -> Un
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Switch(
                 checked = session.autoContinue, onCheckedChange = onAutoContinue,
-                colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.Bg),
+                colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.OnClay),
             )
             Text("Auto", color = C.Muted, fontSize = 11.sp)
         }

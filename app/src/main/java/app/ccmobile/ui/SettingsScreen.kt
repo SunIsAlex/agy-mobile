@@ -37,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -69,6 +70,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
     var autoContinue by remember { mutableStateOf(settings.autoContinue) }
     var reviveBridge by remember { mutableStateOf(settings.reviveBridge) }
     var keepAwake by remember { mutableStateOf(settings.keepAwake) }
+    var theme by remember { mutableStateOf(settings.theme) }
     var starting by remember { mutableStateOf<BridgeKind?>(null) }
     var waitingFor by remember { mutableStateOf<BridgeKind?>(null) }
     fun launch(kind: BridgeKind) {
@@ -159,7 +161,12 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 Text(modeDescription(mode), color = if (mode == YOLO) C.Red else C.Muted, fontSize = 13.sp)
             }
 
-            Section("Default model") {
+            Section("Appearance") {
+                val config = LocalConfiguration.current
+                Segmented(themeLabels, theme, { theme = it; settings.theme = it; applyTheme(it, config) })
+            }
+
+                        Section("Default model") {
                 Segmented(modelLabels, model, { model = it; settings.model = it })
             }
 
@@ -215,7 +222,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 }
                 Switch(
                     checked = notify, onCheckedChange = null,
-                    colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.Bg),
+                    colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.OnClay),
                 )
             }
         }
@@ -267,7 +274,7 @@ private fun SwitchRow(title: String, detail: String, checked: Boolean, onChange:
             Text(title, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
             Text(detail, color = C.Muted, fontSize = 12.sp)
         }
-        Switch(checked = checked, onCheckedChange = null, colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.Bg))
+        Switch(checked = checked, onCheckedChange = null, colors = SwitchDefaults.colors(checkedTrackColor = C.Clay, checkedThumbColor = C.OnClay))
     }
 }
 

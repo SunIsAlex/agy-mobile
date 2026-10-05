@@ -56,7 +56,7 @@ fun PrimaryButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifi
     Button(
         onClick = onClick, enabled = enabled, modifier = modifier.height(50.dp),
         shape = RoundedCornerShape(16.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = C.Clay, contentColor = C.Bg, disabledContainerColor = C.Surface2),
+        colors = ButtonDefaults.buttonColors(containerColor = C.Clay, contentColor = C.OnClay, disabledContainerColor = C.Surface2),
     ) { Text(text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
 }
 

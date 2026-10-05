@@ -198,11 +198,11 @@ private fun FileCard(file: FileDiff, expanded: Boolean, onToggle: () -> Unit, co
 @Composable
 private fun DiffRow(line: DiffLine, onLineClick: (Int) -> Unit) {
     val (bg, fg, numColor, sign) = when (line.kind) {
-        LineKind.Add -> Quad(C.AddBg, C.AddText, Color(0xFF7FAE7D), "+")
-        LineKind.Remove -> Quad(C.DelBg, C.DelText, Color(0xFFB87A70), "−")
-        LineKind.Hunk -> Quad(Color(0xFF191917), C.Faint, C.Faint, "")
+        LineKind.Add -> Quad(C.AddBg, C.AddText, C.AddMark, "+")
+        LineKind.Remove -> Quad(C.DelBg, C.DelText, C.DelMark, "−")
+        LineKind.Hunk -> Quad(C.HunkBg, C.Faint, C.Faint, "")
         LineKind.Meta -> Quad(Color.Transparent, C.Faint, C.Faint, "")
-        LineKind.Context -> Quad(Color.Transparent, C.TextSoft, Color(0xFF6F6C64), " ")
+        LineKind.Context -> Quad(Color.Transparent, C.TextSoft, C.ContextMark, " ")
     }
     val lineNo = line.newNo ?: line.oldNo
     Row(

@@ -49,6 +49,10 @@ class Settings(context: Context) {
     var reviveBridge: Boolean
         get() = prefs.getBoolean("reviveBridge", true)
         set(v) = prefs.edit { putBoolean("reviveBridge", v) }
+    /** "system", "light" or "dark". */
+    var theme: String
+        get() = prefs.getString("theme", "system")!!
+        set(v) = prefs.edit { putString("theme", v) }
     var notify: Boolean
         get() = prefs.getBoolean("notify", true)
         set(v) = prefs.edit { putBoolean("notify", v) }

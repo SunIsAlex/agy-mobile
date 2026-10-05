@@ -358,8 +358,8 @@ private fun Composer(
                     .semantics { contentDescription = "Start task" },
                 contentAlignment = Alignment.Center,
             ) {
-                if (starting) CircularProgressIndicator(Modifier.size(18.dp), color = C.Bg, strokeWidth = 2.dp)
-                else CcIcon(R.drawable.ic_send, if (canStart) C.Bg else C.Faint)
+                if (starting) CircularProgressIndicator(Modifier.size(18.dp), color = C.OnClay, strokeWidth = 2.dp)
+                else CcIcon(R.drawable.ic_send, if (canStart) C.OnClay else C.Faint)
             }
         }
     }
@@ -464,7 +464,7 @@ private fun TaskRow(s: SessionSummary, host: String, onClick: () -> Unit, onArch
                 color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
         }
-        HorizontalDivider(Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp), color = Color(0xFF242320))
+        HorizontalDivider(Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp), color = C.Divider)
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             DropdownMenuItem(text = { Text("Open") }, onClick = { menu = false; onClick() })
             DropdownMenuItem(text = { Text("Archive (stops it and deletes the bridge's copy)") }, onClick = { menu = false; onArchive() })
@@ -496,7 +496,7 @@ private fun ClaudeSessionRow(s: ClaudeSession, resuming: Boolean, onClick: () ->
             if (resuming) CircularProgressIndicator(Modifier.size(18.dp), color = C.Clay, strokeWidth = 2.dp)
             else CcIcon(R.drawable.ic_chevron_right, C.Muted, 18.dp)
         }
-        HorizontalDivider(Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp), color = Color(0xFF242320))
+        HorizontalDivider(Modifier.align(Alignment.BottomCenter).padding(horizontal = 16.dp), color = C.Divider)
     }
 }
 

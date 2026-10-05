@@ -8,6 +8,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -43,6 +44,7 @@ import app.ccmobile.ui.SessionScreen
 import app.ccmobile.ui.SettingsScreen
 import app.ccmobile.ui.TasksScreen
 import app.ccmobile.ui.UsageScreen
+import app.ccmobile.ui.applyTheme
 import app.ccmobile.ui.ProcessesScreen
 
 sealed interface Screen {
@@ -71,6 +73,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // "System" follows the phone; a change there recreates the activity, so this runs again.
+        applyTheme(repository.settings.theme, resources.configuration)
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         val repository = this.repository
@@ -81,6 +85,13 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) startNotifications()
 
         setContent {
+            // Status and navigation bar icons follow the app's theme, not only the phone's.
+            val dark = C.palette.dark
+            LaunchedEffect(dark) {
+                val bars = if (dark) SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                else SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
+            }
             CcTheme {
                 AppRoot(repository, nav)
                 pairRequest?.let { req ->
