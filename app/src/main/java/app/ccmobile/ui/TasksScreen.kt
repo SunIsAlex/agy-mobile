@@ -1,5 +1,11 @@
 package app.ccmobile.ui
 
+import androidx.compose.ui.platform.LocalContext
+
+import android.net.Uri
+
+import android.content.Intent
+
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -200,7 +206,7 @@ fun TasksScreen(repository: Repository, onOpen: (String) -> Unit, onSettings: ()
                 }
             }
             items(shown, key = { it.id }) { s ->
-                TaskRow(s, onClick = { onOpen(s.id) }, onArchive = { repository.archive(s.id) })
+                TaskRow(s, settings.host, onClick = { onOpen(s.id) }, onArchive = { repository.archive(s.id) })
             }
         }
     }
@@ -436,7 +442,7 @@ private fun TabLabel(text: String, selected: Boolean, onClick: () -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TaskRow(s: SessionSummary, onClick: () -> Unit, onArchive: () -> Unit) {
+private fun TaskRow(s: SessionSummary, host: String, onClick: () -> Unit, onArchive: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     Box {
         Column(
@@ -449,6 +455,8 @@ private fun TaskRow(s: SessionSummary, onClick: () -> Unit, onArchive: () -> Uni
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusPill(s.status)
                 Text(relativeTime(s.updatedAt), color = C.Faint, fontSize = 12.sp)
+                Spacer(Modifier.weight(1f))
+                s.ports.forEach { PortChip(it, host) }
             }
             Text(s.title, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 20.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Text(
@@ -515,4 +523,21 @@ fun EffortItems(selected: String, onSelect: (String) -> Unit) {
             trailingIcon = { if (value == selected) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
         )
     }
+}
+
+/** A port the task listens on; opens it in the browser, on the bridge's host. */
+@Composable
+private fun PortChip(port: Int, host: String) {
+    val context = LocalContext.current
+    Text(
+        ":$port", color = C.GreenPill, fontSize = 12.sp, fontFamily = Mono, fontWeight = FontWeight.Medium,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(C.GreenBg)
+            .clickable(role = Role.Button, onClickLabel = "Open in browser") {
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://$host:$port"))) }
+            }
+            .semantics { contentDescription = "Listening on port $port" }
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
 }

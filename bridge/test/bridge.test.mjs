@@ -841,3 +841,34 @@ test('processes: listed with their task, paused, resumed, restarted and killed',
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('ports a task\'s processes listen on show in its summary, and go when they stop', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_PORTS_CHECK_MS: '200' });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  let server;
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'serve', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    // A dev server Claude started (detached, so found by the session id in its environment).
+    server = spawn(process.execPath, ['-e', "const s = require('http').createServer(() => {}).listen(0, '127.0.0.1', () => console.log(s.address().port))"],
+      { detached: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, CLAUDE_CODE_SESSION_ID: session.id } });
+    const served = Number(await new Promise((r) => server.stdout.once('data', (d) => r(String(d).trim()))));
+    const up = await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.ports?.length, 5000);
+    assert.deepEqual(up.session.ports, [served]);
+    server.kill('SIGKILL');
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.ports?.length === 0, 5000);
+    c.end();
+  } finally {
+    try { server?.kill('SIGKILL'); } catch {}
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

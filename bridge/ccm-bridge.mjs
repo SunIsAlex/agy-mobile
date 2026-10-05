@@ -361,6 +361,7 @@ class Session {
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
       running: this.link !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
       background: this.background.map((t) => t.description),
+      ports: this.ports ?? [],
     };
   }
 
@@ -1182,6 +1183,64 @@ async function restartProcess(pid) {
   return { pid: child.pid, log };
 }
 
+// ---------- listening ports ----------
+
+// TCP ports that processes a task started are listening on (a dev server, say), for the task list.
+const PORTS_CHECK_MS = Number(process.env.CCM_PORTS_CHECK_MS ?? 5000);
+
+/** Listening sockets by inode, from /proc/net/tcp and tcp6 (through su where an app can't read them). */
+async function listeningSockets() {
+  let text = '';
+  try { text = fs.readFileSync('/proc/net/tcp', 'utf8') + fs.readFileSync('/proc/net/tcp6', 'utf8'); } catch {
+    if (!phoneAvailable) return new Map();
+    text = await new Promise((resolve) => execFile(process.env.CCM_SU ?? 'su', ['-c', 'cat /proc/net/tcp /proc/net/tcp6'],
+      { timeout: 5000, maxBuffer: 4 << 20 }, (err, out) => resolve(err ? '' : out)));
+  }
+  const byInode = new Map();
+  for (const line of text.split('\n')) {
+    const f = line.trim().split(/\s+/);
+    if (f[3] !== '0A' || !f[1]?.includes(':')) continue; // 0A: LISTEN
+    byInode.set(f[9], parseInt(f[1].split(':')[1], 16));
+  }
+  return byInode;
+}
+
+/** Ports each task's processes listen on, by session id (the bridge's and Claude's own are left out). */
+async function taskPorts() {
+  const sockets = await listeningSockets();
+  const ports = new Map();
+  if (!sockets.size) return ports;
+  for (const p of listProcesses()) {
+    if (p.role !== 'job' || !p.sid) continue;
+    let fds = [];
+    try { fds = fs.readdirSync(`/proc/${p.pid}/fd`); } catch { continue; }
+    for (const fd of fds) {
+      let link;
+      try { link = fs.readlinkSync(`/proc/${p.pid}/fd/${fd}`); } catch { continue; }
+      const port = sockets.get(link.match(/^socket:\[(\d+)\]$/)?.[1]);
+      if (port) (ports.get(p.sid) ?? ports.set(p.sid, new Set()).get(p.sid)).add(port);
+    }
+  }
+  return ports;
+}
+
+let checkingPorts = false;
+async function updatePorts() {
+  if (checkingPorts || !clients.size) return; // only while someone is looking
+  checkingPorts = true;
+  try {
+    const ports = await taskPorts();
+    for (const s of sessions.values()) {
+      const now = [...(ports.get(s.id) ?? [])].sort((a, b) => a - b);
+      if (now.join() === (s.ports ?? []).join()) continue;
+      s.ports = now;
+      broadcast({ ev: 'session', session: s.summary() });
+    }
+  } finally {
+    checkingPorts = false;
+  }
+}
+
 // ---------- repos & git ----------
 
 function currentBranch(repo) {
@@ -1404,6 +1463,7 @@ loadSessions();
 function resumeDue() { for (const s of sessions.values()) s.resumeIfDue(); }
 resumeDue();
 setInterval(resumeDue, RESUME_CHECK_MS);
+setInterval(updatePorts, PORTS_CHECK_MS);
 phoneAvailable = await detectPhone();
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {

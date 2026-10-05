@@ -37,6 +37,8 @@ data class SessionSummary(
     val resumeAt: Long? = null,
     /** Background jobs Claude is waiting on (it wakes up when each finishes). */
     val background: List<String> = emptyList(),
+    /** TCP ports the task's processes listen on (a dev server, say). */
+    val ports: List<Int> = emptyList(),
 ) {
     val isActive: Boolean get() = status == "working" || status == "needs_approval"
     /** Not finished: working, waiting for approval, paused by a usage limit, or running background work. */
