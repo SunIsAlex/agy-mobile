@@ -60,6 +60,13 @@ tool call; tap one for full screen, then swipe, pinch or double-tap to zoom. The
 from tasks before this was added are recovered from Claude Code's own transcript the first time
 the task is opened.
 
+**Debian terminal** (`>_` on the task list, or long-press the app icon › *Debian terminal*): a shell in the
+Debian chroot, as `claude`. It's a real terminal (xterm.js, so vim, htop and colors work) with an
+extra-keys row (Esc, Tab, sticky Ctrl/Alt, arrows, Home/End, PgUp/PgDn), copy, paste and text size.
+The shell keeps running when you leave the screen; coming back shows what it printed meanwhile. The
+bridge runs it in a pseudo-terminal through `bridge/ptyhost.py` (Python's standard library); from the
+Termux bridge it enters the chroot with `ccm-chroot shell`.
+
 **Processes** (terminal icon on the task list): everything running as Termux's user, grouped by the task
 that started it, including jobs Claude detached with nohup/setsid (found by the session id Claude Code
 puts in their environment). Each shows its command, folder, CPU, memory and age, and can be stopped,

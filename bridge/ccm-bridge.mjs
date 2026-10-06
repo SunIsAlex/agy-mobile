@@ -76,6 +76,7 @@ const attachmentsDir = path.join(stateDir, 'attachments');
 const imagesDir = path.join(stateDir, 'images');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
 const phoneMcp = path.join(path.dirname(fileURLToPath(import.meta.url)), 'phone-mcp.mjs');
+const ptyPy = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ptyhost.py'); // not pty.py: that would shadow Python's pty
 const keeperJs = path.join(path.dirname(fileURLToPath(import.meta.url)), 'keeper.mjs');
 // One folder per running Claude process; see keeper.mjs and KeeperLink.
 const keepersDir = path.join(stateDir, 'keepers');
@@ -1183,6 +1184,65 @@ async function restartProcess(pid) {
   return { pid: child.pid, log };
 }
 
+// ---------- terminal ----------
+
+// A shell in the Debian chroot for the app's Terminal screen. It runs in a pseudo-terminal (ptyhost.py)
+// and outlives the screen: closing the screen detaches, and reopening replays recent output.
+const TERM_BUFFER = 256 * 1024;
+/** @type {Map<string, Terminal>} */
+const terminals = new Map();
+
+/** A login shell in the Debian chroot: bash itself for the chroot's bridge, else through ccm-chroot. */
+function chrootShell() {
+  if (process.env.CCM_TERM_SHELL) return process.env.CCM_TERM_SHELL.split(' ');
+  if (fs.existsSync('/etc/debian_version') && !process.execPath.includes('/com.termux/')) return ['bash', '-l'];
+  if (!fs.existsSync('/data/ccm/ccm-chroot')) throw new Error("The Debian chroot isn't installed. Set it up with: sh chroot/ccm-chroot install");
+  return [process.env.CCM_SU ?? 'su', '-c', `sh ${path.join(path.dirname(ptyPy), '..', 'chroot', 'ccm-chroot')} shell`];
+}
+
+class Terminal {
+  constructor(cols, rows) {
+    this.id = randomUUID();
+    this.chunks = [];
+    this.size = 0;
+    this.clients = new Set();
+    const shell = chrootShell();
+    this.proc = spawn('python3', [ptyPy, String(cols), String(rows), ...shell], {
+      cwd: os.homedir(), env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' }, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+    });
+    for (const s of [this.proc.stdin, this.proc.stdio[3]]) s.on('error', () => {});
+    this.proc.stdout.on('data', (d) => this.output(d));
+    this.proc.stderr.on('data', (d) => this.output(d));
+    this.proc.on('error', (e) => this.output(Buffer.from(`\r\nCan't start the terminal: ${e.message}\r\n`)));
+    this.proc.on('close', (code) => {
+      terminals.delete(this.id);
+      for (const c of this.clients) c.send({ ev: 'term_exit', id: this.id, code });
+    });
+    terminals.set(this.id, this);
+  }
+
+  output(data) {
+    this.chunks.push(data);
+    this.size += data.length;
+    while (this.size > TERM_BUFFER && this.chunks.length > 1) this.size -= this.chunks.shift().length;
+    const msg = { ev: 'term_output', id: this.id, data: data.toString('base64') };
+    for (const c of this.clients) c.send(msg);
+  }
+
+  replay() { return Buffer.concat(this.chunks).toString('base64'); }
+  write(base64) { this.proc.stdin.write(Buffer.from(String(base64 ?? ''), 'base64')); }
+  resize(cols, rows) {
+    if (cols > 0 && rows > 0) this.proc.stdio[3].write(`${Math.min(cols, 1000)} ${Math.min(rows, 1000)}\n`);
+  }
+  close() { this.proc.kill('SIGTERM'); } // the shell gets SIGHUP when the terminal closes
+}
+
+function terminalFor(id) {
+  const term = terminals.get(String(id ?? ''));
+  if (!term) throw new Error('That terminal has ended.');
+  return term;
+}
+
 // ---------- listening ports ----------
 
 // TCP ports that processes a task started are listening on (a dev server, say), for the task list.
@@ -1312,7 +1372,10 @@ class Client {
     socket.setEncoding('utf8');
     socket.setKeepAlive(true, 30_000);
     socket.on('data', (c) => this.onData(c));
-    socket.on('close', () => clients.delete(this));
+    socket.on('close', () => {
+      clients.delete(this);
+      for (const term of terminals.values()) term.clients.delete(this);
+    });
     socket.on('error', () => {});
     // Unauthenticated connections get 10 s to say hello.
     this.helloTimer = setTimeout(() => { if (!this.authed) socket.destroy(); }, 10_000);
@@ -1385,6 +1448,20 @@ class Client {
         this.send({ ev: 'started', ref, session: session.summary() });
         break;
       }
+      case 'term_open': {
+        // Attaches to the running terminal (or the one asked for), or starts one.
+        const cols = Number(msg.cols) || 80;
+        const rows = Number(msg.rows) || 24;
+        const term = terminals.get(String(msg.id ?? '')) ?? (msg.fresh ? null : [...terminals.values()].at(-1)) ?? new Terminal(cols, rows);
+        term.clients.add(this);
+        if (msg.cols && msg.rows) term.resize(cols, rows); // attaching without a size leaves it as it is
+        this.send({ ev: 'term_opened', ref, id: term.id, data: term.replay() });
+        break;
+      }
+      case 'term_input': terminalFor(msg.id).write(msg.data); break;
+      case 'term_resize': terminalFor(msg.id).resize(Number(msg.cols), Number(msg.rows)); break;
+      case 'term_detach': terminals.get(String(msg.id ?? ''))?.clients.delete(this); break;
+      case 'term_close': terminalFor(msg.id).close(); break;
       case 'processes': this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'signal': signalProcess(Number(msg.pid), String(msg.signal)); this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'restart_process': {

@@ -44,6 +44,7 @@ import app.ccmobile.ui.SessionScreen
 import app.ccmobile.ui.SettingsScreen
 import app.ccmobile.ui.TasksScreen
 import app.ccmobile.ui.UsageScreen
+import app.ccmobile.ui.TerminalScreen
 import app.ccmobile.ui.applyTheme
 import app.ccmobile.ui.ProcessesScreen
 
@@ -54,6 +55,7 @@ sealed interface Screen {
     data object Settings : Screen
     data object Usage : Screen
     data object Processes : Screen
+    data object Terminal : Screen
 }
 
 class Nav : ViewModel() {
@@ -61,6 +63,8 @@ class Nav : ViewModel() {
     fun push(screen: Screen) { if (stack.lastOrNull() != screen) stack.add(screen) }
     fun pop() { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
 }
+
+const val EXTRA_SCREEN = "screen"
 
 data class PairRequest(val host: String, val port: Int, val token: String)
 
@@ -145,6 +149,8 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         intent?.getStringExtra(Notifier.EXTRA_SID)?.let { nav.push(Screen.Session(it)) }
+        // The "Debian terminal" launcher shortcut (res/xml/shortcuts.xml).
+        if (intent?.getStringExtra(EXTRA_SCREEN) == "terminal") nav.push(Screen.Terminal)
         val uri: Uri = intent?.data ?: return
         if (uri.scheme == "ccmobile" && uri.host == "pair") {
             val host = uri.getQueryParameter("host")
@@ -175,11 +181,12 @@ private fun AppRoot(repository: Repository, nav: Nav) {
             Screen.Tasks -> TasksScreen(
                 repository, onOpen = { nav.push(Screen.Session(it)) },
                 onSettings = { nav.push(Screen.Settings) }, onUsage = { nav.push(Screen.Usage) },
-                onProcesses = { nav.push(Screen.Processes) },
+                onProcesses = { nav.push(Screen.Processes) }, onTerminal = { nav.push(Screen.Terminal) },
             )
             is Screen.Session -> SessionScreen(repository, screen.sid, onBack = nav::pop, onDiff = { nav.push(Screen.Diff(screen.sid)) })
             is Screen.Diff -> DiffScreen(repository, screen.sid, onBack = nav::pop)
             Screen.Usage -> UsageScreen(repository, onBack = nav::pop)
+            Screen.Terminal -> TerminalScreen(repository, onBack = nav::pop)
             Screen.Processes -> ProcessesScreen(repository, onBack = nav::pop, onOpenTask = { nav.push(Screen.Session(it)) })
             Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null)
         }

@@ -2,6 +2,7 @@ package app.ccmobile.data
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -65,6 +66,12 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     /** True while an activity is visible; approval notifications are held back then. */
     val foreground = MutableStateFlow(false)
 
+    private val _terminal = MutableSharedFlow<JsonObject>(extraBufferCapacity = 4096)
+    /** term_output and term_exit events for the Terminal screen. */
+    val terminal: SharedFlow<JsonObject> = _terminal
+    // Keystrokes go out one at a time, in order (separate coroutines could reorder fast typing).
+    private val termInputs = Channel<Pair<String, String>>(Channel.UNLIMITED)
+
     private val transcripts = HashMap<String, Transcript>()
     // Images are about a megabyte each; keep the recent ones so scrolling back doesn't refetch.
     private val imageCache = object : LruCache<String, ByteArray>(32 * 1024 * 1024) {
@@ -78,6 +85,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     private val quietRefs = mutableSetOf<Int>()
 
     init {
+        scope.launch { for ((id, data) in termInputs) send("term_input", "id" to id, "data" to data) }
         scope.launch { client.events.collect(::onEvent) }
         scope.launch {
             client.state.collect { state ->
@@ -193,6 +201,19 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         else -> processList(reply)?.let { Result.success(it) } ?: Result.failure(Exception("Bad reply"))
     }
 
+    /** Opens (or attaches to) the Debian terminal; returns its id and recent output (base64), or the bridge's error. */
+    suspend fun termOpen(cols: Int, rows: Int, id: String?, fresh: Boolean = false): Result<Pair<String, String>> {
+        val reply = call("term_open", quiet = true, "cols" to cols, "rows" to rows, "id" to id, "fresh" to fresh.takeIf { it })
+            ?: return Result.failure(Exception("The bridge didn't answer."))
+        if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't open the terminal."))
+        return Result.success((reply.str("id") ?: "") to (reply.str("data") ?: ""))
+    }
+
+    fun termInput(id: String, base64: String) { termInputs.trySend(id to base64) }
+    fun termResize(id: String, cols: Int, rows: Int) = fire("term_resize", "id" to id, "cols" to cols, "rows" to rows)
+    fun termDetach(id: String) { scope.launch { send("term_detach", "id" to id) } }
+    fun termClose(id: String) = fire("term_close", "id" to id)
+
     fun refreshClaudeSessions() = fire("claude_sessions")
 
     fun open(sid: String) {
@@ -303,6 +324,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             }
             "claude_sessions" -> _claudeSessions.value =
                 json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
+            "term_output", "term_exit" -> { _terminal.tryEmit(ev); return }
             "limits" -> ev.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
             "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
             "history" -> {

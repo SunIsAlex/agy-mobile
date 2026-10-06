@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- The Terminal screen's emulator: xterm.js (MIT, see LICENSE-xterm.txt) in a WebView. TerminalScreen.kt
+     talks to it through window.ccm (app to page) and the Android object (page to app); bytes cross as base64. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="xterm.css">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  #term { position: absolute; top: 4px; right: 4px; bottom: 4px; left: 8px; }
+  .xterm .xterm-viewport { scrollbar-width: none; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script>
+  const term = new Terminal({
+    fontFamily: 'monospace', fontSize: 13, lineHeight: 1.1, cursorBlink: true, scrollback: 5000,
+    macOptionIsMeta: true, rightClickSelectsWord: true,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+
+  const encoder = new TextEncoder();
+  const toBase64 = (bytes) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
+  const fromBase64 = (b64) => { const s = atob(b64); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+
+  // Sticky Ctrl and Alt from the extra keys: they apply to the next key typed, then switch off.
+  let ctrl = false, alt = false;
+  function send(text) {
+    let bytes = encoder.encode(text);
+    if (ctrl && text.length === 1) {
+      const c = text.toUpperCase().charCodeAt(0);
+      if (c >= 64 && c <= 95) bytes = new Uint8Array([c & 31]);
+      else if (text === ' ') bytes = new Uint8Array([0]);
+    }
+    if (alt) bytes = new Uint8Array([27, ...bytes]);
+    if (ctrl || alt) { ctrl = alt = false; Android.modifiersUsed(); }
+    Android.input(toBase64(bytes));
+  }
+  term.onData(send);
+  term.onBinary((s) => Android.input(btoa(s)));
+
+  let cols = 0, rows = 0;
+  function refit() {
+    try { fit.fit(); } catch (e) { return; }
+    if (term.cols !== cols || term.rows !== rows) { cols = term.cols; rows = term.rows; Android.resize(cols, rows); }
+  }
+  // The WebView can start out with no height; re-measure whenever anything about the size may change.
+  new ResizeObserver(refit).observe(document.getElementById('term'));
+  window.addEventListener('resize', refit);
+  if (document.fonts) document.fonts.ready.then(refit);
+
+  window.ccm = {
+    write: (b64) => term.write(fromBase64(b64)),
+    refit,
+    reset: () => term.reset(),
+    theme: (t) => { term.options.theme = t; document.body.style.background = t.background; },
+    font: (size) => { term.options.fontSize = size; refit(); },
+    paste: (text) => term.paste(text),
+    focus: () => term.focus(),
+    modifiers: (c, a) => { ctrl = c; alt = a; },
+    selection: () => term.getSelection(),
+  };
+  refit();
+  Android.ready(term.cols, term.rows);
+</script>
+</body>
+</html>

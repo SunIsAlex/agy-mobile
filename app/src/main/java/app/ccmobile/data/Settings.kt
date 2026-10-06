@@ -53,6 +53,10 @@ class Settings(context: Context) {
     var theme: String
         get() = prefs.getString("theme", "system")!!
         set(v) = prefs.edit { putString("theme", v) }
+    /** Text size in the Terminal screen. */
+    var terminalFont: Int
+        get() = prefs.getInt("terminalFont", 13)
+        set(v) = prefs.edit { putInt("terminalFont", v) }
     var notify: Boolean
         get() = prefs.getBoolean("notify", true)
         set(v) = prefs.edit { putBoolean("notify", v) }

@@ -872,3 +872,51 @@ test('ports a task\'s processes listen on show in its summary, and go when they 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('terminal: a shell in a real pty that resizes, survives detaching, and closes', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  fs.mkdirSync(path.join(tmp, 'repos'), { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_TERM_SHELL: 'sh' });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    let c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    let seen = '';
+    const until = async (text) => {
+      while (!seen.includes(text)) seen += Buffer.from((await c.next((m) => m.ev === 'term_output')).data, 'base64').toString();
+    };
+    c.send({ op: 'term_open', ref: 1, cols: 100, rows: 30 });
+    const { id } = await c.next((m) => m.ev === 'term_opened');
+    const type = (s) => c.send({ op: 'term_input', id, data: Buffer.from(s).toString('base64') });
+    type('stty size; echo mark-$((6*7))\n');
+    await until('30 100');
+    await until('mark-42');
+    c.send({ op: 'term_resize', id, cols: 120, rows: 40 });
+    await new Promise((r) => setTimeout(r, 200));
+    type('stty size\n');
+    await until('40 120');
+
+    // Leaving the screen detaches; opening again finds the same shell and what it printed.
+    c.send({ op: 'term_detach', id });
+    c.end();
+    c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'term_open', ref: 2, cols: 120, rows: 40 });
+    const again = await c.next((m) => m.ev === 'term_opened');
+    assert.equal(again.id, id);
+    assert.match(Buffer.from(again.data, 'base64').toString(), /mark-42/);
+
+    c.send({ op: 'term_close', id });
+    await c.next((m) => m.ev === 'term_exit' && m.id === id);
+    c.send({ op: 'term_input', ref: 3, id, data: '' });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 3)).message, /ended/);
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
