@@ -2,6 +2,7 @@ package app.ccmobile.data
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -86,10 +87,13 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
 
     init {
         scope.launch { for ((id, data) in termInputs) send("term_input", "id" to id, "data" to data) }
-        scope.launch { client.events.collect(::onEvent) }
+        // Subscribed before any connection exists: the bridge sends its task list right after hello,
+        // and an event emitted before anyone collects is lost (that left the task list nearly empty).
+        scope.launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect(::onEvent) }
         scope.launch {
             client.state.collect { state ->
                 if (state is ConnState.Connected) {
+                    send("sessions") // also sent unasked on connect; asking again can't hurt
                     send("repos")
                     open.forEach { send("subscribe", "sid" to it) }
                 }
