@@ -559,6 +559,31 @@ class Session {
     });
   }
 
+  /**
+   * Moves the task to another working folder. Claude restarts there on the next message and resumes
+   * the same session (Claude Code finds a session by id from any folder and keeps appending to its
+   * transcript); project memory is then the new folder's. Refused while Claude is busy, since
+   * restarting it would cut that work off.
+   */
+  async moveTo(dir) {
+    const target = path.resolve(String(dir ?? '').replace(/^~(?=$|\/)/, os.homedir()));
+    if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) throw new Error(`Not a folder: ${target}`);
+    if (target === this.cwd) return;
+    if (['working', 'needs_approval'].includes(this.status) || this.background.length) {
+      throw new Error('Claude is busy in this task. Wait for it to finish, or stop it, then change the folder.');
+    }
+    if (this.link) {
+      this.link.kill();
+      for (let i = 0; i < 100 && this.link; i++) await new Promise((r) => setTimeout(r, 100));
+      if (this.link) throw new Error("Claude didn't stop; try again.");
+    }
+    const from = this.cwd;
+    this.cwd = target;
+    this.ports = [];
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: `Working folder: ${target} (was ${from})` });
+    this.setStatus(this.status === 'stopped' || this.status === 'error' ? 'idle' : this.status);
+  }
+
   setPhone(on) {
     if (on && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
     this.phone = on;
@@ -1497,6 +1522,7 @@ class Client {
       }
       case 'send': s.sendUser(String(msg.text ?? ''), msg.attachments); break;
       case 'phone': s.setPhone(!!msg.on); break;
+      case 'cwd': await s.moveTo(msg.cwd); this.send({ ev: 'session', ref, session: s.summary() }); break;
       case 'auto_continue': s.setAutoContinue(!!msg.on); break;
       // From the app's alarm at a task's resumeAt, which wakes the phone: check now.
       case 'tick': resumeDue(); this.send({ ev: 'tock', ref }); break;

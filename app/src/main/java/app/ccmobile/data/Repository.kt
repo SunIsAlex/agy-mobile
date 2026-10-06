@@ -218,6 +218,15 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     fun termDetach(id: String) { scope.launch { send("term_detach", "id" to id) } }
     fun termClose(id: String) = fire("term_close", "id" to id)
 
+    /** Moves task [sid] to working folder [cwd]; Claude carries on there from the next message. */
+    suspend fun moveTask(sid: String, cwd: String): Result<Unit> {
+        val reply = call("cwd", quiet = true, "sid" to sid, "cwd" to cwd)
+            ?: return Result.failure(Exception("The bridge didn't answer."))
+        if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't change the folder."))
+        reply.obj("session")?.let { upsertSession(json.decodeFromJsonElement(SessionSummary.serializer(), it)) }
+        return Result.success(Unit)
+    }
+
     fun refreshClaudeSessions() = fire("claude_sessions")
 
     fun open(sid: String) {

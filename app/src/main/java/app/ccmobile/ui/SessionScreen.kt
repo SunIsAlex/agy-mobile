@@ -31,6 +31,10 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
@@ -118,6 +122,8 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
             var menu by remember { mutableStateOf(false) }
             var effortMenu by remember { mutableStateOf(false) }
+            var moving by remember { mutableStateOf(false) }
+            if (moving && session != null) MoveFolderDialog(repository, session) { moving = false }
             Box {
                 IconBtn(R.drawable.ic_more, "More options", { menu = true })
                 DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
@@ -149,6 +155,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                         text = { Text(if (session?.autoContinue == true) "Don't continue after usage limits" else "Continue after usage limits reset") },
                         onClick = { menu = false; repository.setAutoContinue(sid, session?.autoContinue != true) },
                     )
+                    DropdownMenuItem(text = { Text("Change folder…") }, onClick = { menu = false; repository.refreshRepos(); moving = true })
                     DropdownMenuItem(text = { Text("Stop session") }, onClick = { menu = false; repository.stop(sid) })
                     DropdownMenuItem(text = { Text("Archive") }, onClick = { menu = false; repository.archive(sid); onBack() })
                 }
@@ -419,4 +426,58 @@ private fun LimitBanner(session: SessionSummary, onAutoContinue: (Boolean) -> Un
             Text("Auto", color = C.Muted, fontSize = 11.sp)
         }
     }
+}
+
+/** Picks a new working folder for the task: one of the bridge's projects, or any path. */
+@Composable
+private fun MoveFolderDialog(repository: Repository, session: SessionSummary, onDone: () -> Unit) {
+    val repos by repository.repos.collectAsStateWithLifecycle()
+    var path by remember { mutableStateOf(session.cwd) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = onDone,
+        title = { Text("Change folder") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Claude carries on in the new folder from your next message, in the same conversation. Its project memory is the new folder\u2019s.",
+                    color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp,
+                )
+                OutlinedTextField(
+                    value = path, onValueChange = { path = it; error = null }, singleLine = true,
+                    label = { Text("Folder") }, textStyle = TextStyle(fontFamily = Mono, fontSize = 13.sp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                error?.let { Text(it, color = C.Red, fontSize = 13.sp) }
+                Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState())) {
+                    repos.forEach { r ->
+                        Text(
+                            r.path.replace(Regex("^/data/data/com\\.termux/files/home"), "~"),
+                            color = if (r.path == path) C.ClayText else C.TextSoft, fontSize = 13.sp, fontFamily = Mono,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                .clickable(role = Role.Button) { path = r.path; error = null }.padding(vertical = 9.dp, horizontal = 4.dp),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy && path.isNotBlank() && path.trim() != session.cwd,
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        repository.moveTask(session.id, path.trim())
+                            .onSuccess { onDone() }
+                            .onFailure { error = it.message }
+                        busy = false
+                    }
+                },
+            ) { Text(if (busy) "Moving…" else "Move") }
+        },
+        dismissButton = { TextButton(onClick = onDone) { Text("Cancel") } },
+    )
 }

@@ -920,3 +920,45 @@ test('terminal: a shell in a real pty that resizes, survives detaching, and clos
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('a task moves to another working folder and Claude carries on there', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const a = path.join(tmp, 'repos', 'a');
+  const b = path.join(tmp, 'repos', 'b');
+  fs.mkdirSync(a, { recursive: true });
+  fs.mkdirSync(b, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: a, prompt: 'first', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    await c.next((m) => m.ev === 'session' && m.session.status === 'idle');
+
+    c.send({ op: 'cwd', ref: 2, sid: session.id, cwd: b });
+    assert.equal((await c.next((m) => m.ev === 'session' && m.ref === 2)).session.cwd, b);
+    c.send({ op: 'subscribe', sid: session.id });
+    await c.next((m) => m.ev === 'history');
+    c.send({ op: 'send', sid: session.id, text: 'second' });
+    const init = await c.next((m) => m.ev === 'cli' && m.msg.type === 'system' && m.msg.subtype === 'init' && m.msg.cwd === b);
+    assert.equal(init.msg.cwd, b);
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
+
+    c.send({ op: 'cwd', ref: 3, sid: session.id, cwd: path.join(tmp, 'nope') });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 3)).message, /Not a folder/);
+    // Busy: a background job is running.
+    c.send({ op: 'send', sid: session.id, text: 'run in the background for 60000 ms' });
+    const sentAt = Date.now();
+    await c.next((m) => m.ev === 'session' && m.session.background.length && m.session.updatedAt >= sentAt);
+    c.send({ op: 'cwd', ref: 4, sid: session.id, cwd: a });
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 4)).message, /busy/);
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
