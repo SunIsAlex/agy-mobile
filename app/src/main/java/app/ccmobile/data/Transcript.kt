@@ -122,6 +122,8 @@ class Transcript(private val sid: String, private val title: String) {
     }
 
     private fun onUser(msg: JsonObject) {
+        // Notes Claude Code adds for the model (an image's size, say), not the user's words.
+        if (msg.bool("isSynthetic") == true) return
         when (val content = msg.obj("message")?.get("content")) {
             is JsonPrimitive -> add(UserItem(nextKey(), content.content, attachmentNames(msg)))
             is kotlinx.serialization.json.JsonArray -> for (block in content) {

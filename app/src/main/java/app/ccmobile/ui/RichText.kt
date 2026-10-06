@@ -33,7 +33,8 @@ fun RichText(text: String) {
     }
 }
 
-private val Color_Body = C.Text.copy(alpha = 0.92f)
+// A getter, not a value: it must follow the theme when it changes.
+private val Color_Body get() = C.Text.copy(alpha = 0.92f)
 
 private fun parseBlocks(text: String): List<Block> {
     val blocks = mutableListOf<Block>()

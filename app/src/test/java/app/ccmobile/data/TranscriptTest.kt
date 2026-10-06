@@ -117,4 +117,12 @@ class TranscriptTest {
         val ends = t.snapshot().filterIsInstance<TurnEndItem>().map { it.text }
         assertEquals(listOf("Done · 2s · \$11.40", "Done · 4s · \$0.47"), ends)
     }
+
+    @Test
+    fun syntheticUserMessagesAreNotShownAsTheUsers() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Image: original 1264x2780, displayed at 909x2000.]"}]},"isSynthetic":true}"""))
+        t.apply(msg("""{"type":"user","message":{"role":"user","content":"Sorry for the typo."},"local":true}"""))
+        assertEquals(listOf("Sorry for the typo."), t.snapshot().filterIsInstance<UserItem>().map { it.text })
+    }
 }
