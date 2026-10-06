@@ -80,6 +80,14 @@ const ptyPy = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ptyhost.p
 const keeperJs = path.join(path.dirname(fileURLToPath(import.meta.url)), 'keeper.mjs');
 // One folder per running Claude process; see keeper.mjs and KeeperLink.
 const keepersDir = path.join(stateDir, 'keepers');
+// Claude Code's native installer puts `claude` in ~/.local/bin, which shells started by an app (Termux's
+// RUN_COMMAND, the app's Start button) may not have on PATH; without it `claude` can resolve to a
+// broken npm copy ("claude native binary not installed"). Claude's own commands inherit this PATH.
+{
+  const localBin = path.join(os.homedir(), '.local', 'bin');
+  const dirs = (process.env.PATH ?? '').split(':');
+  if (fs.existsSync(localBin) && !dirs.includes(localBin)) process.env.PATH = [localBin, ...dirs.filter(Boolean)].join(':');
+}
 const claudeBin = process.env.CCM_CLAUDE_BIN ?? 'claude';
 const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects');
 // bypassPermissions is the app's "YOLO" mode: tools run without asking. Claude Code still sends
