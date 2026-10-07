@@ -122,6 +122,10 @@ data class ProcInfo(
 @Serializable
 data class Repo(val path: String, val name: String, val branch: String? = null)
 
+/** One of Claude's questions (AskUserQuestion) and its choices. */
+data class Question(val question: String, val header: String, val multiSelect: Boolean, val options: List<QuestionOption>)
+data class QuestionOption(val label: String, val description: String)
+
 /** A pending `can_use_tool` request from Claude Code, waiting for the user. */
 data class Approval(
     val sid: String,
@@ -131,6 +135,8 @@ data class Approval(
     val summary: String,
     val detail: String,
     val canAlways: Boolean,
+    /** Set when Claude is asking (AskUserQuestion): answered by choosing, not by allowing. */
+    val questions: List<Question> = emptyList(),
 )
 
 fun JsonObject.str(key: String): String? = (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
@@ -156,7 +162,21 @@ fun approvalFrom(sid: String, sessionTitle: String, message: JsonObject): Approv
         summary = ToolText.summary(tool, input),
         detail = ToolText.detail(tool, input),
         canAlways = canAlways,
+        questions = if (tool == "AskUserQuestion") questionsIn(input) else emptyList(),
     )
+}
+
+private fun questionsIn(input: JsonObject): List<Question> = input.arr("questions").orEmpty().mapNotNull { q ->
+    (q as? JsonObject)?.let {
+        Question(
+            question = it.str("question") ?: return@let null,
+            header = it.str("header").orEmpty(),
+            multiSelect = it.bool("multiSelect") == true,
+            options = it.arr("options").orEmpty().mapNotNull { o ->
+                (o as? JsonObject)?.str("label")?.let { label -> QuestionOption(label, o.str("description").orEmpty()) }
+            },
+        )
+    }
 }
 
 /** Short, human-readable descriptions of tool calls. */

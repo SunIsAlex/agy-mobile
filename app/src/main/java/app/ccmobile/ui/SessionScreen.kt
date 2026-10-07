@@ -31,6 +31,8 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import app.ccmobile.data.Question
+import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.material3.OutlinedTextField
@@ -194,7 +196,13 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
         if (session?.status == "limited" && approval == null) {
             LimitBanner(session) { repository.setAutoContinue(sid, it) }
         }
-        if (approval != null) {
+        if (approval != null && approval.questions.isNotEmpty()) {
+            QuestionCard(
+                approval,
+                onSend = { repository.answerQuestions(approval, it) },
+                onSkip = { repository.answerQuestions(approval, null) },
+            )
+        } else if (approval != null) {
             PermissionCard(
                 approval,
                 onDeny = { repository.answer(approval, allow = false) },
@@ -234,11 +242,17 @@ private fun TranscriptItem(item: Item, onDiff: () -> Unit, loadImage: ImageLoade
         is AssistantItem -> RichText(item.text)
         is ToolItem -> ToolRow(item, onDiff, loadImage) { onImage(item, it) }
         is PermissionItem -> {
-            val (text, color) = when (item.decision) {
+            val asking = item.approval.questions.isNotEmpty()
+            val (text, color) = when {
+                asking && item.decision == null -> "Claude is asking: ${item.approval.questions.first().question}" to C.ClayPill
+                asking && item.decision == "allow" -> "You replied to Claude\u2019s question" to C.Muted
+                asking -> "Claude\u2019s question was withdrawn" to C.Faint
+                else -> when (item.decision) {
                 null -> "Waiting for your approval: ${item.approval.toolName}" to C.ClayPill
                 "allow" -> "You allowed ${item.approval.toolName}" to C.Muted
                 "deny" -> "You denied ${item.approval.toolName}" to C.Red
                 else -> "Approval request withdrawn" to C.Faint
+                }
             }
             Text(text, color = color, fontSize = 12.sp, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
         }
@@ -480,4 +494,82 @@ private fun MoveFolderDialog(repository: Repository, session: SessionSummary, on
         },
         dismissButton = { TextButton(onClick = onDone) { Text("Cancel") } },
     )
+}
+
+/** Claude's questions (AskUserQuestion): pick an option, several where allowed, or write your own answer. */
+@Composable
+private fun QuestionCard(approval: Approval, onSend: (Map<String, String>) -> Unit, onSkip: () -> Unit) {
+    val picks = remember(approval.requestId) { mutableStateMapOf<Int, Set<String>>() }
+    val other = remember(approval.requestId) { mutableStateMapOf<Int, String>() }
+    fun answerFor(i: Int, q: Question): String? {
+        val own = other[i]?.trim().orEmpty()
+        val chosen = q.options.map { it.label }.filter { it in (picks[i] ?: emptySet()) }
+        val parts = if (q.multiSelect) chosen + listOfNotNull(own.ifEmpty { null }) else listOf(own.ifEmpty { chosen.firstOrNull() ?: "" })
+        return parts.filter { it.isNotEmpty() }.joinToString(", ").ifEmpty { null }
+    }
+    val answers = approval.questions.mapIndexedNotNull { i, q -> answerFor(i, q)?.let { q.question to it } }.toMap()
+    Column(
+        Modifier
+            .padding(8.dp)
+            .fillMaxWidth()
+            .heightIn(max = 520.dp)
+            .clip(RoundedCornerShape(22.dp))
+            .background(C.PermBg)
+            .border(1.dp, C.PermBorder, RoundedCornerShape(22.dp))
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(if (approval.questions.size == 1) "Claude has a question" else "Claude has ${approval.questions.size} questions",
+            color = C.ClayText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        approval.questions.forEachIndexed { i, q ->
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (q.header.isNotBlank()) Text(q.header.uppercase(), color = C.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp)
+                Text(q.question, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp)
+                q.options.forEach { opt ->
+                    val on = opt.label in (picks[i] ?: emptySet())
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (on) C.ClayBg else C.Card)
+                            .border(1.dp, if (on) C.Clay else C.Border, RoundedCornerShape(12.dp))
+                            .clickable(role = if (q.multiSelect) Role.Checkbox else Role.RadioButton) {
+                                val now = picks[i] ?: emptySet()
+                                picks[i] = if (q.multiSelect) (if (on) now - opt.label else now + opt.label) else setOf(opt.label)
+                                if (!q.multiSelect) other.remove(i)
+                            }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Box(
+                            Modifier.padding(top = 2.dp).size(18.dp)
+                                .clip(if (q.multiSelect) RoundedCornerShape(4.dp) else RoundedCornerShape(9.dp))
+                                .border(2.dp, if (on) C.Clay else C.BorderStrong, if (q.multiSelect) RoundedCornerShape(4.dp) else RoundedCornerShape(9.dp))
+                                .background(if (on) C.Clay else Color.Transparent),
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(opt.label, color = C.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            if (opt.description.isNotBlank()) Text(opt.description, color = C.Muted, fontSize = 12.sp, lineHeight = 17.sp)
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = other[i].orEmpty(),
+                    onValueChange = { other[i] = it; if (!q.multiSelect && it.isNotBlank()) picks.remove(i) },
+                    placeholder = { Text("Other answer…", color = C.Faint) },
+                    textStyle = TextStyle(fontSize = 14.sp, color = C.Text),
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SecondaryButton("Skip", onSkip, Modifier.weight(1f))
+            PrimaryButton(
+                "Send", { onSend(answers) }, Modifier.weight(1f),
+                enabled = approval.questions.isNotEmpty() && answers.size == approval.questions.size,
+            )
+        }
+    }
 }

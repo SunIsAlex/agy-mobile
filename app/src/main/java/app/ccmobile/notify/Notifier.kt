@@ -64,6 +64,24 @@ object Notifier {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             ),
         )
+        if (approval.questions.isNotEmpty()) {
+            // A question needs an answer chosen in the app, which notification buttons can't give.
+            val q = approval.questions.first()
+            val question = NotificationCompat.Builder(context, CHANNEL_APPROVALS)
+                .setSmallIcon(R.drawable.ic_shield)
+                .setContentTitle("Claude has a question")
+                .setContentText(q.question)
+                .setSubText(approval.sessionTitle)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(q.question + "\n" + q.options.joinToString(" · ") { it.label }))
+                .setCategory(NotificationCompat.CATEGORY_REMINDER)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setContentIntent(openSessionIntent(context, approval.sid))
+                .setAutoCancel(true)
+                .build()
+            @Suppress("MissingPermission")
+            NotificationManagerCompat.from(context).notify(approval.requestId, 0, question)
+            return
+        }
         val notification = NotificationCompat.Builder(context, CHANNEL_APPROVALS)
             .setSmallIcon(R.drawable.ic_shield)
             .setContentTitle("Allow ${approval.toolName}?")

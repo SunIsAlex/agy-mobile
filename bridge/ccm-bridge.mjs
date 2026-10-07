@@ -601,12 +601,18 @@ class Session {
     this.setStatus(this.status === 'working' || this.status === 'needs_approval' ? 'idle' : this.status);
   }
 
-  answer(requestId, decision, always, message) {
+  /**
+   * [answers] replies to AskUserQuestion: {question text: chosen label(s) or the user's own words}.
+   * Claude Code reads them from the allowed input (allowing without them reads as "didn't answer").
+   */
+  answer(requestId, decision, always, message, answers) {
     const req = this.pending.get(requestId);
     if (!req) return false;
     this.pending.delete(requestId);
+    const ok = answers && typeof answers === 'object' && Object.values(answers).every((v) => typeof v === 'string');
+    const input = ok ? { ...req.request.input, answers } : req.request.input;
     const response = decision === 'allow'
-      ? { behavior: 'allow', updatedInput: req.request.input, ...(always && req.request.permission_suggestions ? { updatedPermissions: req.request.permission_suggestions.filter((s) => s.type === 'addRules') } : {}) }
+      ? { behavior: 'allow', updatedInput: input, ...(always && req.request.permission_suggestions ? { updatedPermissions: req.request.permission_suggestions.filter((s) => s.type === 'addRules') } : {}) }
       : { behavior: 'deny', message: message || 'The user denied this from the CC Mobile app.' };
     this.writeCli({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } });
     this.emitLocal({ type: 'bridge', subtype: 'permission_answer', request_id: requestId, decision, always: !!always });
@@ -1535,7 +1541,7 @@ class Client {
       // From the app's alarm at a task's resumeAt, which wakes the phone: check now.
       case 'tick': resumeDue(); this.send({ ev: 'tock', ref }); break;
       case 'permission':
-        if (!s.answer(msg.requestId, msg.decision === 'allow' ? 'allow' : 'deny', !!msg.always, msg.message)) {
+        if (!s.answer(msg.requestId, msg.decision === 'allow' ? 'allow' : 'deny', !!msg.always, msg.message, msg.answers)) {
           this.send({ ev: 'error', ref, message: 'That request was already answered.' });
         }
         broadcast({ ev: 'approval_done', sid: s.id, requestId: msg.requestId });

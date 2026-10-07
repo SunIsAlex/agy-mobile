@@ -962,3 +962,29 @@ test('a task moves to another working folder and Claude carries on there', async
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('Claude\'s questions (AskUserQuestion) get the user\'s answers', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port);
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'ask me something', mode: 'bypassPermissions' });
+    const { session } = await c.next((m) => m.ev === 'started');
+    const asked = await c.next((m) => m.ev === 'approval' && m.sid === session.id);
+    assert.equal(asked.request.request.tool_name, 'AskUserQuestion');
+    c.send({ op: 'permission', sid: session.id, requestId: asked.request.request_id, decision: 'allow', answers: { 'Which color?': 'Blue' } });
+    const result = await c.next((m) => m.ev === 'cli' && m.msg.type === 'user' && Array.isArray(m.msg.message.content) && m.msg.message.content[0].type === 'tool_result');
+    assert.equal(result.msg.message.content[0].content, 'answered {"Which color?":"Blue"}');
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

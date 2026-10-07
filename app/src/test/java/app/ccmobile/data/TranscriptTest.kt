@@ -125,4 +125,14 @@ class TranscriptTest {
         t.apply(msg("""{"type":"user","message":{"role":"user","content":"Sorry for the typo."},"local":true}"""))
         assertEquals(listOf("Sorry for the typo."), t.snapshot().filterIsInstance<UserItem>().map { it.text })
     }
+
+    @Test
+    fun askUserQuestionRequestsCarryTheirQuestions() {
+        val req = msg("""{"type":"control_request","request_id":"q-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Which color?","header":"Color","multiSelect":false,"options":[{"label":"Red","description":"Warm"},{"label":"Blue","description":"Cool"}]}]}}}""")
+        val a = approvalFrom("s", "Task", req)!!
+        assertEquals(1, a.questions.size)
+        assertEquals("Which color?", a.questions[0].question)
+        assertEquals(listOf("Red" to "Warm", "Blue" to "Cool"), a.questions[0].options.map { it.label to it.description })
+        assertEquals(false, a.questions[0].multiSelect)
+    }
 }

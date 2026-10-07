@@ -258,6 +258,13 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             "decision" to if (allow) "allow" else "deny", "always" to always)
     }
 
+    /** Answers Claude's questions: {question text: chosen label(s), or the user's own words}; null skips them. */
+    fun answerQuestions(approval: Approval, answers: Map<String, String>?) {
+        _approvals.update { list -> list.filterNot { it.requestId == approval.requestId } }
+        fire("permission", "sid" to approval.sid, "requestId" to approval.requestId, "decision" to "allow",
+            "answers" to answers?.let { JsonObject(it.mapValues { (_, v) -> JsonPrimitive(v) }) })
+    }
+
     fun loadDiff(sid: String) {
         _diffs.update { it + (sid to (it[sid] ?: DiffState()).copy(loading = true)) }
         scope.launch {

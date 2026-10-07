@@ -34,6 +34,12 @@ rl.on('line', (line) => {
     const eff = effort ? ` [effort: ${effort}]` : '';
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Looking at: ${said}${mcp}${eff}` }] } });
     out({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: `tool-${n}`, name: 'Bash', input: { command: 'touch x' } }] } });
+    if (said.includes('ask me')) {
+      // Like Claude using AskUserQuestion: a permission request whose answers come back in the input.
+      const input = { questions: [{ question: 'Which color?', header: 'Color', multiSelect: false, options: [{ label: 'Red', description: 'Warm' }, { label: 'Blue', description: 'Cool' }] }] };
+      out({ type: 'control_request', request_id: `ask-${n}`, request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion', display_name: 'AskUserQuestion', input } });
+      return;
+    }
     if (said.includes('hit the limit')) {
       // What Claude Code prints when a plan limit stops a turn.
       const resetsAt = Math.ceil(Date.now() / 1000) + 2;
@@ -80,6 +86,11 @@ rl.on('line', (line) => {
     });
   } else if (msg.type === 'control_response') {
     const r = msg.response.response;
+    if (r.updatedInput?.answers) {
+      out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: `answered ${JSON.stringify(r.updatedInput.answers)}` }] } });
+      out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: cost });
+      return;
+    }
     out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tool-${n}`, content: `${r.behavior}${r.updatedPermissions ? ' always' : ''}`, is_error: r.behavior !== 'allow' }] } });
     out({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: (cost = Math.round((cost + 0.01) * 100) / 100) });
   } else if (msg.type === 'control_request' && msg.request.subtype === 'apply_flag_settings') {
