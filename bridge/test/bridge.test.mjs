@@ -22,7 +22,7 @@ function fakeClaudeWrapper(dir) {
 
 function startBridge(stateDir, repoRoot, port, env = {}) {
   const proc = spawn(process.execPath, [bridgePath, '--port', String(port), '--roots', repoRoot, '--state-dir', stateDir], {
-    env: { ...process.env, CCM_PHONE: '0', ...env, CCM_CLAUDE_BIN: fakeClaudeWrapper(path.dirname(stateDir)), CLAUDE_CONFIG_DIR: path.join(path.dirname(stateDir), 'claude-config') },
+    env: { ...process.env, CCM_ROOT: '0', ...env, CCM_CLAUDE_BIN: fakeClaudeWrapper(path.dirname(stateDir)), CLAUDE_CONFIG_DIR: path.join(path.dirname(stateDir), 'claude-config') },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   return new Promise((resolve) => proc.stdout.once('data', () => resolve(proc)));
@@ -287,27 +287,26 @@ test('YOLO mode runs tools without asking, and can be switched on mid-session', 
   }
 });
 
-test('attachments are saved for Claude, images also sent inline; phone use attaches the MCP server', async () => {
+test('attachments are saved for Claude, images also sent inline', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
   const stateDir = path.join(tmp, 'state');
   const repo = path.join(tmp, 'repos', 'demo');
   fs.mkdirSync(repo, { recursive: true });
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_PHONE: '1' });
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_ROOT: '1' });
   const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
   const b64 = (s) => Buffer.from(s).toString('base64');
   const said = (sid) => (m) => m.ev === 'cli' && m.sid === sid && m.msg.type === 'assistant' && m.msg.message.content[0].type === 'text';
   try {
     const c = connect(port);
     c.send({ op: 'hello', token });
-    assert.equal((await c.next((m) => m.ev === 'hello')).phone, true);
+    assert.equal((await c.next((m) => m.ev === 'hello')).root, true);
 
     c.send({
       op: 'start', ref: 1, cwd: repo, prompt: 'what is this?',
       attachments: [{ name: 'shot.png', mime: 'image/png', data: b64('png-bytes') }, { name: '../notes.txt', mime: 'text/plain', data: b64('hi') }],
     });
     const { session } = await c.next((m) => m.ev === 'started');
-    assert.equal(session.phone, false);
     const dir = path.join(stateDir, 'attachments', session.id);
     assert.equal(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8'), 'hi');
     const echo = await c.next((m) => m.ev === 'cli' && m.msg.type === 'user' && m.msg.local);
@@ -323,18 +322,6 @@ test('attachments are saved for Claude, images also sent inline; phone use attac
     assert.equal(fs.readFileSync(path.join(dir, 'notes-2.txt'), 'utf8'), 'again');
     c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'x', attachments: [{ name: 'empty', data: '' }] });
     assert.match((await c.next((m) => m.ev === 'error' && m.ref === 2)).message, /empty/);
-
-    c.send({ op: 'start', ref: 3, cwd: repo, prompt: 'set an alarm', phone: true });
-    const phone = (await c.next((m) => m.ev === 'started' && m.ref === 3)).session;
-    assert.equal(phone.phone, true);
-    assert.match((await c.next(said(phone.id))).msg.message.content[0].text, /\[mcp: phone\]$/);
-
-    // Turning phone use on for an existing session restarts claude with the server on the next message.
-    c.send({ op: 'phone', sid: session.id, on: true });
-    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.phone);
-    await new Promise((r) => setTimeout(r, 300));
-    c.send({ op: 'send', sid: session.id, text: 'now with phone' });
-    assert.match((await c.next((m) => said(session.id)(m) && /now with phone/.test(m.msg.message.content[0].text))).msg.message.content[0].text, /\[mcp: phone\]$/);
 
     c.send({ op: 'archive', sid: session.id });
     await c.next((m) => m.ev === 'removed');
@@ -739,7 +726,7 @@ test('one bridge per state folder, and a task whose keeper vanished recovers on 
   const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
   try {
     // A second bridge on the same folder refuses to start.
-    const second = spawn(process.execPath, [bridgePath, '--port', String(port + 1), '--state-dir', stateDir], { env: { ...process.env, CCM_PHONE: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const second = spawn(process.execPath, [bridgePath, '--port', String(port + 1), '--state-dir', stateDir], { env: { ...process.env, CCM_ROOT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
     second.stderr.on('data', (d) => { stderr += d; });
     const code = await new Promise((r) => second.once('exit', r));

@@ -87,7 +87,6 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
     val sessions by repository.sessions.collectAsStateWithLifecycle()
     val allItems by repository.items.collectAsStateWithLifecycle()
     val approvals by repository.approvals.collectAsStateWithLifecycle()
-    val phoneAvailable by repository.phoneAvailable.collectAsStateWithLifecycle()
     val session = sessions.firstOrNull { it.id == sid }
     val items = allItems[sid]
     val approval = approvals.firstOrNull { it.sid == sid }
@@ -119,7 +118,6 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
                 }
-                if (session?.phone == true) Text("Phone use · can operate this phone", color = C.ClayText, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
             var menu by remember { mutableStateOf(false) }
@@ -139,14 +137,6 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                         DropdownMenuItem(
                             text = { Text("Turn on YOLO (don't ask)", color = C.Red) },
                             onClick = { menu = false; repository.setMode(sid, YOLO) },
-                        )
-                    }
-                    if (session?.phone == true) {
-                        DropdownMenuItem(text = { Text("Turn off phone use") }, onClick = { menu = false; repository.setPhone(sid, false) })
-                    } else if (phoneAvailable) {
-                        DropdownMenuItem(
-                            text = { Text("Turn on phone use (restarts Claude)") },
-                            onClick = { menu = false; repository.setPhone(sid, true) },
                         )
                     }
                     DropdownMenuItem(

@@ -42,13 +42,10 @@ The bridge saves them in `attachments/<session id>/` and tells Claude their path
 passed with `--add-dir`, so Claude reads them without asking. Photos are scaled to 1568 px and
 also sent inline, so Claude sees them straight away.
 
-**Phone use** (bridge in Termux on a rooted phone): the **Phone** chip on a new task, or *Turn on
-phone use* in a task's menu, gives Claude `bridge/phone-mcp.mjs`, an MCP server that runs
-`screencap`, `uiautomator`, `input`, `am` and `pm` through `su`. Tools: screenshot, screen_elements,
-tap, long_press, swipe, type_text (ASCII only), key, list_apps, open_app, open_uri, set_alarm,
-set_timer. Looking (screenshot, screen_elements, list_apps) runs without asking; every action goes
-through the usual approval unless you allow it always or turn on YOLO. Phone tasks don't need a
-repo. The chip only shows when the bridge's `su -c id` returns 0 (override with `CCM_PHONE=0|1`).
+**Operating the phone:** on a rooted phone Claude can use the phone directly with `su -c` in its
+shell: `screencap`, `uiautomator dump`, `input`, `am`, `pm`, `settings` and so on, through the usual
+approvals unless the task is in YOLO. (An earlier MCP server for this was removed: root makes it
+unnecessary.) The bridge also uses root to read which ports a task listens on.
 
 **Reasoning effort:** the model chip on a new task also picks effort (Low, Medium, High, Extra high,
 Max, or the model's default; passed as `--effort`). In a running task, *Reasoning effort* in the menu
@@ -116,7 +113,7 @@ sh chroot/ccm-chroot boot on     # start at boot (KernelSU/Magisk service.d)
 Claude runs as user `claude`, which has Termux's uid, so your Termux home is mounted at its usual path
 and files keep Termux's ownership. Like Termux, it gets root through `su`: the chroot's `su -c '…'`
 asks a root helper (`chroot/ccm-rootd.mjs`) to run the command on Android itself, so `pm install`,
-`am`, `settings`, `logcat` and Phone use all work. Paths in your Termux home are the same on both sides;
+`am`, `settings` and `logcat` work. Paths in your Termux home are the same on both sides;
 other chroot files are under `/data/ccm/rootfs` on Android. Claude can also install Debian packages
 with `su -c 'chroot /data/ccm/rootfs … apt-get install …'` (see the note it gets in
 `~/.claude/CLAUDE.md`). `root off` turns this off. It's root access, not a sandbox: approvals still
@@ -187,7 +184,6 @@ the same session.
 ## Layout
 
 - `bridge/ccm-bridge.mjs` — the bridge (Node, no dependencies); `bridge/test/` runs it against a fake CLI.
-- `bridge/phone-mcp.mjs` — the Phone use MCP server (stdio, no dependencies).
 - `bridge/keeper.mjs` — runs one Claude process detached from the bridge, so restarts don't stop tasks.
 - `chroot/ccm-chroot` — the optional Debian chroot runtime for rooted phones.
 - `app/src/main/java/app/ccmobile/data/` — socket client, repository, stream-json → transcript reducer, diff parser.

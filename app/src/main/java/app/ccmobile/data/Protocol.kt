@@ -29,8 +29,6 @@ data class SessionSummary(
     val pending: Int = 0,
     val costUsd: Double = 0.0,
     val running: Boolean = false,
-    /** Phone use: Claude can see and operate the phone the bridge runs on. */
-    val phone: Boolean = false,
     /** Continue by itself once a usage limit resets. */
     val autoContinue: Boolean = false,
     /** When a task stopped by a usage limit can go on (status "limited"), epoch ms. */

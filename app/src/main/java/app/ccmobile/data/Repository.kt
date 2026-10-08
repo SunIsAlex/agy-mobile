@@ -46,9 +46,6 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     private val _roots = MutableStateFlow<List<String>>(emptyList())
     /** The folders the bridge scans for repos (its --roots); new folders go in one of these. */
     val roots: StateFlow<List<String>> = _roots.asStateFlow()
-    private val _phoneAvailable = MutableStateFlow(false)
-    /** True when the bridge runs on a rooted phone, so tasks can use Phone use. */
-    val phoneAvailable: StateFlow<Boolean> = _phoneAvailable.asStateFlow()
     private val _claudeSessions = MutableStateFlow<List<ClaudeSession>?>(null)
     /** Sessions from Claude Code elsewhere that can be resumed here; null until loaded. */
     val claudeSessions: StateFlow<List<ClaudeSession>?> = _claudeSessions.asStateFlow()
@@ -130,13 +127,13 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     /** Starts a task and returns its session id, or null if the bridge refused or didn't answer. */
     suspend fun start(
         cwd: String, prompt: String, mode: String, model: String?, effort: String?,
-        phone: Boolean = false, attachments: List<PendingAttachment> = emptyList(),
+        attachments: List<PendingAttachment> = emptyList(),
         autoContinue: Boolean = settings.autoContinue,
     ): String? {
         settings.lastRepo = cwd
         val reply = request(
             "start", "cwd" to cwd, "prompt" to prompt, "mode" to mode, "model" to model, "effort" to effort,
-            "phone" to phone.takeIf { it }, "autoContinue" to autoContinue.takeIf { it }, "attachments" to attachmentsJson(attachments),
+            "autoContinue" to autoContinue.takeIf { it }, "attachments" to attachmentsJson(attachments),
         )
         val session = reply?.obj("session") ?: return null
         val summary = json.decodeFromJsonElement(SessionSummary.serializer(), session)
@@ -241,7 +238,6 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
 
     fun sendMessage(sid: String, text: String, attachments: List<PendingAttachment> = emptyList()) =
         fire("send", "sid" to sid, "text" to text, "attachments" to attachmentsJson(attachments))
-    fun setPhone(sid: String, on: Boolean) = fire("phone", "sid" to sid, "on" to on)
     fun setAutoContinue(sid: String, on: Boolean) = fire("auto_continue", "sid" to sid, "on" to on)
     fun reportError(message: String) { _errors.tryEmit(message) }
     fun interrupt(sid: String) = fire("interrupt", "sid" to sid)
@@ -327,7 +323,6 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         when (ev.str("ev")) {
             "hello" -> {
                 _roots.value = ev.arr("roots").orEmpty().mapNotNull { (it as? JsonPrimitive)?.content }
-                _phoneAvailable.value = ev.bool("phone") == true
             }
             "sessions" -> _sessions.value = json.decodeFromJsonElement(ListSerializer(SessionSummary.serializer()), ev["sessions"]!!)
                 .sortedByDescending { it.updatedAt }

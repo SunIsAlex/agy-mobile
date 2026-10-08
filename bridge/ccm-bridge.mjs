@@ -13,7 +13,6 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { READ_ONLY as PHONE_READ_ONLY } from './phone-mcp.mjs';
 
 const VERSION = 1;
 const MAX_EVENTS = 4000;
@@ -75,7 +74,6 @@ const attachmentsDir = path.join(stateDir, 'attachments');
 // Images Claude looked at, per session, named by content hash (see saveImage()).
 const imagesDir = path.join(stateDir, 'images');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
-const phoneMcp = path.join(path.dirname(fileURLToPath(import.meta.url)), 'phone-mcp.mjs');
 const ptyPy = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ptyhost.py'); // not pty.py: that would shadow Python's pty
 const keeperJs = path.join(path.dirname(fileURLToPath(import.meta.url)), 'keeper.mjs');
 // One folder per running Claude process; see keeper.mjs and KeeperLink.
@@ -332,14 +330,13 @@ const sessions = new Map();
 const clients = new Set();
 
 class Session {
-  constructor({ id, cwd, title, model, effort, mode, createdAt, status, phone, autoContinue, resumeAt }) {
+  constructor({ id, cwd, title, model, effort, mode, createdAt, status, autoContinue, resumeAt }) {
     this.id = id;
     this.cwd = cwd;
     this.title = title;
     this.model = model ?? null;
     this.effort = EFFORTS.includes(effort) ? effort : null;
     this.mode = mode ?? 'default';
-    this.phone = !!phone; // "Phone use": the phone MCP server is attached
     this.createdAt = createdAt ?? Date.now();
     this.updatedAt = this.createdAt;
     this.status = status ?? 'idle'; // working | needs_approval | idle | stopped | error
@@ -368,7 +365,7 @@ class Session {
       id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
-      running: this.link !== null, phone: this.phone, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
+      running: this.link !== null, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
       background: this.background.map((t) => t.description),
       ports: this.ports ?? [],
     };
@@ -414,11 +411,6 @@ class Session {
     // Attachments are saved here; allowing the folder lets Claude Read them without asking.
     fs.mkdirSync(this.attachmentsDir, { recursive: true, mode: 0o700 });
     args.push('--add-dir', this.attachmentsDir);
-    if (this.phone) {
-      const config = { mcpServers: { phone: { type: 'stdio', command: process.execPath, args: [phoneMcp], env: process.env.CCM_SU ? { CCM_SU: process.env.CCM_SU } : {} } } };
-      args.push('--mcp-config', JSON.stringify(config), '--append-system-prompt', PHONE_PROMPT,
-        '--allowedTools', PHONE_READ_ONLY.map((t) => `mcp__phone__${t}`).join(','));
-    }
     args.push(...(this.started ? ['--resume', this.id] : ['--session-id', this.id]));
 
     // Claude runs under a keeper, detached, so it outlives the bridge (see keeper.mjs).
@@ -592,15 +584,6 @@ class Session {
     this.setStatus(this.status === 'stopped' || this.status === 'error' ? 'idle' : this.status);
   }
 
-  setPhone(on) {
-    if (on && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
-    this.phone = on;
-    // MCP servers are fixed at launch; the next message restarts claude with --resume.
-    this.link?.kill();
-    this.emitLocal({ type: 'bridge', subtype: 'note', message: on ? 'Phone use on: Claude can see and operate this phone' : 'Phone use off' });
-    this.setStatus(this.status === 'working' || this.status === 'needs_approval' ? 'idle' : this.status);
-  }
-
   /**
    * [answers] replies to AskUserQuestion: {question text: chosen label(s) or the user's own words}.
    * Claude Code reads them from the allowed input (allowing without them reads as "didn't answer").
@@ -764,20 +747,14 @@ function formatBytes(n) {
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-// ---------- phone use ----------
-
-const PHONE_PROMPT = `You are also acting as the user's Android assistant. You run on their phone (Termux, root available), and the phone MCP tools let you see and operate it: screen_elements (accessibility tree with tap targets), screenshot, tap, long_press, swipe, type_text, key, list_apps, open_app, open_uri, set_alarm, set_timer.
-- The user talks to you through the CC Mobile app (package app.ccmobile), which runs this session via Termux (com.termux). Never force-stop, clear or uninstall those two; switching to other apps is fine, and the user can come back with the app switcher.
-- Prefer direct intents (set_alarm, set_timer, open_uri, open_app) over tapping through menus. When you must use the UI: look (screen_elements, or screenshot for visual detail), act, then look again to confirm the result.
-- If the screen is off, press WAKEUP. If it is locked with a PIN, pattern or biometrics, ask the user to unlock it; don't try to guess credentials.
-- Ask the user before anything hard to undo or that acts for them: sending messages or email, calls, purchases or payments, deleting data, changing security settings, posting publicly.
-- For deeper debugging use Bash with su -c (logcat, dumpsys, settings, pm, am). Be careful with commands that can brick or wipe the device.
-- Report what you did in a sentence or two.`;
+// ---------- root ----------
 
 // Resolved before the server starts listening, so hello can report it.
-let phoneAvailable = false;
-async function detectPhone() {
-  if (process.env.CCM_PHONE) return process.env.CCM_PHONE === '1';
+// With root Claude can operate the phone itself (su -c: screencap, input, am, pm...), and the bridge
+// can read the socket table for the ports a task listens on.
+let rootAvailable = false;
+async function detectRoot() {
+  if (process.env.CCM_ROOT) return process.env.CCM_ROOT === '1';
   // Root on Android, not just root: Termux's su, or the chroot's su (chroot/su) whose commands run
   // on Android although this Node reports linux.
   return new Promise((resolve) => execFile(process.env.CCM_SU ?? 'su', ['-c', 'id -u; getprop ro.build.version.sdk'], { timeout: 10_000 },
@@ -1291,7 +1268,7 @@ const PORTS_CHECK_MS = Number(process.env.CCM_PORTS_CHECK_MS ?? 5000);
 async function listeningSockets() {
   let text = '';
   try { text = fs.readFileSync('/proc/net/tcp', 'utf8') + fs.readFileSync('/proc/net/tcp6', 'utf8'); } catch {
-    if (!phoneAvailable) return new Map();
+    if (!rootAvailable) return new Map();
     text = await new Promise((resolve) => execFile(process.env.CCM_SU ?? 'su', ['-c', 'cat /proc/net/tcp /proc/net/tcp6'],
       { timeout: 5000, maxBuffer: 4 << 20 }, (err, out) => resolve(err ? '' : out)));
   }
@@ -1442,7 +1419,7 @@ class Client {
         this.authed = true;
         clearTimeout(this.helloTimer);
         clients.add(this);
-        this.send({ ev: 'hello', version: VERSION, host: os.hostname(), platform: process.platform, roots: opts.roots, phone: phoneAvailable });
+        this.send({ ev: 'hello', version: VERSION, host: os.hostname(), platform: process.platform, roots: opts.roots, root: rootAvailable });
         this.send({ ev: 'sessions', sessions: [...sessions.values()].map((s) => s.summary()) });
         if (limits) this.send({ ev: 'limits', limits });
         for (const s of sessions.values()) for (const req of s.pending.values()) this.send({ ev: 'approval', sid: s.id, title: s.title, request: req });
@@ -1470,10 +1447,9 @@ class Client {
         const prompt = String(msg.prompt ?? '').trim();
         const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
         if (!prompt && !attachments.length) throw new Error('Empty prompt');
-        if (msg.phone && !phoneAvailable) throw new Error('Phone use needs the bridge running in Termux with root (su).');
         const mode = MODES.includes(msg.mode) ? msg.mode : 'default';
         const title = prompt.split('\n')[0].slice(0, 100) || `Attached ${attachments.map((a) => a.name).join(', ')}`.slice(0, 100);
-        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, phone: !!msg.phone, autoContinue: !!msg.autoContinue });
+        const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, autoContinue: !!msg.autoContinue });
         sessions.set(session.id, session);
         this.subs.add(session.id);
         try { session.sendUser(prompt, attachments); } catch (e) {
@@ -1535,7 +1511,6 @@ class Client {
         break;
       }
       case 'send': s.sendUser(String(msg.text ?? ''), msg.attachments); break;
-      case 'phone': s.setPhone(!!msg.on); break;
       case 'cwd': await s.moveTo(msg.cwd); this.send({ ev: 'session', ref, session: s.summary() }); break;
       case 'auto_continue': s.setAutoContinue(!!msg.on); break;
       // From the app's alarm at a task's resumeAt, which wakes the phone: check now.
@@ -1581,12 +1556,12 @@ function resumeDue() { for (const s of sessions.values()) s.resumeIfDue(); }
 resumeDue();
 setInterval(resumeDue, RESUME_CHECK_MS);
 setInterval(updatePorts, PORTS_CHECK_MS);
-phoneAvailable = await detectPhone();
+rootAvailable = await detectRoot();
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {
   const { address, port } = server.address();
   const loopback = address === '127.0.0.1' || address === '::1';
-  console.log(`ccm-bridge listening on ${address}:${port} (${sessions.size} saved sessions${phoneAvailable ? ', phone use available' : ''})`);
+  console.log(`ccm-bridge listening on ${address}:${port} (${sessions.size} saved sessions${rootAvailable ? ', root available' : ''})`);
   if (!loopback) console.log('Warning: listening beyond this device. Traffic is not encrypted; use a private network such as Tailscale or an SSH tunnel.');
   const pairUrl = `ccmobile://pair?host=${encodeURIComponent(loopback ? '127.0.0.1' : address)}&port=${port}&token=${encodeURIComponent(token)}`;
   if (opts.showToken) console.log(`Token: ${token}\nPair link: ${pairUrl}`);

@@ -9,6 +9,8 @@ import android.content.Intent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -84,7 +86,6 @@ fun TasksScreen(
     val conn by repository.client.state.collectAsStateWithLifecycle()
     val claudeSessions by repository.claudeSessions.collectAsStateWithLifecycle()
     val roots by repository.roots.collectAsStateWithLifecycle()
-    val phoneAvailable by repository.phoneAvailable.collectAsStateWithLifecycle()
     val limits by repository.limits.collectAsStateWithLifecycle()
     val settings = repository.settings
 
@@ -98,8 +99,6 @@ fun TasksScreen(
     var starting by remember { mutableStateOf(false) }
     var resuming by remember { mutableStateOf<String?>(null) }
     var newFolder by rememberSaveable { mutableStateOf(false) }
-    var phone by rememberSaveable { mutableStateOf(settings.phone) }
-    val phoneOn = phone && phoneAvailable
     val attachments = repository.draftAttachments("")
     val scope = rememberCoroutineScope()
 
@@ -111,14 +110,14 @@ fun TasksScreen(
         if (tab == 2 && conn is ConnState.Connected) repository.refreshClaudeSessions()
     }
     // Phone tasks don't need a repo; they run in the bridge's first root.
-    val cwd = repo?.path ?: roots.firstOrNull()?.takeIf { phoneOn }
+    val cwd = repo?.path
     val canStart = (prompt.isNotBlank() || attachments.isNotEmpty()) && cwd != null && conn is ConnState.Connected && !starting
 
     fun start() {
         val target = cwd ?: return
         starting = true
         scope.launch {
-            val sid = repository.start(target, prompt.trim(), mode, model.ifBlank { null }, effort.ifBlank { null }, phoneOn, attachments.toList())
+            val sid = repository.start(target, prompt.trim(), mode, model.ifBlank { null }, effort.ifBlank { null }, attachments.toList())
             starting = false
             if (sid != null) {
                 prompt = ""
@@ -173,7 +172,6 @@ fun TasksScreen(
                         effort = effort, onEffort = { effort = it },
                         canStart = canStart, starting = starting, onStart = ::start,
                         attachments = attachments, onError = repository::reportError,
-                        phone = phoneOn.takeIf { phoneAvailable }, onPhone = { phone = it; settings.phone = it },
                     )
                 }
             }
@@ -289,8 +287,6 @@ private fun Composer(
     effort: String, onEffort: (String) -> Unit,
     canStart: Boolean, starting: Boolean, onStart: () -> Unit,
     attachments: SnapshotStateList<PendingAttachment>, onError: (String) -> Unit,
-    /** Phone use toggle state, or null when the bridge can't offer it. */
-    phone: Boolean?, onPhone: (Boolean) -> Unit,
 ) {
     Column(
         Modifier
@@ -314,6 +310,11 @@ private fun Composer(
         )
         AttachmentChips(attachments, Modifier.padding(start = 10.dp, bottom = 8.dp))
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+          // The chips scroll sideways when they don't fit, so the start button always stays in view.
+          Row(
+            Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+          ) {
             AttachButton(attachments, onError)
             var modeMenu by remember { mutableStateOf(false) }
             Box {
@@ -351,8 +352,7 @@ private fun Composer(
                     EffortItems(effort) { onEffort(it); menu = false }
                 }
             }
-            if (phone != null) Chip("Phone", onClick = { onPhone(!phone) }, icon = R.drawable.ic_phone, on = phone)
-            Spacer(Modifier.weight(1f))
+          }
             Box(
                 Modifier
                     .size(44.dp)
