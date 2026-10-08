@@ -226,4 +226,7 @@ fun effortDescription(effort: String): String = when (effort) {
     "max" -> "Thinks as long as it needs. Slowest, and uses the most of your limits."
     else -> "Uses the model's own default."
 }
-val modelLabels = listOf("" to "Default", "opus" to "Opus", "sonnet" to "Sonnet", "haiku" to "Haiku")
+// Haiku 5.5 by its full id: Claude Code 2.1.289's "haiku" alias still means Haiku 4.5.
+val modelLabels = listOf(
+    "" to "Default", "opus" to "Opus", "sonnet" to "Sonnet", "claude-haiku-5-5" to "Haiku 5.5", "haiku" to "Haiku 4.5",
+)

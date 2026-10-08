@@ -18,6 +18,7 @@ class UsageTextTest {
         assertEquals("Opus 5.5", UsageText.modelName("claude-opus-5-5"))
         assertEquals("Haiku 4.5", UsageText.modelName("claude-haiku-4-5-20251001"))
         assertEquals("Sonnet 5", UsageText.modelName("claude-sonnet-5"))
+        assertEquals("Haiku 5.5", UsageText.modelName("claude-haiku-5-5"))
         assertEquals("unknown", UsageText.modelName("unknown"))
     }
 
