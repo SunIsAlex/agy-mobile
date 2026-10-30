@@ -149,7 +149,10 @@ class BridgeService : LifecycleService() {
             }
         }
         for (session in active) {
-            val since = working.getOrPut(session.id) { System.currentTimeMillis() }
+            val since = working.getOrPut(session.id) {
+                Notifier.cancelFinished(this, session.id) // an earlier "Finished" is out of date now
+                System.currentTimeMillis()
+            }
             // Session events arrive with every message; only repost when the text changes,
             // since Android drops updates that come faster than a few a second.
             val shows = listOf(session.title, session.status, session.lastActivity)

@@ -20,9 +20,12 @@ object Notifier {
     const val CHANNEL_APPROVALS = "approvals"
     const val CHANNEL_SERVICE = "service"
     const val CHANNEL_ACTIVITY = "activity"
+    const val CHANNEL_FINISHED = "finished"
     const val SERVICE_ID = 1
-    /** Working and finished notifications, tagged with the session id. */
+    /** Working and paused notifications, tagged with the session id. */
     private const val TASK_ID = 2
+    /** Finished notifications, tagged with the session id; separate so they alert instead of silently updating. */
+    private const val FINISHED_ID = 3
     const val EXTRA_SID = "sid"
 
     fun createChannels(context: Context) {
@@ -39,7 +42,12 @@ object Notifier {
         )
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ACTIVITY, "Claude's progress", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "What Claude is doing in each running task, and when it finishes"
+                description = "What Claude is doing in each running task"
+            },
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_FINISHED, "Finished tasks", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Claude finished a task or stopped with an error"
             },
         )
     }
@@ -131,20 +139,23 @@ object Notifier {
         NotificationManagerCompat.from(context).notify(session.id, TASK_ID, notification)
     }
 
-    /** Replaces a task's working notification with one saying it finished. */
+    /** Replaces a task's working notification with one saying it finished, which sounds and pops up. */
     fun showFinished(context: Context, session: SessionSummary) {
+        NotificationManagerCompat.from(context).cancel(session.id, TASK_ID)
         if (!canPost(context)) return
-        val notification = NotificationCompat.Builder(context, CHANNEL_ACTIVITY)
+        val notification = NotificationCompat.Builder(context, CHANNEL_FINISHED)
             .setSmallIcon(R.drawable.ic_check)
             .setContentTitle(if (session.status == "error") "Stopped with an error" else "Finished")
             .setContentText(session.title)
             .setSubText(session.repoName)
             .setStyle(NotificationCompat.BigTextStyle().bigText(listOf(session.title, session.lastActivity).filter { it.isNotBlank() }.joinToString("\n")))
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(openSessionIntent(context, session.id))
             .setAutoCancel(true)
             .build()
         @Suppress("MissingPermission")
-        NotificationManagerCompat.from(context).notify(session.id, TASK_ID, notification)
+        NotificationManagerCompat.from(context).notify(session.id, FINISHED_ID, notification)
     }
 
     /** Replaces a task's working notification when a usage limit pauses it. */
@@ -171,6 +182,10 @@ object Notifier {
 
     fun cancelTask(context: Context, sid: String) {
         NotificationManagerCompat.from(context).cancel(sid, TASK_ID)
+    }
+
+    fun cancelFinished(context: Context, sid: String) {
+        NotificationManagerCompat.from(context).cancel(sid, FINISHED_ID)
     }
 
     fun cancelApproval(context: Context, requestId: String) {
