@@ -1552,7 +1552,7 @@ class Client {
         const term = terminals.get(String(msg.id ?? '')) ?? (msg.fresh ? null : ofKind.at(-1)) ?? new Terminal(cols, rows, kind);
         term.clients.add(this);
         if (msg.cols && msg.rows) term.resize(cols, rows); // attaching without a size leaves it as it is
-        this.send({ ev: 'term_opened', ref, id: term.id, data: term.replay(), links: term.links });
+        this.send({ ev: 'term_opened', ref, id: term.id, kind: term.kind, data: term.replay(), links: term.links });
         break;
       }
       case 'term_input': terminalFor(msg.id).write(msg.data); break;

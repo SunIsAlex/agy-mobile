@@ -961,8 +961,9 @@ test('login: claude auth login runs in a pty, its sign-in pages go to the app, a
     c.send({ op: 'term_open', ref: 2, cols: 80, rows: 24 });
     const shell = (await c.next((m) => m.ev === 'term_opened' && m.ref === 2)).id;
     c.send({ op: 'term_open', ref: 3, cols: 80, rows: 24, kind: 'login', fresh: true });
-    const { id } = await c.next((m) => m.ev === 'term_opened' && m.ref === 3);
+    const { id, kind } = await c.next((m) => m.ev === 'term_opened' && m.ref === 3);
     assert.notEqual(id, shell);
+    assert.equal(kind, 'login');
     const local = await c.next((m) => m.ev === 'term_link' && m.id === id && m.local);
     assert.match(local.url, /redirect_uri=http%3A%2F%2Flocalhost/);
     const manual = await c.next((m) => m.ev === 'term_link' && m.id === id && !m.local);

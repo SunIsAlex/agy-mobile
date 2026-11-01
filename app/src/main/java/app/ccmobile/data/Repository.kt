@@ -36,6 +36,8 @@ data class DiffState(
  * App-wide state backed by the bridge. Lives for the whole process (held by CcApp) so the
  * notification service and the UI share one connection. Call from the main thread.
  */
+private const val OUTDATED_BRIDGE = "This bridge is too old to log in from the app. Restart it to update it."
+
 class Repository(private val scope: CoroutineScope, val settings: Settings) {
     val client = BridgeClient(scope)
 
@@ -212,6 +214,8 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             "kind" to "login".takeIf { login },
         ) ?: return Result.failure(Exception("The bridge didn't answer."))
         if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't open the terminal."))
+        // A bridge from before logins ignores the kind and hands back its shell.
+        if (login && reply.str("kind") != "login") return Result.failure(Exception(OUTDATED_BRIDGE))
         val links = reply.arr("links")?.let { json.decodeFromJsonElement(ListSerializer(TermLink.serializer()), it) }.orEmpty()
         return Result.success(TermOpened(reply.str("id") ?: "", reply.str("data") ?: "", links))
     }
@@ -219,7 +223,10 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     /** Who Claude Code on the bridge is signed in as. */
     suspend fun authStatus(): Result<AuthStatus> {
         val reply = call("auth", quiet = true) ?: return Result.failure(Exception("The bridge didn't answer."))
-        if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't check the Claude login."))
+        if (reply.str("ev") == "error") {
+            val message = reply.str("message")
+            return Result.failure(Exception(if (message?.startsWith("Unknown op") == true) OUTDATED_BRIDGE else message ?: "Couldn't check the Claude login."))
+        }
         return runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
     }
 

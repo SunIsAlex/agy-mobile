@@ -233,7 +233,7 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
             IconBtn(R.drawable.ic_terminal, "Show keyboard", { showKeyboard() })
         }
         ConnectionBanner(conn, ::leave)
-        if (login && !ended) {
+        if (login && !ended && error == null) {
             Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     if (bridgeHere) "Sign in in your browser, then come back here."
