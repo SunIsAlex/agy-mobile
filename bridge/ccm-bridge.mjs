@@ -1216,28 +1216,64 @@ function chrootShell() {
   return [process.env.CCM_SU ?? 'su', '-c', `sh ${path.join(path.dirname(ptyPy), '..', 'chroot', 'ccm-chroot')} shell`];
 }
 
+// `claude auth login` opens its sign-in page with $BROWSER, which can't show anything here. This stand-in
+// passes the link to the bridge instead, which sends it to the app to open (see Terminal.checkLink).
+const openUrlSh = path.join(stateDir, 'open-url.sh');
+fs.writeFileSync(openUrlSh, `#!${['/bin/sh', '/system/bin/sh'].find((p) => fs.existsSync(p))}
+printf '%s\\n' "$1" > "$CCM_OPEN_URL.tmp" && mv "$CCM_OPEN_URL.tmp" "$CCM_OPEN_URL"
+`, { mode: 0o755 });
+
 class Terminal {
-  constructor(cols, rows) {
+  /** kind 'shell' is the Debian terminal; 'login' runs `claude auth login` where this bridge runs Claude. */
+  constructor(cols, rows, kind = 'shell') {
     this.id = randomUUID();
+    this.kind = kind;
     this.chunks = [];
     this.size = 0;
     this.clients = new Set();
-    const shell = chrootShell();
-    this.proc = spawn('python3', [ptyPy, String(cols), String(rows), ...shell], {
-      cwd: os.homedir(), env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' }, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+    this.links = []; // sign-in pages for the app to open, as {url, local}
+    const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+    let command = chrootShell;
+    if (kind === 'login') {
+      command = () => [claudeBin, 'auth', 'login'];
+      this.urlFile = path.join(stateDir, `login-${this.id}.url`);
+      Object.assign(env, { BROWSER: openUrlSh, CCM_OPEN_URL: this.urlFile });
+      this.urlCheck = setInterval(() => this.checkLink(), 250);
+    }
+    this.proc = spawn('python3', [ptyPy, String(cols), String(rows), ...command()], {
+      cwd: os.homedir(), env, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     });
     for (const s of [this.proc.stdin, this.proc.stdio[3]]) s.on('error', () => {});
     this.proc.stdout.on('data', (d) => this.output(d));
     this.proc.stderr.on('data', (d) => this.output(d));
     this.proc.on('error', (e) => this.output(Buffer.from(`\r\nCan't start the terminal: ${e.message}\r\n`)));
     this.proc.on('close', (code) => {
+      clearInterval(this.urlCheck);
+      if (this.urlFile) fs.rm(this.urlFile, { force: true }, () => {});
       terminals.delete(this.id);
       for (const c of this.clients) c.send({ ev: 'term_exit', id: this.id, code });
     });
     terminals.set(this.id, this);
   }
 
+  /** The page Claude asked $BROWSER to open. Its sign-in finishes by itself, through a server on localhost. */
+  checkLink() {
+    let url;
+    try { url = fs.readFileSync(this.urlFile, 'utf8').trim(); } catch { return; }
+    fs.rmSync(this.urlFile, { force: true });
+    if (/^https:\/\//.test(url)) this.link(url, true);
+  }
+
+  /** local: the sign-in only finishes in a browser on this machine; otherwise it shows a code to paste. */
+  link(url, local) {
+    if (this.links.some((l) => l.url === url)) return;
+    this.links.push({ url, local });
+    for (const c of this.clients) c.send({ ev: 'term_link', id: this.id, url, local });
+  }
+
   output(data) {
+    // The printed link (OSC 8) is the paste-a-code sign-in, for when the app is on another machine.
+    if (this.kind === 'login') for (const m of data.toString().matchAll(/\x1b\]8;;(https:\/\/[^\x07\x1b]+)/g)) this.link(m[1], false);
     this.chunks.push(data);
     this.size += data.length;
     while (this.size > TERM_BUFFER && this.chunks.length > 1) this.size -= this.chunks.shift().length;
@@ -1257,6 +1293,13 @@ function terminalFor(id) {
   const term = terminals.get(String(id ?? ''));
   if (!term) throw new Error('That terminal has ended.');
   return term;
+}
+
+/** Who Claude Code is signed in as here: `claude auth status` (it exits 1 when signed out, still printing JSON). */
+function authStatus() {
+  return new Promise((resolve, reject) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
+    try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`Couldn't check the Claude login${err ? `: ${err.message}` : ''}`)); }
+  }));
 }
 
 // ---------- listening ports ----------
@@ -1467,16 +1510,21 @@ class Client {
         // Attaches to the running terminal (or the one asked for), or starts one.
         const cols = Number(msg.cols) || 80;
         const rows = Number(msg.rows) || 24;
-        const term = terminals.get(String(msg.id ?? '')) ?? (msg.fresh ? null : [...terminals.values()].at(-1)) ?? new Terminal(cols, rows);
+        // kind 'login' signs Claude in (one at a time); a fresh one replaces a sign-in still waiting.
+        const kind = msg.kind === 'login' ? 'login' : 'shell';
+        const ofKind = [...terminals.values()].filter((t) => t.kind === kind);
+        if (msg.fresh && kind === 'login') ofKind.forEach((t) => t.close());
+        const term = terminals.get(String(msg.id ?? '')) ?? (msg.fresh ? null : ofKind.at(-1)) ?? new Terminal(cols, rows, kind);
         term.clients.add(this);
         if (msg.cols && msg.rows) term.resize(cols, rows); // attaching without a size leaves it as it is
-        this.send({ ev: 'term_opened', ref, id: term.id, data: term.replay() });
+        this.send({ ev: 'term_opened', ref, id: term.id, data: term.replay(), links: term.links });
         break;
       }
       case 'term_input': terminalFor(msg.id).write(msg.data); break;
       case 'term_resize': terminalFor(msg.id).resize(Number(msg.cols), Number(msg.rows)); break;
       case 'term_detach': terminals.get(String(msg.id ?? ''))?.clients.delete(this); break;
       case 'term_close': terminalFor(msg.id).close(); break;
+      case 'auth': this.send({ ev: 'auth', ref, auth: await authStatus() }); break;
       case 'processes': this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'signal': signalProcess(Number(msg.pid), String(msg.signal)); this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'restart_process': {

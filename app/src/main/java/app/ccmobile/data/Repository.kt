@@ -65,7 +65,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     val foreground = MutableStateFlow(false)
 
     private val _terminal = MutableSharedFlow<JsonObject>(extraBufferCapacity = 4096)
-    /** term_output and term_exit events for the Terminal screen. */
+    /** term_output, term_exit and term_link events for the Terminal screen. */
     val terminal: SharedFlow<JsonObject> = _terminal
     // Keystrokes go out one at a time, in order (separate coroutines could reorder fast typing).
     private val termInputs = Channel<Pair<String, String>>(Channel.UNLIMITED)
@@ -202,12 +202,25 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         else -> processList(reply)?.let { Result.success(it) } ?: Result.failure(Exception("Bad reply"))
     }
 
-    /** Opens (or attaches to) the Debian terminal; returns its id and recent output (base64), or the bridge's error. */
-    suspend fun termOpen(cols: Int, rows: Int, id: String?, fresh: Boolean = false): Result<Pair<String, String>> {
-        val reply = call("term_open", quiet = true, "cols" to cols, "rows" to rows, "id" to id, "fresh" to fresh.takeIf { it })
-            ?: return Result.failure(Exception("The bridge didn't answer."))
+    /**
+     * Opens (or attaches to) the Debian terminal, or with [login] a `claude auth login` on the bridge;
+     * returns it or the bridge's error.
+     */
+    suspend fun termOpen(cols: Int, rows: Int, id: String?, fresh: Boolean = false, login: Boolean = false): Result<TermOpened> {
+        val reply = call(
+            "term_open", quiet = true, "cols" to cols, "rows" to rows, "id" to id, "fresh" to fresh.takeIf { it },
+            "kind" to "login".takeIf { login },
+        ) ?: return Result.failure(Exception("The bridge didn't answer."))
         if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't open the terminal."))
-        return Result.success((reply.str("id") ?: "") to (reply.str("data") ?: ""))
+        val links = reply.arr("links")?.let { json.decodeFromJsonElement(ListSerializer(TermLink.serializer()), it) }.orEmpty()
+        return Result.success(TermOpened(reply.str("id") ?: "", reply.str("data") ?: "", links))
+    }
+
+    /** Who Claude Code on the bridge is signed in as. */
+    suspend fun authStatus(): Result<AuthStatus> {
+        val reply = call("auth", quiet = true) ?: return Result.failure(Exception("The bridge didn't answer."))
+        if (reply.str("ev") == "error") return Result.failure(Exception(reply.str("message") ?: "Couldn't check the Claude login."))
+        return runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
     }
 
     fun termInput(id: String, base64: String) { termInputs.trySend(id to base64) }
@@ -339,7 +352,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             }
             "claude_sessions" -> _claudeSessions.value =
                 json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
-            "term_output", "term_exit" -> { _terminal.tryEmit(ev); return }
+            "term_output", "term_exit", "term_link" -> { _terminal.tryEmit(ev); return }
             "limits" -> ev.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
             "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
             "history" -> {

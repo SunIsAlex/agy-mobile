@@ -56,6 +56,7 @@ sealed interface Screen {
     data object Usage : Screen
     data object Processes : Screen
     data object Terminal : Screen
+    data object Login : Screen
 }
 
 class Nav : ViewModel() {
@@ -187,8 +188,9 @@ private fun AppRoot(repository: Repository, nav: Nav) {
             is Screen.Diff -> DiffScreen(repository, screen.sid, onBack = nav::pop)
             Screen.Usage -> UsageScreen(repository, onBack = nav::pop)
             Screen.Terminal -> TerminalScreen(repository, onBack = nav::pop)
+            Screen.Login -> TerminalScreen(repository, onBack = nav::pop, login = true)
             Screen.Processes -> ProcessesScreen(repository, onBack = nav::pop, onOpenTask = { nav.push(Screen.Session(it)) })
-            Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null)
+            Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null, onLogin = { nav.push(Screen.Login) })
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 80.dp)) {
             Snackbar(it, containerColor = C.Surface3, contentColor = C.Text)

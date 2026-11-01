@@ -3,11 +3,14 @@ package app.ccmobile.ui
 import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Intent
+import android.net.Uri
 import android.util.Base64
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -30,6 +33,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,8 +50,10 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
+import app.ccmobile.data.AuthStatus
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.Repository
+import app.ccmobile.data.TermLink
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -77,10 +83,13 @@ private fun terminalTheme(p: Palette): String {
         "\"cursorAccent\":\"${hex(p.bg)}\",\"selectionBackground\":\"$selection\",$colors}"
 }
 
-/** A shell in the Debian chroot, through the bridge (see Terminal in ccm-bridge.mjs). */
+/**
+ * A shell in the Debian chroot, through the bridge (see Terminal in ccm-bridge.mjs). With [login] it runs
+ * `claude auth login` where the bridge runs Claude instead, and opens its sign-in page in the browser.
+ */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
+fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = false) {
     val context = LocalContext.current
     val conn by repository.client.state.collectAsStateWithLifecycle()
     val connected = conn is ConnState.Connected
@@ -94,6 +103,10 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
     var alt by remember { mutableStateOf(false) }
     var fontSize by remember { mutableIntStateOf(repository.settings.terminalFont) }
     var fresh by remember { mutableIntStateOf(0) } // bumped by "New session"
+    // Login: the sign-in pages seen, those already opened (kept across activity restarts), and the outcome.
+    var links by remember { mutableStateOf(emptyList<TermLink>()) }
+    var opened by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var signedIn by remember { mutableStateOf<AuthStatus?>(null) }
 
     val web = remember {
         WebView(context).apply {
@@ -112,6 +125,24 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
         }
     }
     fun js(code: String) = web.evaluateJavascript(code, null)
+    // A bridge on this phone finishes the sign-in by itself (a server on localhost); one elsewhere can't,
+    // so open the page that shows a code to paste instead.
+    val bridgeHere = repository.settings.host in setOf("127.0.0.1", "localhost")
+    val signInPage = links.firstOrNull { it.local == bridgeHere }?.url
+    fun openPage(url: String) {
+        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { repository.reportError("Couldn't open a browser: ${it.message}") }
+    }
+    LaunchedEffect(signInPage) {
+        if (signInPage != null && signInPage !in opened) { opened = opened + signInPage; openPage(signInPage) }
+    }
+    // Leaving gives up on a sign-in still waiting; the screen only detaches when Android recreates it.
+    fun leave() {
+        if (login && !ended) termId?.let(repository::termClose)
+        onBack()
+    }
+    BackHandler(enabled = login) { leave() }
+
     fun send(text: String) {
         val id = termId ?: return
         repository.termInput(id, Base64.encodeToString(text.toByteArray(), Base64.NO_WRAP))
@@ -121,12 +152,14 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
     LaunchedEffect(ready, connected, fresh) {
         if (!ready || !connected) return@LaunchedEffect
         val (cols, rows) = size
-        repository.termOpen(cols, rows, if (fresh > 0) null else termId, fresh = fresh > 0)
-            .onSuccess { (id, replay) ->
-                termId = id
+        repository.termOpen(cols, rows, if (fresh > 0) null else termId, fresh = fresh > 0, login = login)
+            .onSuccess { t ->
+                termId = t.id
                 ended = false
                 error = null
-                js("ccm.reset();" + if (replay.isNotEmpty()) "ccm.write('$replay');" else "")
+                links = t.links
+                signedIn = null
+                js("ccm.reset();" + if (t.replay.isNotEmpty()) "ccm.write('${t.replay}');" else "")
             }
             .onFailure { error = it.message }
     }
@@ -146,7 +179,14 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
                         js("ccm.write('${Base64.encodeToString(bytes, Base64.NO_WRAP)}')")
                     }
                 }
-                "term_exit" -> ended = true
+                "term_exit" -> {
+                    ended = true
+                    if (login) signedIn = repository.authStatus().getOrDefault(AuthStatus())
+                }
+                "term_link" -> {
+                    val url = ev["url"]?.toString()?.trim('"') ?: return@collect
+                    links = links + TermLink(url, ev["local"]?.toString() == "true")
+                }
             }
         }
     }
@@ -181,9 +221,9 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
 
     Column(Modifier.fillMaxSize().background(C.Bg).safeDrawingPadding().imePadding()) {
         Row(Modifier.padding(start = 4.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconBtn(R.drawable.ic_back, "Back", onBack)
+            IconBtn(R.drawable.ic_back, "Back", ::leave)
             Column(Modifier.weight(1f)) {
-                Text("Debian", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (login) "Log in to Claude" else "Debian", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 Text(if (connected) "${size.first}×${size.second}" else "Not connected", color = C.Muted, fontSize = 12.sp, fontFamily = Mono)
             }
             ToolText("A−", "Smaller text") { setFont(fontSize - 1) }
@@ -192,7 +232,17 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
             ToolText("Paste", "Paste") { paste() }
             IconBtn(R.drawable.ic_terminal, "Show keyboard", { showKeyboard() })
         }
-        ConnectionBanner(conn, onBack)
+        ConnectionBanner(conn, ::leave)
+        if (login && !ended) {
+            Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (bridgeHere) "Sign in in your browser, then come back here."
+                    else "Sign in in your browser, then copy the code it shows and tap Paste.",
+                    color = C.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f),
+                )
+                signInPage?.let { url -> ToolText("Open page", "Open the sign-in page again") { openPage(url) } }
+            }
+        }
         error?.let {
             Text(it, color = C.Red, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
         }
@@ -205,9 +255,18 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit) {
                         .padding(horizontal = 14.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text("Session ended", color = C.TextSoft, fontSize = 13.sp)
-                    Text("Start again", color = C.ClayText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clickable(role = Role.Button) { fresh++ })
+                    val done = login && signedIn?.loggedIn == true
+                    Text(
+                        when {
+                            !login -> "Session ended"
+                            signedIn == null -> "Checking…"
+                            done -> "Signed in" + (signedIn?.email?.let { " as $it" } ?: "")
+                            else -> "Not signed in"
+                        },
+                        color = C.TextSoft, fontSize = 13.sp,
+                    )
+                    Text(if (done) "Done" else if (login) "Try again" else "Start again", color = C.ClayText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable(role = Role.Button) { if (done) onBack() else fresh++ })
                 }
             }
         }

@@ -908,6 +908,52 @@ test('terminal: a shell in a real pty that resizes, survives detaching, and clos
   }
 });
 
+test('login: claude auth login runs in a pty, its sign-in pages go to the app, and auth reports the result', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  fs.mkdirSync(path.join(tmp, 'repos'), { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_TERM_SHELL: 'sh' });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'auth', ref: 1 });
+    assert.equal((await c.next((m) => m.ev === 'auth' && m.ref === 1)).auth.loggedIn, false);
+
+    // A shell is open too: login gets its own terminal, and the shell stays the Debian screen's.
+    c.send({ op: 'term_open', ref: 2, cols: 80, rows: 24 });
+    const shell = (await c.next((m) => m.ev === 'term_opened' && m.ref === 2)).id;
+    c.send({ op: 'term_open', ref: 3, cols: 80, rows: 24, kind: 'login', fresh: true });
+    const { id } = await c.next((m) => m.ev === 'term_opened' && m.ref === 3);
+    assert.notEqual(id, shell);
+    const local = await c.next((m) => m.ev === 'term_link' && m.id === id && m.local);
+    assert.match(local.url, /redirect_uri=http%3A%2F%2Flocalhost/);
+    const manual = await c.next((m) => m.ev === 'term_link' && m.id === id && !m.local);
+    assert.equal(manual.url, 'https://claude.test/authorize?code=true');
+
+    // Coming back to the screen finds the same sign-in and both pages.
+    c.send({ op: 'term_open', ref: 4, cols: 80, rows: 24, kind: 'login' });
+    const again = await c.next((m) => m.ev === 'term_opened' && m.ref === 4);
+    assert.equal(again.id, id);
+    assert.deepEqual(again.links.map((l) => l.local).sort(), [false, true]);
+    c.send({ op: 'term_open', ref: 5, cols: 80, rows: 24 });
+    assert.equal((await c.next((m) => m.ev === 'term_opened' && m.ref === 5)).id, shell);
+
+    c.send({ op: 'term_input', id, data: Buffer.from('ada\r').toString('base64') });
+    await c.next((m) => m.ev === 'term_exit' && m.id === id);
+    c.send({ op: 'auth', ref: 6 });
+    const { auth } = await c.next((m) => m.ev === 'auth' && m.ref === 6);
+    assert.equal(auth.loggedIn, true);
+    assert.equal(auth.email, 'ada@example.com');
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('a task moves to another working folder and Claude carries on there', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
   const stateDir = path.join(tmp, 'state');

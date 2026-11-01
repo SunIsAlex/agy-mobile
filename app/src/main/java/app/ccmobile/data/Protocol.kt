@@ -117,6 +117,23 @@ data class ProcInfo(
     val paused: Boolean get() = state == "T" || state == "t"
 }
 
+/** `claude auth status` on the bridge: who Claude Code is signed in as there. */
+@Serializable
+data class AuthStatus(
+    val loggedIn: Boolean = false,
+    val authMethod: String? = null,
+    val email: String? = null,
+    val orgName: String? = null,
+    val subscriptionType: String? = null,
+)
+
+/** A sign-in page from `claude auth login`. local: it only finishes in a browser on the bridge's machine. */
+@Serializable
+data class TermLink(val url: String, val local: Boolean)
+
+/** A terminal the bridge opened: its id, recent output (base64) and, for a login, its sign-in pages. */
+data class TermOpened(val id: String, val replay: String, val links: List<TermLink>)
+
 @Serializable
 data class Repo(val path: String, val name: String, val branch: String? = null)
 

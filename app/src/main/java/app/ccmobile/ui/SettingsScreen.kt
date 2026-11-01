@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
+import app.ccmobile.data.AuthStatus
 import app.ccmobile.data.BridgeKind
 import app.ccmobile.data.BridgeLauncher
 import app.ccmobile.data.ConnState
@@ -56,7 +57,7 @@ import app.ccmobile.notify.Notifier
 
 
 @Composable
-fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
+fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () -> Unit) {
     val settings = repository.settings
     val context = LocalContext.current
     val conn by repository.client.state.collectAsStateWithLifecycle()
@@ -99,6 +100,9 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
         else if (starting != null) { kotlinx.coroutines.delay(45_000); starting = null }
     }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
+    // Who Claude Code on the connected bridge is signed in as; checked again after logging in.
+    var auth by remember { mutableStateOf<Result<AuthStatus>?>(null) }
+    LaunchedEffect(conn) { auth = if (conn is ConnState.Connected) repository.authStatus() else null }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         notify = granted
@@ -152,6 +156,28 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?) {
                 )
                 Text(
                     "Using a computer instead? Run the bridge there with --host set to a private address (for example your Tailscale IP) and enter it here. The connection is not encrypted, so keep it on a private network.",
+                    color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                )
+            }
+
+            Section("Claude account") {
+                val status = auth?.getOrNull()
+                Text(
+                    when {
+                        conn !is ConnState.Connected -> "Connect to a bridge to see which account Claude uses."
+                        auth == null -> "Checking…"
+                        status == null -> auth?.exceptionOrNull()?.message ?: "Couldn't check the login."
+                        !status.loggedIn -> "Not signed in. Tasks fail until Claude Code on the bridge is logged in."
+                        else -> "Signed in" + (status.email?.let { " as $it" } ?: "") +
+                            (status.subscriptionType?.let { " · Claude ${it.replaceFirstChar(Char::uppercase)}" }
+                                ?: if (status.authMethod == "claude.ai") "" else " · ${status.authMethod}")
+                    },
+                    color = if (status?.loggedIn == false) C.Red else C.TextSoft, fontSize = 14.sp,
+                )
+                if (status?.loggedIn == true) SecondaryButton("Log in with another account", onLogin, modifier = Modifier.fillMaxWidth())
+                else PrimaryButton("Log in to Claude", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
+                Text(
+                    "Runs claude auth login on the bridge and opens the sign-in page in your browser.",
                     color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
                 )
             }

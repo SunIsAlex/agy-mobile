@@ -1,7 +1,29 @@
 #!/usr/bin/env node
 // Stand-in for `claude -p --input-format stream-json ...` used by the bridge tests.
 // Each user message makes it ask permission for one Bash command, then report the answer.
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
+
+// `claude auth status|login`, signed in by a file in CLAUDE_CONFIG_DIR. Login opens a page with $BROWSER,
+// prints a paste-a-code link, and signs in once a code is typed. Both exit the process when done.
+if (process.argv[2] === 'auth') await new Promise(() => {
+  const file = path.join(process.env.CLAUDE_CONFIG_DIR, 'fake-login');
+  if (process.argv[3] === 'status') {
+    const email = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    process.stdout.write(JSON.stringify({ loggedIn: !!email, authMethod: email ? 'claude.ai' : 'none', ...(email && { email }) }, null, 2) + '\n');
+    process.exit(email ? 0 : 1);
+  }
+  execFileSync(process.env.BROWSER, ['https://claude.test/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A4000%2Fcallback']);
+  process.stdout.write('Opening browser to sign in…\r\nIf the browser didn\'t open, visit: \x1b]8;;https://claude.test/authorize?code=true\x07https://claude.test/authorize?code=true\x1b]8;;\x07\r\nPaste code here if prompted > ');
+  readline.createInterface({ input: process.stdin }).once('line', (code) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${code.trim()}@example.com`);
+    process.stdout.write('Login successful.\r\n');
+    process.exit(0);
+  });
+});
 
 const sid = process.argv[process.argv.indexOf(process.argv.includes('--resume') ? '--resume' : '--session-id') + 1];
 const out = (o) => process.stdout.write(JSON.stringify({ session_id: sid, ...o }) + '\n');
