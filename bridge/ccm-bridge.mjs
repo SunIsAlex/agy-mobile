@@ -408,8 +408,9 @@ class Session {
     if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status)) return;
     this.idleTimer = setTimeout(() => {
       if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status) || this.pending.size) return;
-      // Background jobs wake Claude when they finish, and its child processes (a dev server, say) die with it.
-      const busy = this.background.length || this.ports?.length || listProcesses().some((p) => p.sid === this.id && p.role === 'job' && !p.detached);
+      // Background jobs wake Claude when they finish, and its child processes (a dev server, say) die with
+      // it. Detached ones (a Gradle daemon, nohup jobs) outlive it, even when they listen on a port.
+      const busy = this.background.length || listProcesses().some((p) => p.sid === this.id && p.role === 'job' && !p.detached);
       if (busy) { this.scheduleIdleExit(); return; } // look again later
       this.idleExit = true;
       this.link.kill();
