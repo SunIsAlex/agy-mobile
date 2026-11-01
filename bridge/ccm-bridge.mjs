@@ -35,6 +35,9 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 // Image types and size the Messages API takes inline; other files are only saved for Claude to Read.
 const INLINE_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 const MAX_INLINE_IMAGE_BYTES = 3_750_000; // 5 MB once base64-encoded
+// A finished turn leaves Claude's process waiting for the next message, holding memory and waking
+// the phone. It's stopped after this long idle; the next message resumes the session (--resume).
+const IDLE_EXIT_MS = Number(process.env.CCM_IDLE_EXIT_MS ?? 60_000);
 
 // ---------- args & config ----------
 
@@ -358,6 +361,9 @@ class Session {
     // Background jobs Claude started (Bash run_in_background). Claude wakes up by itself when one
     // finishes, but only while its process lives, so the process must not be stopped meanwhile.
     this.background = [];
+    this.idleTimer = null;
+    this.idleExit = false; // Claude's process is being stopped for being idle
+    this.afterExit = []; // messages for Claude sent meanwhile, for the process that resumes it
   }
 
   summary() {
@@ -393,6 +399,22 @@ class Session {
     this.updatedAt = Date.now();
     this.persistMeta();
     broadcast({ ev: 'session', session: this.summary() });
+    this.scheduleIdleExit();
+  }
+
+  /** Stops Claude's process once the task has been idle for IDLE_EXIT_MS, unless something still needs it. */
+  scheduleIdleExit() {
+    clearTimeout(this.idleTimer);
+    if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status)) return;
+    this.idleTimer = setTimeout(() => {
+      if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status) || this.pending.size) return;
+      // Background jobs wake Claude when they finish, and its child processes (a dev server, say) die with it.
+      const busy = this.background.length || this.ports?.length || listProcesses().some((p) => p.sid === this.id && p.role === 'job' && !p.detached);
+      if (busy) { this.scheduleIdleExit(); return; } // look again later
+      this.idleExit = true;
+      this.link.kill();
+    }, IDLE_EXIT_MS);
+    this.idleTimer.unref();
   }
 
   get keeperDir() { return path.join(keepersDir, this.id); }
@@ -434,7 +456,17 @@ class Session {
 
   onProcessExit(code, signal, stderr) {
     this.link = null;
+    clearTimeout(this.idleTimer);
     try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
+    if (this.idleExit) {
+      // Stopped for being idle: the task itself hasn't changed, unless a message came meanwhile.
+      this.idleExit = false;
+      const queued = this.afterExit.splice(0);
+      if (queued.length && !this.archived) { this.ensureProcess(); queued.forEach((m) => this.writeCli(m)); }
+      this.persistMeta();
+      broadcast({ ev: 'session', session: this.summary() });
+      return;
+    }
     this.pending.clear();
     if (this.background.length) {
       this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with Claude's process: ${this.background.map((t) => t.description).join(', ')}` });
@@ -450,6 +482,7 @@ class Session {
   }
 
   writeCli(obj) {
+    if (this.idleExit) { this.afterExit.push(obj); return true; }
     if (!this.link) return false;
     this.link.write(JSON.stringify(obj));
     return true;
@@ -1046,6 +1079,7 @@ function loadSessions() {
         s.pending = new Map((meta.pendingRequests ?? []).map((r) => [r.request_id, r]));
         s.background = meta.backgroundTasks ?? [];
         s.attach();
+        s.scheduleIdleExit();
       }
     } catch {}
   }

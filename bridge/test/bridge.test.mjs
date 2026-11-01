@@ -908,6 +908,41 @@ test('terminal: a shell in a real pty that resizes, survives detaching, and clos
   }
 });
 
+test('an idle task\'s Claude process stops after a while, and the next message resumes it', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'proj');
+  fs.mkdirSync(repo, { recursive: true });
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_IDLE_EXIT_MS: '400' });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  const claudes = (sid) => execFileSync('ps', ['-eo', 'args']).toString().split('\n').filter((l) => l.includes('fake-claude') && l.includes(sid));
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'first', mode: 'bypassPermissions' });
+    const sid = (await c.next((m) => m.ev === 'started')).session.id;
+    const done = await c.next((m) => m.ev === 'session' && m.session.id === sid && m.session.status === 'idle');
+    assert.equal(done.session.running, true);
+    assert.equal(claudes(sid).length, 1);
+
+    // Stopped without the task changing: still idle, still where it was in the list.
+    const slept = await c.next((m) => m.ev === 'session' && m.session.id === sid && !m.session.running, 3000);
+    assert.equal(slept.session.status, 'idle');
+    assert.equal(slept.session.updatedAt, done.session.updatedAt);
+    assert.equal(claudes(sid).length, 0);
+
+    c.send({ op: 'send', sid, text: 'second' });
+    await c.next((m) => m.ev === 'session' && m.session.id === sid && m.session.status === 'idle' && m.session.running);
+    assert.match(claudes(sid)[0], /--resume/);
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('login: claude auth login runs in a pty, its sign-in pages go to the app, and auth reports the result', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
   const stateDir = path.join(tmp, 'state');
