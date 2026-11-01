@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -1055,5 +1056,115 @@ test('Claude\'s questions (AskUserQuestion) get the user\'s answers', async () =
   } finally {
     await stopAll(bridge, stateDir);
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// A stand-in for Claude's speech service: checks the login, answers each audio frame with the text
+// so far, and ends the utterance on CloseStream. Languages other than en and zh are refused (1003).
+function fakeSpeechServer() {
+  const seen = [];
+  const server = net.createServer((sock) => {
+    let buf = Buffer.alloc(0);
+    let open = false;
+    let words = [];
+    let request;
+    const frame = (op, payload) => {
+      const head = payload.length < 126 ? Buffer.from([0x80 | op, payload.length]) : Buffer.from([0x80 | op, 126, payload.length >> 8, payload.length & 255]);
+      sock.write(Buffer.concat([head, payload]));
+    };
+    const json = (o) => frame(1, Buffer.from(JSON.stringify(o)));
+    sock.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (!open) {
+        const end = buf.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const head = buf.subarray(0, end).toString();
+        buf = buf.subarray(end + 4);
+        const key = /sec-websocket-key: (\S+)/i.exec(head)[1];
+        const url = new URL(head.split(' ')[1], 'http://x');
+        request = { auth: /authorization: ([^\r]+)/i.exec(head)?.[1], language: url.searchParams.get('language'), keyterms: /x-config-keyterms: ([^\r]+)/i.exec(head)?.[1], audio: 0 };
+        seen.push(request);
+        if (request.auth !== 'Bearer test-token') { sock.end('HTTP/1.1 401 Unauthorized\r\n\r\n'); return; }
+        const accept = createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+        sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+        open = true;
+        if (!['en', 'zh'].includes(request.language)) { frame(8, Buffer.concat([Buffer.from([0x03, 0xeb]), Buffer.from('unsupported language')])); return; }
+      }
+      while (buf.length >= 6) {
+        let len = buf[1] & 0x7f;
+        let off = 2;
+        if (len === 126) { len = buf.readUInt16BE(2); off = 4; }
+        if (buf.length < off + 4 + len) return;
+        const mask = buf.subarray(off, off + 4);
+        const payload = Buffer.from(buf.subarray(off + 4, off + 4 + len).map((x, i) => x ^ mask[i % 4]));
+        const op = buf[0] & 0x0f;
+        buf = buf.subarray(off + 4 + len);
+        if (op === 2) {
+          request.audio += payload.length;
+          words.push(`word${words.length + 1}`);
+          json({ type: 'TranscriptInterim', data: words.join(' ') });
+        } else if (op === 1 && JSON.parse(payload).type === 'CloseStream') {
+          json({ type: 'TranscriptEndpoint' });
+          frame(8, Buffer.from([0x03, 0xe8]));
+        } else if (op === 8) sock.end();
+      }
+    });
+    sock.on('error', () => {});
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, seen, url: `ws://127.0.0.1:${server.address().port}` })));
+}
+
+test('voice: audio goes to Claude\'s speech service with the CLI\'s login, and transcripts come back', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+  fs.mkdirSync(path.join(tmp, 'claude-config'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'claude-config', '.credentials.json'),
+    JSON.stringify({ claudeAiOauth: { accessToken: 'test-token', expiresAt: Date.now() + 3_600_000 } }));
+  const speech = await fakeSpeechServer();
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_VOICE_URL: speech.url });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hi' });
+    const { session } = await c.next((m) => m.ev === 'started');
+
+    const pcm = Buffer.alloc(3200).toString('base64');
+    c.send({ op: 'voice_start', ref: 2, id: 'v1', language: 'en', sid: session.id, keyterms: ['ccm-bridge'] });
+    await c.next((m) => m.ev === 'voice_started' && m.ref === 2);
+    // Audio sent before the connection is up is queued, not lost.
+    c.send({ op: 'voice_audio', id: 'v1', data: pcm });
+    await c.next((m) => m.ev === 'voice' && m.id === 'v1' && m.type === 'ready');
+    assert.equal((await c.next((m) => m.ev === 'voice' && m.type === 'transcript')).text, 'word1');
+    c.send({ op: 'voice_audio', id: 'v1', data: pcm });
+    assert.deepEqual(await c.next((m) => m.ev === 'voice' && m.type === 'transcript'), { ev: 'voice', id: 'v1', type: 'transcript', text: 'word1 word2', final: false });
+    c.send({ op: 'voice_stop', id: 'v1' });
+    assert.equal((await c.next((m) => m.ev === 'voice' && m.type === 'transcript')).final, true);
+    assert.equal((await c.next((m) => m.ev === 'voice' && m.type === 'closed')).text, 'word1 word2');
+    assert.equal(speech.seen[0].keyterms, 'demo,ccm-bridge');
+    assert.equal(speech.seen[0].audio, 6400);
+
+    // A language the service refuses falls back to English, keeping what was already said.
+    c.send({ op: 'voice_start', ref: 3, id: 'v2', language: 'xx' });
+    c.send({ op: 'voice_audio', id: 'v2', data: pcm });
+    assert.equal((await c.next((m) => m.ev === 'voice' && m.id === 'v2' && m.type === 'transcript')).text, 'word1');
+    assert.deepEqual(speech.seen.slice(1).map((r) => r.language), ['xx', 'en']);
+    c.send({ op: 'voice_cancel', id: 'v2' });
+
+    // A rejected login is reported, not left hanging.
+    fs.writeFileSync(path.join(tmp, 'claude-config', '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'stale', expiresAt: Date.now() + 3_600_000 } }));
+    c.send({ op: 'voice_start', ref: 4, id: 'v3', language: 'en' });
+    assert.match((await c.next((m) => m.ev === 'voice' && m.id === 'v3' && m.type === 'error')).message, /HTTP 401/);
+    await c.next((m) => m.ev === 'voice' && m.id === 'v3' && m.type === 'closed');
+    c.end();
+  } finally {
+    speech.server.close();
+    await stopAll(bridge, stateDir);
   }
 });

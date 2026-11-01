@@ -13,6 +13,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VoiceStream } from './voice.mjs';
 
 const VERSION = 1;
 const MAX_EVENTS = 4000;
@@ -1462,6 +1463,7 @@ class Client {
     this.socket = socket;
     this.authed = false;
     this.subs = new Set();
+    this.voices = new Map(); // dictations in progress, by the app's id (see voice.mjs)
     this.buf = '';
     socket.setEncoding('utf8');
     socket.setKeepAlive(true, 30_000);
@@ -1469,6 +1471,8 @@ class Client {
     socket.on('close', () => {
       clients.delete(this);
       for (const term of terminals.values()) term.clients.delete(this);
+      for (const v of this.voices.values()) v.cancel();
+      this.voices.clear();
     });
     socket.on('error', () => {});
     // Unauthenticated connections get 10 s to say hello.
@@ -1560,6 +1564,32 @@ class Client {
       case 'term_detach': terminals.get(String(msg.id ?? ''))?.clients.delete(this); break;
       case 'term_close': terminalFor(msg.id).close(); break;
       case 'auth': this.send({ ev: 'auth', ref, auth: await authStatus() }); break;
+      // Dictation through Claude's speech-to-text (Claude Code's /voice): the app streams
+      // 16 kHz mono 16-bit PCM in base64 and gets 'voice' events back with the same id.
+      case 'voice_start': {
+        const id = String(msg.id ?? '');
+        if (!id || this.voices.has(id)) throw new Error('Bad voice id');
+        const keyterms = (Array.isArray(msg.keyterms) ? msg.keyterms : []).slice(0, 50).map(String);
+        if (s) keyterms.unshift(path.basename(s.cwd));
+        const v = new VoiceStream({
+          claudeBin, language: String(msg.language ?? 'en'), keyterms,
+          emit: (e) => {
+            this.send({ ev: 'voice', id, ...e });
+            if (e.type === 'closed') this.voices.delete(id);
+          },
+        });
+        this.voices.set(id, v);
+        this.send({ ev: 'voice_started', ref, id });
+        break;
+      }
+      case 'voice_audio': this.voices.get(String(msg.id ?? ''))?.audio(Buffer.from(String(msg.data ?? ''), 'base64')); break;
+      case 'voice_stop': this.voices.get(String(msg.id ?? ''))?.stop(); break;
+      case 'voice_cancel': {
+        const id = String(msg.id ?? '');
+        this.voices.get(id)?.cancel();
+        this.voices.delete(id);
+        break;
+      }
       case 'processes': this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'signal': signalProcess(Number(msg.pid), String(msg.signal)); this.send({ ev: 'processes', ref, processes: listProcesses() }); break;
       case 'restart_process': {

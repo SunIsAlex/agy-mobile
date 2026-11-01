@@ -77,6 +77,7 @@ import app.ccmobile.data.ToolItem
 import app.ccmobile.data.ToolState
 import app.ccmobile.data.TurnEndItem
 import app.ccmobile.data.UserItem
+import app.ccmobile.data.VoiceInput
 
 @Composable
 fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDiff: () -> Unit) {
@@ -93,6 +94,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
     val working = session?.status == "working"
     val loadImage: ImageLoader = remember(sid) { { ref -> repository.image(sid, ref) } }
     var viewing by remember { mutableStateOf<Pair<ToolItem, Int>?>(null) }
+    var voiceMode by rememberSaveable(sid) { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
@@ -120,6 +122,11 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 }
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
+            val startVoice = rememberWithMic({ repository.reportError("Voice mode needs access to the microphone.") }) { voiceMode = true }
+            IconBtn(
+                R.drawable.ic_voice, if (voiceMode) "End voice mode" else "Voice mode: talk with Claude",
+                { if (voiceMode) voiceMode = false else startVoice() }, tint = if (voiceMode) C.ClayText else C.Text,
+            )
             var menu by remember { mutableStateOf(false) }
             var effortMenu by remember { mutableStateOf(false) }
             var moving by remember { mutableStateOf(false) }
@@ -199,9 +206,13 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 onAllow = { repository.answer(approval, allow = true) },
                 onAlways = { repository.answer(approval, allow = true, always = true) },
             )
-        } else {
+        }
+        if (voiceMode) {
+            VoiceModePanel(repository, sid) { voiceMode = false }
+        } else if (approval == null) {
             var draft by remember(sid) { mutableStateOf(repository.settings.draft(sid)) }
             ReplyBar(
+                voice = repository.voice, sid = sid,
                 text = draft, onText = { draft = it; repository.settings.setDraft(sid, it) },
                 attachments = repository.draftAttachments(sid),
                 effort = session?.effort.orEmpty(), onEffort = { repository.setEffort(sid, it) },
@@ -347,6 +358,7 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
 
 @Composable
 private fun ReplyBar(
+    voice: VoiceInput, sid: String,
     text: String, onText: (String) -> Unit, attachments: SnapshotStateList<PendingAttachment>,
     effort: String, onEffort: (String) -> Unit,
     onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit,
@@ -369,6 +381,7 @@ private fun ReplyBar(
         TextField(
             value = text, onValueChange = onText,
             placeholder = { Text("Steer Claude, or /command…", color = C.Faint) },
+            trailingIcon = { MicButton(voice, owner = sid, sid = sid, text = text, onText = onText, onError = onError, size = 40.dp) },
             maxLines = 6,
             textStyle = TextStyle(fontSize = 15.sp, color = C.Text),
             modifier = Modifier.weight(1f).border(1.dp, C.Surface3, RoundedCornerShape(16.dp)).semantics { contentDescription = "Message Claude" },

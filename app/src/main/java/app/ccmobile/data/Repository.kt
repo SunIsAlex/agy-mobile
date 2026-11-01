@@ -40,6 +40,16 @@ private const val OUTDATED_BRIDGE = "This bridge is too old to log in from the a
 
 class Repository(private val scope: CoroutineScope, val settings: Settings) {
     val client = BridgeClient(scope)
+    /** Dictation through Claude's speech-to-text on the bridge. */
+    val voice = VoiceInput(scope, send = { op, fields -> send(op, *fields) }, open = { fields ->
+        val reply = call("voice_start", quiet = true, *fields)
+        when {
+            reply == null -> "The bridge didn't answer."
+            reply.str("ev") != "error" -> null
+            reply.str("message")?.startsWith("Unknown op") == true -> "This bridge is too old for voice. Restart it to update it."
+            else -> reply.str("message") ?: "Couldn't start voice."
+        }
+    })
 
     private val _sessions = MutableStateFlow<List<SessionSummary>>(emptyList())
     val sessions: StateFlow<List<SessionSummary>> = _sessions.asStateFlow()
@@ -360,6 +370,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
             "claude_sessions" -> _claudeSessions.value =
                 json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
             "term_output", "term_exit", "term_link" -> { _terminal.tryEmit(ev); return }
+            "voice" -> { voice.onEvent(ev); return }
             "limits" -> ev.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
             "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
             "history" -> {

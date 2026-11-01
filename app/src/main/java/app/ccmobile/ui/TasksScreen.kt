@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
+import app.ccmobile.data.VoiceInput
 import app.ccmobile.data.ClaudeSession
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.PendingAttachment
@@ -171,7 +172,7 @@ fun TasksScreen(
                         model = model, onModel = { model = it },
                         effort = effort, onEffort = { effort = it },
                         canStart = canStart, starting = starting, onStart = ::start,
-                        attachments = attachments, onError = repository::reportError,
+                        attachments = attachments, onError = repository::reportError, voice = repository.voice,
                     )
                 }
             }
@@ -286,7 +287,7 @@ private fun Composer(
     model: String, onModel: (String) -> Unit,
     effort: String, onEffort: (String) -> Unit,
     canStart: Boolean, starting: Boolean, onStart: () -> Unit,
-    attachments: SnapshotStateList<PendingAttachment>, onError: (String) -> Unit,
+    attachments: SnapshotStateList<PendingAttachment>, onError: (String) -> Unit, voice: VoiceInput,
 ) {
     Column(
         Modifier
@@ -316,6 +317,7 @@ private fun Composer(
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
           ) {
             AttachButton(attachments, onError)
+            MicButton(voice, owner = "new-task", sid = null, text = prompt, onText = onPrompt, onError = onError, size = 36.dp)
             var modeMenu by remember { mutableStateOf(false) }
             Box {
                 Chip(modeLabel(mode), onClick = { modeMenu = true }, icon = R.drawable.ic_shield, warn = mode == YOLO)

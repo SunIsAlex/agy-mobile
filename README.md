@@ -47,6 +47,17 @@ shell: `screencap`, `uiautomator dump`, `input`, `am`, `pm`, `settings` and so o
 approvals unless the task is in YOLO. (An earlier MCP server for this was removed: root makes it
 unnecessary.) The bridge also uses root to read which ports a task listens on.
 
+**Voice:** the microphone in both message boxes dictates with Claude's own speech-to-text, the one
+Claude Code's `/voice` uses: tap to talk, tap again to stop; the words appear in the box as you speak.
+The waveform button in a task starts **voice mode**, a hands-free conversation: it listens, sends what you
+said once you pause, reads Claude's reply aloud (the phone's text-to-speech), and listens again. It also
+reads out permission requests (answer "yes", "no" or "always") and Claude's questions (say an option, "the
+second one", or your own answer). While Claude works, *Talk* steers it; say "end voice mode" to stop. The
+screen stays on meanwhile. The phone records 16 kHz audio and the bridge streams it to
+`api.anthropic.com/api/ws/speech_to_text/voice_stream` with the claude.ai login of the `claude` it runs
+(`bridge/voice.mjs`), so voice needs a Claude subscription login there, not an API key. The phone's language
+is used when Claude supports it, English otherwise (which also understands Chinese, for one).
+
 **Reasoning effort:** the model chip on a new task also picks effort (Low, Medium, High, Extra high,
 Max, or the model's default; passed as `--effort`). In a running task, *Reasoning effort* in the menu
 changes it from the next reply without restarting Claude. The default for new tasks is in Settings.
