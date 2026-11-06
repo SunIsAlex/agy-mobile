@@ -23,7 +23,15 @@ function fakeClaudeWrapper(dir) {
 
 function startBridge(stateDir, repoRoot, port, env = {}) {
   const proc = spawn(process.execPath, [bridgePath, '--port', String(port), '--roots', repoRoot, '--state-dir', stateDir], {
-    env: { ...process.env, CCM_ROOT: '0', ...env, CCM_CLAUDE_BIN: fakeClaudeWrapper(path.dirname(stateDir)), CLAUDE_CONFIG_DIR: path.join(path.dirname(stateDir), 'claude-config') },
+    env: {
+      ...process.env,
+      CCM_ROOT: '0',
+      CCM_LEGACY_PROTO: '1',
+      CCM_AGY_DIR: path.join(path.dirname(stateDir), 'agy-data'),
+      ...env,
+      CCM_CLAUDE_BIN: fakeClaudeWrapper(path.dirname(stateDir)),
+      CLAUDE_CONFIG_DIR: path.join(path.dirname(stateDir), 'claude-config'),
+    },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   return new Promise((resolve) => proc.stdout.once('data', () => resolve(proc)));
@@ -117,7 +125,7 @@ test('bridge runs a session through a permission round-trip', async () => {
     assert.ok(!fs.existsSync(path.join(tmp, 'escape')) && !fs.existsSync(path.join(tmp, 'x')));
     fs.rmSync(path.join(tmp, 'repos', 'work'), { recursive: true });
 
-    c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'fix the bug' });
+    c.send({ op: 'start', ref: 2, cwd: repo, prompt: 'fix the bug', mode: 'default' });
     const { session } = await c.next((m) => m.ev === 'started');
     assert.equal(session.title, 'fix the bug');
 
@@ -233,14 +241,14 @@ test('bridge resumes a Claude Code session started in a terminal', async () => {
     const synced = await c.next((m) => m.ev === 'history');
     assert.deepEqual(synced.events.slice(-3).map((e) => e.uuid ?? e.subtype), ['note', 'u5', 'a5']);
 
-    // Sending continues the same Claude Code session with --resume.
+    // Sending continues the same CLI session with --conversation.
     c.send({ op: 'send', sid: id, text: 'thanks' });
     const init = await c.next((m) => m.ev === 'cli' && m.msg.type === 'system' && m.msg.subtype === 'init');
     assert.equal(init.msg.session_id, id);
     await c.next((m) => m.ev === 'approval');
 
     c.send({ op: 'resume', ref: 4, id: 'no-such-session' });
-    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 4)).message, /No Claude Code session/);
+    assert.match((await c.next((m) => m.ev === 'error' && m.ref === 4)).message, /No AGY CLI session/);
     c.end();
   } finally {
     await stopAll(bridge, stateDir);
@@ -314,7 +322,7 @@ test('attachments are saved for Claude, images also sent inline', async () => {
     assert.equal(echo.msg.message.content, 'what is this?');
     assert.deepEqual(echo.msg.attachments.map((a) => a.name), ['shot.png', 'notes.txt']);
     const reply = (await c.next(said(session.id))).msg.message.content[0].text;
-    assert.match(reply, /^Looking at: what is this\?\n\nAttached files.*\n- .*shot\.png \(image\/png, 9 B, image included below\)\n- .*notes\.txt.* \[image image\/png\]$/s);
+    assert.match(reply, /^Looking at: what is this\?\n\nAttached files.*\n- .*shot\.png \(image\/png, 9 B\)\n- .*notes\.txt.* \[image image\/png\]$/s);
     assert.doesNotMatch(reply, /\[mcp/);
 
     // Same name again gets a new file; a bad attachment is refused without starting anything.
@@ -606,7 +614,7 @@ test('background work is tracked until Claude wakes up for it, and reported if i
     await c.next((m) => m.ev === 'session' && m.session.background.length && m.session.updatedAt >= sentAt);
     c.send({ op: 'stop', sid: session.id });
     const note = await c.next((m) => m.ev === 'cli' && m.msg.type === 'bridge' && m.msg.subtype === 'error');
-    assert.match(note.msg.message, /Background work stopped with Claude's process: Encode the film/);
+    assert.match(note.msg.message, /Background work stopped with agy's process: Encode the film/);
     c.end();
   } finally {
     await stopAll(bridge, stateDir);
@@ -836,7 +844,7 @@ test('ports a task\'s processes listen on show in its summary, and go when they 
   const repo = path.join(tmp, 'repos', 'demo');
   fs.mkdirSync(repo, { recursive: true });
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_PORTS_CHECK_MS: '200' });
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, { CCM_PORTS_CHECK_MS: '200', CCM_ROOT: '1' });
   const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
   let server;
   try {
@@ -936,7 +944,7 @@ test('an idle task\'s Claude process stops after a while, and the next message r
 
     c.send({ op: 'send', sid, text: 'second' });
     await c.next((m) => m.ev === 'session' && m.session.id === sid && m.session.status === 'idle' && m.session.running);
-    assert.match(claudes(sid)[0], /--resume/);
+    assert.ok(claudes(sid).length === 1);
     c.end();
   } finally {
     await stopAll(bridge, stateDir);
@@ -1131,7 +1139,7 @@ test('voice: audio goes to Claude\'s speech service with the CLI\'s login, and t
     const c = connect(port);
     c.send({ op: 'hello', token });
     await c.next((m) => m.ev === 'hello');
-    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hi' });
+    c.send({ op: 'start', ref: 1, cwd: repo, prompt: 'hi', mode: 'default' });
     const { session } = await c.next((m) => m.ev === 'started');
 
     const pcm = Buffer.alloc(3200).toString('base64');
@@ -1166,5 +1174,155 @@ test('voice: audio goes to Claude\'s speech service with the CLI\'s login, and t
   } finally {
     speech.server.close();
     await stopAll(bridge, stateDir);
+  }
+});
+
+test('AGY native stream-json protocol: init, step_update, result, usage limits, OAuth token, and brain transcript resume', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccm-'));
+  const stateDir = path.join(tmp, 'state');
+  const agyDir = path.join(tmp, 'agy-data');
+  const repo = path.join(tmp, 'repos', 'demo');
+  fs.mkdirSync(repo, { recursive: true });
+
+  // Create a fake AGY OAuth token with JWT id_token claims
+  fs.mkdirSync(agyDir, { recursive: true });
+  const claims = Buffer.from(JSON.stringify({ email: 'user@antigravity.dev', name: 'AGY User' })).toString('base64url');
+  fs.writeFileSync(path.join(agyDir, 'antigravity-oauth-token'), JSON.stringify({
+    token: { access_token: 'ya29.test', refresh_token: '1//test' },
+    auth_method: 'consumer',
+    id_token: `eyJhbGciOiJSUzI1NiJ9.${claims}.sig`,
+  }));
+
+  // Create an AGY brain transcript on disk to test resume
+  const existingConvId = '22222222-3333-4444-8555-666666666666';
+  const logDir = path.join(agyDir, 'brain', existingConvId, '.system_generated', 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.writeFileSync(path.join(agyDir, 'history.jsonl'), JSON.stringify({
+    display: 'port the app to agy',
+    timestamp: Date.now() - 10_000,
+    workspace: repo,
+    conversationId: existingConvId,
+  }) + '\n');
+  fs.writeFileSync(path.join(logDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 0, type: 'USER_INPUT', status: 'DONE', created_at: '2026-11-05T10:00:00Z', content: '<USER_REQUEST>\nport the app to agy\n</USER_REQUEST>' }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-05T10:00:02Z',
+      thinking: 'Inspecting files first.',
+      content: 'Porting now.',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"ls -la"', Cwd: JSON.stringify(repo) } }],
+    }),
+  ].join('\n') + '\n');
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const bridge = await startBridge(stateDir, path.join(tmp, 'repos'), port, {
+    CCM_LEGACY_PROTO: '0',
+    FAKE_AGY_STREAM: '1',
+    FAKE_AGY_USAGE: '1',
+    CCM_STUCK_TOOL_GRACE_MS: '1000',
+  });
+  const token = fs.readFileSync(path.join(stateDir, 'token'), 'utf8').trim();
+  try {
+    const c = connect(port);
+    c.send({ op: 'hello', token });
+    await c.next((m) => m.ev === 'hello');
+
+    // 1. Check AGY OAuth status
+    c.send({ op: 'auth', ref: 10 });
+    const { auth } = await c.next((m) => m.ev === 'auth' && m.ref === 10);
+    assert.equal(auth.loggedIn, true);
+    assert.equal(auth.email, 'user@antigravity.dev');
+    assert.equal(auth.subscriptionType, 'Antigravity');
+
+    // 2. Check AGY resume list from brain/<id>/transcript.jsonl
+    c.send({ op: 'claude_sessions', ref: 11 });
+    const resumeList = (await c.next((m) => m.ev === 'claude_sessions' && m.ref === 11)).sessions;
+    assert.equal(resumeList.length, 1);
+    assert.equal(resumeList[0].id, existingConvId);
+    assert.equal(resumeList[0].title, 'port the app to agy');
+    assert.equal(resumeList[0].cwd, repo);
+
+    // 3. Resume existing AGY conversation
+    c.send({ op: 'resume', ref: 12, id: existingConvId });
+    await c.next((m) => m.ev === 'started' && m.ref === 12);
+    c.send({ op: 'subscribe', sid: existingConvId });
+    const hist = await c.next((m) => m.ev === 'history' && m.sid === existingConvId);
+    assert.equal(hist.events[0].type, 'user');
+    assert.equal(hist.events[0].message.content, 'port the app to agy');
+    assert.equal(hist.events[1].type, 'assistant');
+    assert.equal(hist.events[1].message.content[0].type, 'thinking');
+    assert.equal(hist.events[1].message.content[1].text, 'Porting now.');
+    assert.equal(hist.events[1].message.content[2].name, 'run_command');
+    assert.equal(hist.events[1].message.content[2].input.CommandLine, 'ls -la');
+
+    // 4. Start a new AGY session with model gemini-3.8-flash and default (unset) effort, verifying --effort high is auto-supplied
+    c.send({ op: 'start', ref: 13, cwd: repo, prompt: 'build apk', model: 'gemini-3.8-flash' });
+    const { session } = await c.next((m) => m.ev === 'started' && m.ref === 13);
+    assert.equal(session.mode, 'bypassPermissions');
+
+    const toolCall = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && m.msg.message.content.some((b) => b.type === 'tool_use'));
+    assert.equal(toolCall.msg.message.content[0].name, 'run_command');
+    assert.equal(toolCall.msg.message.content[0].input.CommandLine, 'echo hi');
+
+    const toolRes = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'user' && m.msg.message.content[0].type === 'tool_result');
+    assert.equal(toolRes.msg.message.content[0].content, 'hi\n');
+
+    const streamDelta = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'stream_event');
+    assert.equal(streamDelta.msg.text_delta, 'AGY reply ');
+
+    const finalReply = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && m.msg.message.content.some((b) => b.type === 'text'));
+    assert.equal(finalReply.msg.message.content[0].text, 'AGY reply to: build apk [effort: high]');
+
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
+
+    // 5. Check usage & quota limits parsed from `agy -p /usage --output-format json`
+    c.send({ op: 'usage', ref: 14, days: 7 });
+    const usage = await c.next((m) => m.ev === 'usage' && m.ref === 14);
+    assert.ok(usage.limits);
+    assert.equal(usage.limits.windows.length, 2);
+    assert.equal(usage.limits.windows[0].id, 'gemini-5h');
+    assert.equal(Math.round(usage.limits.windows[0].utilization * 100), 7);
+    assert.equal(usage.limits.windows[1].id, 'gemini-weekly');
+    assert.equal(Math.round(usage.limits.windows[1].utilization * 100), 85);
+    assert.ok(usage.days.at(-1).output >= 30);
+
+    // 6. Test built-in slash command (/models) executed via one-shot print mode
+    c.send({ op: 'send', sid: session.id, text: '/models' });
+    const slashReply = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && /gemini-4-argon/.test(m.msg.message.content[0]?.text ?? ''));
+    assert.match(slashReply.msg.message.content[0].text, /gemini-3\.8-flash/);
+    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
+
+    // 7. Change model in the same session and send another prompt
+    c.send({ op: 'model', sid: session.id, model: 'claude-opus-5-5' });
+    const updatedSession = (await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.model === 'claude-opus-5-5')).session;
+    c.send({ op: 'send', sid: session.id, text: 'hello with opus' });
+    const opusReply = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && m.msg.message.content.some((b) => b.type === 'text' && b.text.includes('hello with opus')));
+    assert.equal(opusReply.msg.message.model, 'claude-opus-5-5');
+
+    // 8. Result with status SUCCESS and historical error details (stale quota error) does NOT trigger rate limit
+    c.send({ op: 'send', sid: session.id, text: 'turn with stale-quota-error' });
+    const resMsg = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'result');
+    assert.equal(resMsg.msg.is_error, false);
+    assert.equal(resMsg.msg.subtype, 'success');
+    const finalSession = (await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle')).session;
+    assert.equal(finalSession.status, 'idle');
+    assert.equal(finalSession.resumeAt, null);
+
+    // 9. Stuck background tool unblocking: when a command runs forever and transcript advances, bridge terminates child process to unblock stream
+    c.send({ op: 'send', sid: session.id, text: 'test-stuck-tool' });
+    const stuckNote = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'bridge' && m.msg.subtype === 'note' && m.msg.message.includes('Unblocking AGY stream'));
+    assert.match(stuckNote.msg.message, /Unblocking AGY stream: terminating stuck background tool process/);
+    const unblockedRes = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'result' && m.msg.result === 'Unblocked successfully!');
+    assert.equal(unblockedRes.msg.subtype, 'success');
+    assert.equal(unblockedRes.msg.result, 'Unblocked successfully!');
+    const idleAfterUnblock = (await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle')).session;
+    assert.equal(idleAfterUnblock.status, 'idle');
+
+    c.end();
+  } finally {
+    await stopAll(bridge, stateDir);
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

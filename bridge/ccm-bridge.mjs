@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// ccm-bridge: runs Claude Code sessions and exposes them to the CC Mobile app.
+// ccm-bridge: runs Antigravity CLI (agy) sessions and exposes them to the AGY Mobile app.
 //
 // Transport: newline-delimited JSON over TCP. The first line from a client must be
 // {"op":"hello","token":"..."}; anything else closes the connection.
-// Each session is a `claude -p` process speaking stream-json on stdio, with
-// permission prompts routed to the app (--permission-prompt-tool stdio).
+// Each session is an `agy -p=` process speaking stream-json on stdio.
 
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -33,11 +32,11 @@ const LIMIT_GRACE_MS = Number(process.env.CCM_LIMIT_GRACE_MS ?? 60_000);
 const RESUME_CHECK_MS = Number(process.env.CCM_RESUME_CHECK_MS ?? 30_000);
 const MAX_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-// Image types and size the Messages API takes inline; other files are only saved for Claude to Read.
+// Image types and size kept inline in transcripts; other files are saved to disk for agy to view.
 const INLINE_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 const MAX_INLINE_IMAGE_BYTES = 3_750_000; // 5 MB once base64-encoded
-// A finished turn leaves Claude's process waiting for the next message, holding memory and waking
-// the phone. It's stopped after this long idle; the next message resumes the session (--resume).
+// A finished turn leaves agy's process waiting for the next message, holding memory and waking
+// the phone. It's stopped after this long idle; the next message resumes the session (--conversation).
 const IDLE_EXIT_MS = Number(process.env.CCM_IDLE_EXIT_MS ?? 60_000);
 
 // ---------- args & config ----------
@@ -75,25 +74,30 @@ const opts = parseArgs(process.argv.slice(2));
 const stateDir = opts.stateDir ?? path.join(process.env.XDG_STATE_HOME ?? path.join(os.homedir(), '.local', 'state'), 'ccm-bridge');
 const sessionsDir = path.join(stateDir, 'sessions');
 const attachmentsDir = path.join(stateDir, 'attachments');
-// Images Claude looked at, per session, named by content hash (see saveImage()).
+// Images agy looked at, per session, named by content hash (see saveImage()).
 const imagesDir = path.join(stateDir, 'images');
 fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
 const ptyPy = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ptyhost.py'); // not pty.py: that would shadow Python's pty
 const keeperJs = path.join(path.dirname(fileURLToPath(import.meta.url)), 'keeper.mjs');
-// One folder per running Claude process; see keeper.mjs and KeeperLink.
+// One folder per running agy process; see keeper.mjs and KeeperLink.
 const keepersDir = path.join(stateDir, 'keepers');
-// Claude Code's native installer puts `claude` in ~/.local/bin, which shells started by an app (Termux's
-// RUN_COMMAND, the app's Start button) may not have on PATH; without it `claude` can resolve to a
-// broken npm copy ("claude native binary not installed"). Claude's own commands inherit this PATH.
+// Ensure ~/.local/bin and Termux's agy wrapper directories are on PATH even when started from an app broadcast.
 {
-  const localBin = path.join(os.homedir(), '.local', 'bin');
-  const dirs = (process.env.PATH ?? '').split(':');
-  if (fs.existsSync(localBin) && !dirs.includes(localBin)) process.env.PATH = [localBin, ...dirs.filter(Boolean)].join(':');
+  const extraBins = [
+    path.join(os.homedir(), '.local', 'bin'),
+    '/data/data/com.termux/files/home/.local/bin',
+    '/data/data/com.termux/files/home/.agy-termux-musl',
+  ];
+  const dirs = (process.env.PATH ?? '').split(':').filter(Boolean);
+  for (const b of extraBins.reverse()) {
+    if (fs.existsSync(b) && !dirs.includes(b)) dirs.unshift(b);
+  }
+  process.env.PATH = dirs.join(':');
 }
-const claudeBin = process.env.CCM_CLAUDE_BIN ?? 'claude';
+const claudeBin = process.env.CCM_AGY_BIN ?? process.env.CCM_CLAUDE_BIN ?? 'agy';
+const agyDataDir = process.env.CCM_AGY_DIR ?? process.env.AGY_DATA_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli');
 const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects');
-// bypassPermissions is the app's "YOLO" mode: tools run without asking. Claude Code still sends
-// writes to settings, git and tool-configuration files to the permission handler (the app).
+// bypassPermissions is the app's "YOLO" mode (--dangerously-skip-permissions).
 const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'manual', 'dontAsk', 'bypassPermissions'];
 // Reasoning effort (--effort); null leaves it to the model's default.
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -124,7 +128,7 @@ const pidFile = path.join(stateDir, 'bridge.pid');
       const args = fs.readFileSync(`/proc/${other}/cmdline`, 'utf8').split('\0');
       const arg = (name, fallback) => (args.includes(name) ? args[args.indexOf(name) + 1] : fallback);
       const host = arg('--host', '127.0.0.1');
-      const url = `ccmobile://pair?host=${encodeURIComponent(host === '0.0.0.0' ? '127.0.0.1' : host)}&port=${arg('--port', '8765')}&token=${encodeURIComponent(token)}`;
+      const url = `agymobile://pair?host=${encodeURIComponent(host === '0.0.0.0' ? '127.0.0.1' : host)}&port=${arg('--port', '8765')}&token=${encodeURIComponent(token)}`;
       console.log(`ccm-bridge is already running (pid ${other}).`);
       if (opts.showToken) console.log(`Token: ${token}\nPair link: ${url}`);
       if (opts.pair) await new Promise((done) => execFile('am', ['start', '-a', 'android.intent.action.VIEW', '-d', url], (err) => { if (err) console.log(`Pair link: ${url}`); done(); }));
@@ -153,10 +157,11 @@ function tokenMatches(candidate) {
  * bridge carries on from there without losing or repeating a line.
  */
 class KeeperLink {
-  constructor(dir, { onLine, onExit }) {
+  constructor(dir, { onLine, onExit, onTick }) {
     this.dir = dir;
     this.onLine = onLine;
     this.onExit = onExit;
+    this.onTick = onTick;
     this.offset = Number(readText(path.join(dir, 'read'))) || 0;
     this.partial = Buffer.alloc(0);
     this.closed = false;
@@ -216,6 +221,7 @@ class KeeperLink {
       if (this.queued.length) this.openInput();
       this.read();
       if (this.closed) return;
+      if (tick) this.onTick?.();
       const pid = this.info?.pid;
       if (pid && this.killRequested) { this.killRequested = false; try { process.kill(pid, 'SIGTERM'); } catch {} }
       if (exited) {
@@ -334,21 +340,23 @@ const sessions = new Map();
 const clients = new Set();
 
 class Session {
-  constructor({ id, cwd, title, model, effort, mode, createdAt, status, autoContinue, resumeAt }) {
+  constructor({ id, cwd, title, model, effort, mode, createdAt, status, autoContinue, resumeAt, cliSessionId }) {
     this.id = id;
+    this.cliSessionId = cliSessionId ?? null;
     this.cwd = cwd;
     this.title = title;
     this.model = model ?? null;
+    this.currentModel = this.model;
     this.effort = EFFORTS.includes(effort) ? effort : null;
-    this.mode = mode ?? 'default';
+    this.mode = mode ?? 'bypassPermissions';
     this.createdAt = createdAt ?? Date.now();
     this.updatedAt = this.createdAt;
     this.status = status ?? 'idle'; // working | needs_approval | idle | stopped | error
     this.lastActivity = '';
     this.events = [];
     this.pending = new Map(); // request_id -> control_request message
-    this.link = null; // KeeperLink to the running Claude process
-    this.started = false; // true once claude has created this session id on disk
+    this.link = null; // KeeperLink to the running agy process
+    this.started = false; // true once agy has created this session id on disk
     this.costUsd = 0;
     this.costBase = 0; // totals from earlier processes, if one started counting from zero
     this.costLast = 0;
@@ -359,12 +367,17 @@ class Session {
     this.limitHit = false; // this turn ended on a rate_limit error
     this.rejectedResetAt = null; // reset time from this turn's rejected rate_limit_event
     this.limitRetryMs = 0;
-    // Background jobs Claude started (Bash run_in_background). Claude wakes up by itself when one
-    // finishes, but only while its process lives, so the process must not be stopped meanwhile.
+    // Background jobs agy started.
     this.background = [];
     this.idleTimer = null;
-    this.idleExit = false; // Claude's process is being stopped for being idle
-    this.afterExit = []; // messages for Claude sent meanwhile, for the process that resumes it
+    this.idleExit = false; // agy's process is being stopped for being idle
+    this.interrupted = false; // agy's process is being stopped due to user interrupt
+    this.afterExit = []; // messages for agy sent meanwhile, for the process that resumes it
+    this.stepText = new Map(); // step_index -> accumulated streamed text
+    this.emittedTools = new Set(); // step_index where tool_use was emitted
+    this.emittedThinking = new Set(); // step_index where thinking was emitted
+    this.turnHadText = false;
+    this.stuckToolDetectedAt = null;
   }
 
   summary() {
@@ -384,7 +397,14 @@ class Session {
   persistMeta() {
     if (this.archived) return;
     // Pending requests and background jobs are restored if the keeper is still running after a restart.
-    const meta = { ...this.summary(), started: this.started, cliSize: this.cliSize, pendingRequests: [...this.pending.values()], backgroundTasks: this.background };
+    const meta = {
+      ...this.summary(),
+      cliSessionId: this.cliSessionId,
+      started: this.started,
+      cliSize: this.cliSize,
+      pendingRequests: [...this.pending.values()],
+      backgroundTasks: this.background,
+    };
     fs.writeFileSync(path.join(sessionsDir, `${this.id}.json`), JSON.stringify(meta));
   }
 
@@ -403,13 +423,13 @@ class Session {
     this.scheduleIdleExit();
   }
 
-  /** Stops Claude's process once the task has been idle for IDLE_EXIT_MS, unless something still needs it. */
+  /** Stops agy's process once the task has been idle for IDLE_EXIT_MS, unless something still needs it. */
   scheduleIdleExit() {
     clearTimeout(this.idleTimer);
     if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status)) return;
     this.idleTimer = setTimeout(() => {
       if (!this.link || this.idleExit || !['idle', 'error', 'limited'].includes(this.status) || this.pending.size) return;
-      // Background jobs wake Claude when they finish, and its child processes (a dev server, say) die with
+      // Background jobs wake agy when they finish, and its child processes (a dev server, say) die with
       // it. Detached ones (a Gradle daemon, nohup jobs) outlive it, even when they listen on a port.
       const busy = this.background.length || listProcesses().some((p) => p.sid === this.id && p.role === 'job' && !p.detached);
       if (busy) { this.scheduleIdleExit(); return; } // look again later
@@ -421,45 +441,83 @@ class Session {
 
   get keeperDir() { return path.join(keepersDir, this.id); }
 
+  /**
+   * Resolves --model and --effort for agy:
+   * - Multi-effort models (gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5)
+   *   require --effort (low, medium, high) whenever --model is specified without an effort suffix;
+   *   when effort is unset ("Default"), default to "high".
+   * - Single-effort models like gpt-oss-120b only support "medium" (or no --effort flag).
+   * - If model already has a -(low|medium|high) suffix, strip it when an explicit effort is chosen.
+   */
+  resolveAgyModelEffort(rawModel, rawEffort) {
+    const validEffort = rawEffort && ['low', 'medium', 'high'].includes(rawEffort) ? rawEffort : null;
+    if (!rawModel) return { model: null, effort: validEffort };
+    const suffixMatch = String(rawModel).match(/^(.*)-(low|medium|high)$/);
+    const baseModel = suffixMatch ? suffixMatch[1] : String(rawModel);
+    const suffixEffort = suffixMatch ? suffixMatch[2] : null;
+    if (baseModel.startsWith('gpt-oss')) {
+      return { model: baseModel, effort: null };
+    }
+    return {
+      model: baseModel,
+      effort: validEffort ?? suffixEffort ?? 'high',
+    };
+  }
+
   ensureProcess() {
     if (this.link) return;
-    const args = [
-      '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      '--include-partial-messages', '--permission-prompt-tool', 'stdio',
-      '--permission-mode', this.mode,
-      // Only makes YOLO available, so setMode() can switch a running session into it.
-      '--allow-dangerously-skip-permissions',
-    ];
-    if (this.model) args.push('--model', this.model);
-    if (this.effort) args.push('--effort', this.effort);
-    // Attachments are saved here; allowing the folder lets Claude Read them without asking.
+    const args = ['-p=', '--input-format', 'stream-json', '--output-format', 'stream-json'];
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      args.push('--permission-mode', this.mode, '--allow-dangerously-skip-permissions');
+      if (this.effort) args.push('--effort', this.effort);
+      if (this.model) args.push('--model', this.model);
+      args.push(...(this.started ? ['--resume', this.id] : ['--session-id', this.id]));
+    } else {
+      if (this.mode === 'plan') args.push('--mode', 'plan');
+      else if (this.mode === 'acceptEdits') args.push('--mode', 'accept-edits');
+      else args.push('--dangerously-skip-permissions');
+      const { model, effort } = this.resolveAgyModelEffort(this.model, this.effort);
+      if (model) args.push('--model', model);
+      if (effort) args.push('--effort', effort);
+      if (this.cliSessionId) args.push('--conversation', this.cliSessionId);
+    }
+    // Attachments are saved here; allowing the folder and workspace lets agy access them directly.
     fs.mkdirSync(this.attachmentsDir, { recursive: true, mode: 0o700 });
-    args.push('--add-dir', this.attachmentsDir);
-    args.push(...(this.started ? ['--resume', this.id] : ['--session-id', this.id]));
+    args.push('--add-dir', this.cwd, '--add-dir', this.attachmentsDir);
 
-    // Claude runs under a keeper, detached, so it outlives the bridge (see keeper.mjs).
+    // agy runs under a keeper, detached, so it outlives the bridge (see keeper.mjs).
     const dir = this.keeperDir;
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     execFileSync('mkfifo', ['-m', '600', path.join(dir, 'in')]);
-    spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env: process.env }).unref();
+    const env = {
+      ...process.env,
+      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      AGY_SESSION_ID: this.id,
+      CLAUDE_CODE_SESSION_ID: this.id,
+    };
+    spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env }).unref();
     this.started = true;
     this.attach();
     this.persistMeta();
-    this.writeCli({ type: 'control_request', request_id: `init-${randomUUID()}`, request: { subtype: 'initialize' } });
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      this.writeCli({ type: 'control_request', request_id: `init-${randomUUID()}`, request: { subtype: 'initialize' } });
+    }
   }
 
   attach() {
     this.link = new KeeperLink(this.keeperDir, {
       onLine: (line) => this.onLine(line),
       onExit: (code, signal, stderr) => this.onProcessExit(code, signal, stderr),
+      onTick: () => this.checkStuckTools(),
     });
   }
 
   onProcessExit(code, signal, stderr) {
     this.link = null;
+    this.stuckToolDetectedAt = null;
     clearTimeout(this.idleTimer);
-    try { this.cliSize = fs.statSync(findCliTranscript(this.id)).size; } catch {}
+    try { this.cliSize = fs.statSync(findCliTranscript(this.cliSessionId ?? this.id)).size; } catch {}
     if (this.idleExit) {
       // Stopped for being idle: the task itself hasn't changed, unless a message came meanwhile.
       this.idleExit = false;
@@ -469,17 +527,25 @@ class Session {
       broadcast({ ev: 'session', session: this.summary() });
       return;
     }
+    if (this.interrupted) {
+      this.interrupted = false;
+      this.stepText.clear();
+      this.emittedTools.clear();
+      this.turnHadText = false;
+      this.setStatus('idle', 'Interrupted');
+      return;
+    }
     this.pending.clear();
     if (this.background.length) {
-      this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with Claude's process: ${this.background.map((t) => t.description).join(', ')}` });
+      this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with agy's process: ${this.background.map((t) => t.description).join(', ')}` });
       this.background = [];
     }
     if (this.status === 'stopped') { this.setStatus('stopped'); return; }
     if (this.status === 'limited') { this.setStatus('limited'); return; }
     if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
     else {
-      this.emitLocal({ type: 'bridge', subtype: 'error', message: `claude exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
-      this.setStatus('error', 'claude exited unexpectedly');
+      this.emitLocal({ type: 'bridge', subtype: 'error', message: `agy exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
+      this.setStatus('error', 'agy exited unexpectedly');
     }
   }
 
@@ -498,7 +564,353 @@ class Session {
     this.onCliMessage(msg);
   }
 
+  /** Reads the model's internal thinking for a step from agy's transcript.jsonl if available. */
+  readStepThinking(stepIndex) {
+    if (this.emittedThinking.has(stepIndex)) return null;
+    const convId = this.cliSessionId ?? this.id;
+    const file = path.join(agyDataDir, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
+    try {
+      const lines = fs.readFileSync(file, 'utf8').split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line || !line.includes(`"step_index":${stepIndex}`)) continue;
+        const r = JSON.parse(line);
+        if (r.step_index === stepIndex && typeof r.thinking === 'string' && r.thinking.trim()) {
+          this.emittedThinking.add(stepIndex);
+          return r.thinking.trim();
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  /**
+   * Detects and unblocks background commands that have been backgrounded by AGY CLI
+   * but whose child process is still running and blocking the sequential stream-json emitter.
+   */
+  checkStuckTools() {
+    if (this.status !== 'working' || !this.link || this.emittedTools.size === 0) {
+      this.stuckToolDetectedAt = null;
+      return;
+    }
+    const claudePid = this.link.info?.claudePid;
+    if (!claudePid || !alive(claudePid)) return;
+
+    const file = findCliTranscript(this.cliSessionId ?? this.id);
+    if (!file || !fs.existsSync(file)) return;
+
+    let maxTranscriptStep = -1;
+    try {
+      const stat = fs.statSync(file);
+      const readLen = Math.min(stat.size, 65536);
+      const buf = Buffer.alloc(readLen);
+      const fd = fs.openSync(file, 'r');
+      fs.readSync(fd, buf, 0, readLen, stat.size - readLen);
+      fs.closeSync(fd);
+      const lines = buf.toString('utf8').split('\n');
+      for (const line of lines) {
+        if (!line.includes('"step_index"')) continue;
+        try {
+          const r = JSON.parse(line);
+          if (typeof r.step_index === 'number' && r.step_index > maxTranscriptStep) {
+            maxTranscriptStep = r.step_index;
+          }
+        } catch {}
+      }
+    } catch {}
+
+    const minActiveStep = Math.min(...this.emittedTools);
+    if (maxTranscriptStep > minActiveStep) {
+      const now = Date.now();
+      if (!this.stuckToolDetectedAt) {
+        this.stuckToolDetectedAt = now;
+        return;
+      }
+      const graceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : 3000;
+      if (now - this.stuckToolDetectedAt >= graceMs) {
+        const descendants = findDescendantPids(claudePid);
+        if (descendants.length > 0) {
+          this.emitLocal({
+            type: 'bridge',
+            subtype: 'note',
+            message: `Unblocking AGY stream: terminating stuck background tool process(es) (PID ${descendants.join(', ')})`,
+          });
+          for (const pid of [...descendants].reverse()) {
+            try { process.kill(pid, 'SIGTERM'); } catch {}
+          }
+          setTimeout(() => {
+            for (const pid of [...descendants].reverse()) {
+              if (alive(pid)) {
+                try { process.kill(pid, 'SIGKILL'); } catch {}
+              }
+            }
+          }, 500).unref();
+        }
+        this.stuckToolDetectedAt = null;
+      }
+    } else {
+      this.stuckToolDetectedAt = null;
+    }
+  }
+
+  /** Normalizes agy's stream-json events ({event: 'init' | 'step_update' | 'result'}) into bridge events. */
+  onAgyMessage(msg) {
+    if (msg.event === 'init') {
+      if (msg.conversation_id && this.cliSessionId !== msg.conversation_id) {
+        this.cliSessionId = msg.conversation_id;
+        this.persistMeta();
+      }
+      const init = msg.init ?? {};
+      this.currentModel = init.model || this.model || 'agy';
+      this.onCliMessage({
+        type: 'system',
+        subtype: 'init',
+        model: this.currentModel,
+        cwd: init.cwd || this.cwd,
+        permissionMode: this.mode,
+        session_id: this.cliSessionId ?? this.id,
+      });
+      return;
+    }
+
+    if (msg.event === 'step_update') {
+      const su = msg.step_update;
+      if (!su) return;
+      if (su.conversation_id && !this.cliSessionId) {
+        this.cliSessionId = su.conversation_id;
+        this.persistMeta();
+      }
+      const idx = su.step_index ?? 0;
+
+      if (su.step_type === 'agent_response') {
+        if (typeof su.text_delta === 'string' && su.text_delta.length > 0) {
+          const prev = this.stepText.get(idx) ?? '';
+          const next = prev + su.text_delta;
+          this.stepText.set(idx, next);
+          sendToSubscribers(this.id, {
+            ev: 'cli',
+            sid: this.id,
+            msg: { type: 'stream_event', step_index: idx, text_delta: su.text_delta },
+          });
+          if (this.status !== 'needs_approval') {
+            this.setStatus('working', next.trim().slice(0, 120) || 'Thinking');
+          }
+        }
+        if (su.state === 'DONE' || su.state === 'ERROR' || su.state === 'CANCELED') {
+          const text = this.stepText.get(idx) ?? '';
+          this.stepText.delete(idx);
+          const thinking = this.readStepThinking(idx);
+          const content = [];
+          if (thinking) content.push({ type: 'thinking', thinking });
+          if (text) content.push({ type: 'text', text });
+          const usage = su.usage ? {
+            input_tokens: su.usage.input_tokens ?? 0,
+            output_tokens: su.usage.output_tokens ?? 0,
+            cache_read_input_tokens: su.usage.cache_read_tokens ?? 0,
+            cache_creation_input_tokens: 0,
+            thinking_tokens: su.usage.thinking_tokens ?? 0,
+          } : undefined;
+          if (content.length > 0 || usage) {
+            if (text) this.turnHadText = true;
+            this.onCliMessage({
+              type: 'assistant',
+              uuid: `step-${idx}`,
+              timestamp: new Date().toISOString(),
+              cwd: this.cwd,
+              message: {
+                id: `${this.cliSessionId ?? this.id}-step-${idx}`,
+                model: this.currentModel ?? this.model ?? 'agy',
+                role: 'assistant',
+                content,
+                ...(usage ? { usage } : {}),
+              },
+            });
+          }
+        }
+        return;
+      }
+
+      if (su.step_type === 'tool') {
+        const toolName = su.tool_info?.name || su.tool_name || (su.subagent_info ? 'invoke_subagent' : 'tool');
+        const toolId = `tool-${idx}`;
+        let input = su.tool_info?.parameters ?? {};
+        if (su.subagent_info?.subagents?.length && !Object.keys(input).length) {
+          input = {
+            Subagents: su.subagent_info.subagents,
+            description: su.subagent_info.subagents.map((s) => s.role || s.type_name).join(', '),
+          };
+        }
+        if (!this.emittedTools.has(idx)) {
+          this.emittedTools.add(idx);
+          const priorThinking = idx > 0 ? this.readStepThinking(idx - 1) : null;
+          const content = [];
+          if (priorThinking) content.push({ type: 'thinking', thinking: priorThinking });
+          content.push({ type: 'tool_use', id: toolId, name: toolName, input });
+          this.onCliMessage({
+            type: 'assistant',
+            uuid: `step-${idx}-call`,
+            timestamp: new Date().toISOString(),
+            cwd: this.cwd,
+            message: {
+              id: `${this.cliSessionId ?? this.id}-step-${idx}-call`,
+              model: this.currentModel ?? this.model ?? 'agy',
+              role: 'assistant',
+              content,
+            },
+          });
+        }
+        if (su.state === 'DONE' || su.state === 'ERROR' || su.state === 'CANCELED') {
+          this.emittedTools.delete(idx);
+          const isErr = su.state === 'ERROR' || !!su.tool_info?.error;
+          const outText = isErr
+            ? (su.tool_info?.error?.message || su.tool_info?.output || 'Tool error')
+            : (su.tool_info?.output ?? '');
+          let resultContent = outText;
+          // If view_file read an image on disk, attach the image block so slimEvent saves it for the app.
+          const viewedPath = !isErr && toolName === 'view_file' && typeof input?.AbsolutePath === 'string' ? input.AbsolutePath : null;
+          if (viewedPath) {
+            const ext = path.extname(viewedPath).toLowerCase().slice(1);
+            const mime = IMAGE_MIME[ext === 'jpg' ? 'jpeg' : ext];
+            try {
+              const stat = mime ? fs.statSync(viewedPath) : null;
+              if (stat && stat.isFile() && stat.size <= MAX_INLINE_IMAGE_BYTES) {
+                const data = fs.readFileSync(viewedPath).toString('base64');
+                resultContent = [
+                  ...(outText ? [{ type: 'text', text: outText }] : []),
+                  { type: 'image', source: { type: 'base64', media_type: mime, data } },
+                ];
+              }
+            } catch {}
+          }
+          const usage = su.usage ? {
+            input_tokens: su.usage.input_tokens ?? 0,
+            output_tokens: su.usage.output_tokens ?? 0,
+            cache_read_input_tokens: su.usage.cache_read_tokens ?? 0,
+            cache_creation_input_tokens: 0,
+            thinking_tokens: su.usage.thinking_tokens ?? 0,
+          } : undefined;
+          if (usage) {
+            this.record({
+              type: 'assistant',
+              uuid: `step-${idx}-usage`,
+              timestamp: new Date().toISOString(),
+              cwd: this.cwd,
+              message: {
+                id: `${this.cliSessionId ?? this.id}-step-${idx}-usage`,
+                model: this.currentModel ?? this.model ?? 'agy',
+                role: 'assistant',
+                content: [],
+                usage,
+              },
+            });
+          }
+          this.onCliMessage({
+            type: 'user',
+            uuid: `step-${idx}-result`,
+            message: {
+              role: 'user',
+              content: [{
+                type: 'tool_result',
+                tool_use_id: toolId,
+                content: resultContent,
+                is_error: isErr,
+              }],
+            },
+          });
+        }
+        return;
+      }
+
+      if (su.step_type === 'system_message' && su.state === 'DONE' && su.text_delta) {
+        this.emitLocal({ type: 'bridge', subtype: 'note', message: su.text_delta });
+      }
+      return;
+    }
+
+    if (msg.event === 'result') {
+      const res = msg.result ?? {};
+      if (res.conversation_id && !this.cliSessionId) {
+        this.cliSessionId = res.conversation_id;
+        this.persistMeta();
+      }
+      for (const [idx, text] of this.stepText.entries()) {
+        if (text) {
+          this.turnHadText = true;
+          this.onCliMessage({
+            type: 'assistant',
+            uuid: `step-${idx}`,
+            timestamp: new Date().toISOString(),
+            cwd: this.cwd,
+            message: {
+              id: `${this.cliSessionId ?? this.id}-step-${idx}`,
+              model: this.currentModel ?? this.model ?? 'agy',
+              role: 'assistant',
+              content: [{ type: 'text', text }],
+            },
+          });
+        }
+      }
+      this.stepText.clear();
+      this.emittedTools.clear();
+
+      const isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
+      const errText = isError ? (res.error || res.response || '') : '';
+      if (!this.turnHadText && !isError && typeof res.response === 'string' && res.response.trim()) {
+        const usage = res.usage ? {
+          input_tokens: res.usage.input_tokens ?? 0,
+          output_tokens: res.usage.output_tokens ?? 0,
+          cache_read_input_tokens: res.usage.cache_read_tokens ?? 0,
+          cache_creation_input_tokens: 0,
+          thinking_tokens: res.usage.thinking_tokens ?? 0,
+        } : undefined;
+        this.onCliMessage({
+          type: 'assistant',
+          uuid: `turn-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          cwd: this.cwd,
+          message: {
+            id: `${this.cliSessionId ?? this.id}-turn-${Date.now()}`,
+            model: this.currentModel ?? this.model ?? 'agy',
+            role: 'assistant',
+            content: [{ type: 'text', text: res.response }],
+            ...(usage ? { usage } : {}),
+          },
+        });
+      }
+      this.turnHadText = false;
+
+      if (Array.isArray(res.denied_actions) && res.denied_actions.length) {
+        const names = res.denied_actions.map((d) => d.display_name || d.action).join(', ');
+        this.emitLocal({
+          type: 'bridge',
+          subtype: 'note',
+          message: `Denied in ${this.mode} mode: ${names}. Switch mode to YOLO to allow all tool actions automatically.`,
+        });
+      }
+      if (isError && (this.idleExit || /stream input cancelled/i.test(errText))) {
+        return;
+      }
+      if (isError && /rate.?limit|quota|429|resource_exhausted/i.test(errText)) {
+        this.limitHit = true;
+      }
+      this.onCliMessage({
+        type: 'result',
+        subtype: isError ? 'error' : 'success',
+        is_error: isError,
+        result: isError ? (errText || 'Error') : (res.response ?? ''),
+        duration_ms: Math.round((res.duration_seconds ?? 0) * 1000),
+        num_turns: res.num_turns ?? 1,
+        total_cost_usd: 0,
+      });
+      refreshAgyLimits();
+    }
+  }
+
   onCliMessage(msg) {
+    if (typeof msg.event === 'string' && !msg.type) {
+      this.onAgyMessage(msg);
+      return;
+    }
     // The initialize reply lists every command and skill: large and not useful to the app.
     if (msg.type === 'control_response') return;
     // Partial deltas are forwarded live but not stored; the final message replaces them.
@@ -533,18 +945,24 @@ class Session {
       if (msg.error === 'rate_limit') this.limitHit = true;
       const tool = msg.message?.content?.find((c) => c.type === 'tool_use');
       const text = msg.message?.content?.find((c) => c.type === 'text');
-      if (this.status !== 'needs_approval') {
-        this.setStatus('working', tool ? `${tool.name}: ${describeInput(tool.input)}` : text ? text.text.slice(0, 120) : this.lastActivity);
+      if (this.status !== 'needs_approval' && (tool || text)) {
+        this.setStatus('working', tool ? `${tool.name}: ${describeInput(tool.input)}` : text.text.slice(0, 120));
       }
     } else if (msg.type === 'result') {
       this.addCost(msg.total_cost_usd);
       const limited = this.limitHit;
       this.limitHit = false;
       if (limited) { this.onLimited(); this.rejectedResetAt = null; return; }
+      this.clearResume();
       this.rejectedResetAt = null;
       this.limitRetryMs = 0;
       const waiting = this.background.length ? `In the background: ${this.background[0].description}` : 'Waiting for you';
       this.setStatus(msg.is_error ? 'error' : 'idle', msg.is_error ? (msg.result ?? 'Error') : waiting);
+      if (this.restartAfterTurn && this.link) {
+        this.restartAfterTurn = false;
+        this.idleExit = true;
+        this.link.kill();
+      }
     }
   }
 
@@ -555,15 +973,108 @@ class Session {
     sendToSubscribers(this.id, { ev: 'cli', sid: this.id, msg });
   }
 
+  /** Executes built-in agy CLI slash commands (/usage, /quota, /models, /skills, etc.) that run as one-shot print commands. */
+  runSlashCommand(cmd) {
+    const args = ['-p', cmd, '--output-format', 'json'];
+    if (this.cliSessionId) args.push('--conversation', this.cliSessionId);
+    execFile(claudeBin, args, {
+      cwd: this.cwd,
+      timeout: 30_000,
+      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+    }, (err, stdout, stderr) => {
+      let reply = '';
+      let isError = false;
+      try {
+        const parsed = JSON.parse(stdout);
+        const isCmdError = parsed.status ? parsed.status !== 'SUCCESS' : (parsed.status === 'ERROR' || !!parsed.error);
+        if (isCmdError) {
+          isError = true;
+          reply = parsed.error || parsed.response || 'Command error';
+        } else {
+          reply = parsed.response || (parsed.command ? JSON.stringify(parsed.command.data, null, 2) : stdout.trim());
+        }
+        if (parsed.command?.name === 'usage' || parsed.command?.name === 'quota') {
+          parseAgyLimitsOutput(parsed);
+        }
+      } catch {
+        isError = !!err;
+        reply = (stdout || stderr || err?.message || 'Command failed').trim();
+      }
+      if (reply) {
+        this.onCliMessage({
+          type: 'assistant',
+          uuid: `slash-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          cwd: this.cwd,
+          message: {
+            id: `${this.id}-slash-${Date.now()}`,
+            model: this.currentModel ?? this.model ?? 'agy',
+            role: 'assistant',
+            content: [{ type: 'text', text: reply }],
+          },
+        });
+      }
+      this.onCliMessage({
+        type: 'result',
+        subtype: isError ? 'error' : 'success',
+        is_error: isError,
+        result: reply,
+        duration_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+      });
+    });
+  }
+
   sendUser(text, attachments = []) {
     this.clearResume();
     const saved = this.saveAttachments(attachments);
+    const trimmed = String(text ?? '').trim();
+    const modelCmd = !saved.length && trimmed.match(/^\/model(?:\s+(.*))?$/i);
+    if (modelCmd) {
+      this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+      const arg = (modelCmd[1] ?? '').trim();
+      if (!arg) {
+        this.setStatus('working', trimmed);
+        this.runSlashCommand('/models');
+        return;
+      }
+      const aliases = {
+        default: null,
+        auto: null,
+        argon: 'gemini-4-argon',
+        'gemini-4-argon': 'gemini-4-argon',
+        flash: 'gemini-3.8-flash',
+        'gemini-3.8-flash': 'gemini-3.8-flash',
+        opus: 'claude-opus-5-5',
+        'claude-opus-5-5': 'claude-opus-5-5',
+        sonnet: 'claude-sonnet-5-5',
+        'claude-sonnet-5-5': 'claude-sonnet-5-5',
+        'gpt-oss': 'gpt-oss-120b',
+        'gpt-oss-120b': 'gpt-oss-120b',
+      };
+      const resolved = Object.prototype.hasOwnProperty.call(aliases, arg.toLowerCase())
+        ? aliases[arg.toLowerCase()]
+        : arg;
+      this.setModel(resolved);
+      return;
+    }
+    // Built-in CLI slash commands cannot be sent over stream-json stdin in agy; run them via one-shot print mode.
+    if (!saved.length && /^\/(usage|quota|credits|models|agents|skills|permissions|effort|help|config|changelog)(\s|$)/i.test(trimmed)) {
+      this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+      this.setStatus('working', trimmed);
+      this.runSlashCommand(trimmed);
+      return;
+    }
+
     this.ensureProcess();
-    let content = text;
+    let promptText = text;
+    let legacyContent = text;
     if (saved.length) {
-      const list = saved.map((a) => `- ${a.path} (${a.mime}, ${formatBytes(a.size)}${a.inline ? ', image included below' : ''})`).join('\n');
-      content = [
-        { type: 'text', text: `${text || 'See the attached files.'}\n\nAttached files, saved on this machine:\n${list}` },
+      const list = saved.map((a) => `- ${a.path} (${a.mime}, ${formatBytes(a.size)})`).join('\n');
+      promptText = `${text || 'See the attached files.'}\n\nAttached files, saved on this machine (use view_file to read or view them):\n${list}`;
+      legacyContent = [
+        { type: 'text', text: promptText },
         ...saved.filter((a) => a.inline).map((a) => ({ type: 'image', source: { type: 'base64', media_type: a.mime, data: a.data } })),
       ];
     }
@@ -572,7 +1083,15 @@ class Session {
       type: 'user', message: { role: 'user', content: text }, local: true,
       ...(saved.length ? { attachments: saved.map(({ name, mime, size, path: p }) => ({ name, mime, size, path: p })) } : {}),
     });
-    this.writeCli({ type: 'user', message: { role: 'user', content } });
+    this.turnHadText = false;
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      this.writeCli({ type: 'user', message: { role: 'user', content: legacyContent } });
+    } else {
+      this.writeCli({
+        event: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: promptText }] },
+      });
+    }
     this.setStatus('working', 'Thinking');
   }
 
@@ -595,22 +1114,20 @@ class Session {
   }
 
   /**
-   * Moves the task to another working folder. Claude restarts there on the next message and resumes
-   * the same session (Claude Code finds a session by id from any folder and keeps appending to its
-   * transcript); project memory is then the new folder's. Refused while Claude is busy, since
-   * restarting it would cut that work off.
+   * Moves the task to another working folder. agy restarts there on the next message and resumes
+   * the same conversation (--conversation <id>). Refused while agy is busy.
    */
   async moveTo(dir) {
     const target = path.resolve(String(dir ?? '').replace(/^~(?=$|\/)/, os.homedir()));
     if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) throw new Error(`Not a folder: ${target}`);
     if (target === this.cwd) return;
     if (['working', 'needs_approval'].includes(this.status) || this.background.length) {
-      throw new Error('Claude is busy in this task. Wait for it to finish, or stop it, then change the folder.');
+      throw new Error('AGY is busy in this task. Wait for it to finish, or stop it, then change the folder.');
     }
     if (this.link) {
       this.link.kill();
       for (let i = 0; i < 100 && this.link; i++) await new Promise((r) => setTimeout(r, 100));
-      if (this.link) throw new Error("Claude didn't stop; try again.");
+      if (this.link) throw new Error("AGY didn't stop; try again.");
     }
     const from = this.cwd;
     this.cwd = target;
@@ -620,8 +1137,7 @@ class Session {
   }
 
   /**
-   * [answers] replies to AskUserQuestion: {question text: chosen label(s) or the user's own words}.
-   * Claude Code reads them from the allowed input (allowing without them reads as "didn't answer").
+   * [answers] replies to AskUserQuestion / ask_question: {question text: chosen label(s) or the user's own words}.
    */
   answer(requestId, decision, always, message, answers) {
     const req = this.pending.get(requestId);
@@ -631,31 +1147,75 @@ class Session {
     const input = ok ? { ...req.request.input, answers } : req.request.input;
     const response = decision === 'allow'
       ? { behavior: 'allow', updatedInput: input, ...(always && req.request.permission_suggestions ? { updatedPermissions: req.request.permission_suggestions.filter((s) => s.type === 'addRules') } : {}) }
-      : { behavior: 'deny', message: message || 'The user denied this from the CC Mobile app.' };
+      : { behavior: 'deny', message: message || 'The user denied this from the AGY Mobile app.' };
     this.writeCli({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } });
     this.emitLocal({ type: 'bridge', subtype: 'permission_answer', request_id: requestId, decision, always: !!always });
     if (this.pending.size === 0) this.setStatus('working', decision === 'allow' ? 'Approved' : 'Denied');
     return true;
   }
 
+  restartProcessForNextTurn() {
+    if (!this.link) return;
+    if (this.status === 'working' || this.status === 'needs_approval') {
+      this.restartAfterTurn = true;
+    } else {
+      this.idleExit = true;
+      this.link.kill();
+    }
+  }
+
   setMode(mode) {
     this.mode = mode;
-    this.writeCli({ type: 'control_request', request_id: `mode-${randomUUID()}`, request: { subtype: 'set_permission_mode', mode } });
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      this.writeCli({ type: 'control_request', request_id: `mode-${randomUUID()}`, request: { subtype: 'set_permission_mode', mode } });
+    } else {
+      this.restartProcessForNextTurn();
+    }
     this.emitLocal({ type: 'bridge', subtype: 'note', message: mode === 'bypassPermissions' ? 'YOLO mode on: tools run without asking' : `Permission mode: ${mode}` });
+    this.setStatus(this.status);
+  }
+
+  setModel(model) {
+    this.model = model || null;
+    this.currentModel = this.model;
+    if (process.env.CCM_LEGACY_PROTO !== '1') {
+      this.restartProcessForNextTurn();
+    }
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: `Model: ${this.model ?? 'default'}` });
     this.setStatus(this.status);
   }
 
   setEffort(effort) {
     this.effort = effort;
-    // Applies from the next turn; null goes back to the model's default. A stopped session
-    // picks it up from --effort when it restarts.
-    if (this.link) this.writeCli({ type: 'control_request', request_id: `effort-${randomUUID()}`, request: { subtype: 'apply_flag_settings', settings: { effortLevel: effort } } });
+    if (process.env.CCM_LEGACY_PROTO === '1' && this.link) {
+      this.writeCli({ type: 'control_request', request_id: `effort-${randomUUID()}`, request: { subtype: 'apply_flag_settings', settings: { effortLevel: effort } } });
+    } else {
+      this.restartProcessForNextTurn();
+    }
     this.emitLocal({ type: 'bridge', subtype: 'note', message: `Reasoning effort: ${effort ?? 'model default'}` });
     this.setStatus(this.status);
   }
 
   interrupt() {
-    this.writeCli({ type: 'control_request', request_id: `int-${randomUUID()}`, request: { subtype: 'interrupt' } });
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      this.writeCli({ type: 'control_request', request_id: `int-${randomUUID()}`, request: { subtype: 'interrupt' } });
+      return;
+    }
+    const claudePid = this.link?.info?.claudePid;
+    if (claudePid && alive(claudePid)) {
+      const descendants = findDescendantPids(claudePid);
+      if (descendants.length > 0) {
+        this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Stopping running command' });
+        for (const pid of [...descendants].reverse()) {
+          try { process.kill(pid, 'SIGINT'); process.kill(pid, 'SIGTERM'); } catch {}
+        }
+        return;
+      }
+    }
+    if (this.link) {
+      this.interrupted = true;
+      this.link.kill();
+    }
   }
 
   /**
@@ -689,6 +1249,7 @@ class Session {
 
   clearResume() {
     this.resumeAt = null;
+    this.limitRetryMs = 0;
   }
 
   setAutoContinue(on) {
@@ -705,11 +1266,9 @@ class Session {
     else this.setStatus('stopped');
   }
 
-  // Appends turns taken outside the bridge (e.g. `claude --resume` in a terminal) from
-  // Claude Code's own transcript, picking up after the last message the bridge has seen.
   /**
    * Gives image placeholders that have no ref (logs slimmed before images were kept) their
-   * image back from Claude Code's transcript, which still has them. Runs once per session.
+   * image back from the CLI's transcript, which still has them. Runs once per session.
    */
   backfillImages() {
     if (this.imagesBackfilled) return;
@@ -719,7 +1278,7 @@ class Session {
       .filter((b) => b?.type === 'tool_result' && Array.isArray(b.content) && b.content.some(missing));
     if (!this.events.some((e) => results(e).length)) return;
     const found = new Map(); // tool_use_id -> image blocks with data
-    const file = findCliTranscript(this.id);
+    const file = findCliTranscript(this.cliSessionId ?? this.id);
     if (file) {
       for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
         if (!line.includes('"image"')) continue;
@@ -750,17 +1309,17 @@ class Session {
 
   syncFromCli() {
     if (this.link) return;
-    const file = findCliTranscript(this.id);
+    const file = findCliTranscript(this.cliSessionId ?? this.id);
     if (!file) return;
     const { size, mtimeMs } = fs.statSync(file);
     if (size === this.cliSize) return;
     this.cliSize = size;
     const known = new Set(this.events.map((e) => e.uuid).filter(Boolean));
-    const records = readJsonl(file);
+    const records = readJsonl(file).map(cliRecordToEvent).filter(Boolean);
     const last = records.findLastIndex((r) => known.has(r.uuid));
-    const fresh = last < 0 ? [] : records.slice(last + 1).map(cliRecordToEvent).filter((e) => e && !known.has(e.uuid));
+    const fresh = (last < 0 ? records : records.slice(last + 1)).filter((e) => !known.has(e.uuid));
     if (fresh.length) {
-      this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Continued in Claude Code outside this app' });
+      this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Continued in AGY CLI outside this app' });
       for (const e of fresh) this.emitLocal(e);
       this.updatedAt = Math.max(this.updatedAt, Math.round(mtimeMs));
       this.status = 'idle';
@@ -796,7 +1355,7 @@ async function detectRoot() {
     (err, out) => resolve(!err && /^0\n\d+\s*$/.test(out))));
 }
 
-// ---------- Claude Code's own transcripts (~/.claude/projects/<cwd>/<session id>.jsonl) ----------
+// ---------- CLI transcripts (~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl & ~/.claude/projects) ----------
 
 const CLI_HEAD_TAIL = 256 * 1024;
 
@@ -811,6 +1370,8 @@ function readJsonl(file, text = fs.readFileSync(file, 'utf8')) {
 
 function findCliTranscript(id) {
   if (!/^[\w-]+$/.test(id)) return null;
+  const agyTranscript = path.join(agyDataDir, 'brain', id, '.system_generated', 'logs', 'transcript.jsonl');
+  if (fs.existsSync(agyTranscript)) return agyTranscript;
   let dirs = [];
   try { dirs = fs.readdirSync(claudeProjectsDir); } catch { return null; }
   for (const d of dirs) {
@@ -820,9 +1381,72 @@ function findCliTranscript(id) {
   return null;
 }
 
-// Turns a transcript record into the stream-json message the CLI would have printed live,
-// or null for bookkeeping the app doesn't show (attachments, titles, meta prompts, sub-agents).
+function stripUserRequestTags(s) {
+  if (typeof s !== 'string') return '';
+  const m = s.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+  return (m ? m[1] : s).trim();
+}
+
+function parseAgyToolArgs(args) {
+  if (!args || typeof args !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (typeof v === 'string') {
+      try { out[k] = JSON.parse(v); } catch { out[k] = v; }
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// Turns a transcript record (from either agy's transcript.jsonl or legacy .claude/projects/*.jsonl)
+// into the normalized message the app renders.
 function cliRecordToEvent(r) {
+  // agy transcript.jsonl step record
+  if (typeof r.step_index === 'number' && typeof r.type === 'string') {
+    const uuid = `step-${r.step_index}`;
+    if (r.type === 'USER_INPUT') {
+      const content = stripUserRequestTags(r.content ?? '');
+      if (!content) return null;
+      return { type: 'user', message: { role: 'user', content }, uuid, timestamp: r.created_at, parent_tool_use_id: null };
+    }
+    if (r.type === 'PLANNER_RESPONSE') {
+      const blocks = [];
+      if (typeof r.thinking === 'string' && r.thinking.trim()) {
+        blocks.push({ type: 'thinking', thinking: r.thinking.trim() });
+      }
+      if (typeof r.content === 'string' && r.content.trim()) {
+        blocks.push({ type: 'text', text: r.content });
+      }
+      if (Array.isArray(r.tool_calls)) {
+        r.tool_calls.forEach((tc, idx) => {
+          if (tc?.name) {
+            blocks.push({
+              type: 'tool_use',
+              id: `step-${r.step_index}-tool-${idx}`,
+              name: tc.name,
+              input: parseAgyToolArgs(tc.args),
+            });
+          }
+        });
+      }
+      if (!blocks.length) return null;
+      return {
+        type: 'assistant',
+        message: { role: 'assistant', content: blocks },
+        uuid,
+        timestamp: r.created_at,
+        parent_tool_use_id: null,
+      };
+    }
+    if (r.type === 'ERROR_MESSAGE' && r.content) {
+      return { type: 'result', subtype: 'error', is_error: true, result: r.content, uuid };
+    }
+    return null;
+  }
+
+  // Legacy Claude Code transcript record
   if (r.isSidechain || r.isMeta || r.isCompactSummary) return null;
   if (r.type === 'system' && r.subtype === 'compact_boundary') return { type: 'system', subtype: 'compact_boundary', uuid: r.uuid };
   if ((r.type !== 'user' && r.type !== 'assistant') || !r.message) return null;
@@ -844,8 +1468,75 @@ function promptText(event) {
   return Array.isArray(c) ? c.find((b) => b.type === 'text')?.text ?? '' : '';
 }
 
+let agyMetaCache = { mtime: 0, map: new Map() };
+function getAgyConversationMeta() {
+  const dbPath = path.join(agyDataDir, 'conversation_summaries.db');
+  const histPath = path.join(agyDataDir, 'history.jsonl');
+  let mtime = 0;
+  try { mtime += fs.statSync(dbPath).mtimeMs; } catch {}
+  try { mtime += fs.statSync(histPath).mtimeMs; } catch {}
+  if (mtime && mtime === agyMetaCache.mtime) return agyMetaCache.map;
+
+  const map = new Map();
+  // Read history.jsonl first
+  try {
+    for (const r of readJsonl(histPath)) {
+      if (!r.conversationId) continue;
+      const cur = map.get(r.conversationId) ?? {};
+      if (r.workspace && !cur.cwd) cur.cwd = r.workspace;
+      if (r.display) {
+        cur.firstPrompt ??= r.display;
+        cur.lastPrompt = r.display;
+      }
+      if (r.timestamp) {
+        cur.createdAt ??= r.timestamp;
+        cur.updatedAt = Math.max(cur.updatedAt ?? 0, r.timestamp);
+      }
+      map.set(r.conversationId, cur);
+    }
+  } catch {}
+
+  // Read conversation_summaries.db via python3 if present
+  if (fs.existsSync(dbPath)) {
+    try {
+      const py = `
+import sqlite3, json, sys
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("SELECT conversation_id, title, preview, workspace_uris, parent_conversation_id, last_modified_time FROM conversation_summaries")
+print(json.dumps(cur.fetchall()))
+`;
+      const out = execFileSync('python3', ['-c', py, dbPath], { timeout: 5000, encoding: 'utf8' });
+      for (const [id, title, preview, urisJson, parentId, lastMod] of JSON.parse(out)) {
+        const cur = map.get(id) ?? {};
+        if (parentId) cur.isSubagent = true;
+        if (title) cur.title = title;
+        if (preview) {
+          cur.firstPrompt ??= preview;
+          cur.lastPrompt ??= preview;
+        }
+        if (urisJson && !cur.cwd) {
+          try {
+            const uris = JSON.parse(urisJson);
+            const firstUri = Array.isArray(uris) ? uris[0] : null;
+            if (typeof firstUri === 'string' && firstUri.startsWith('file://')) {
+              cur.cwd = decodeURIComponent(firstUri.slice('file://'.length));
+            }
+          } catch {}
+        }
+        const ts = Date.parse(lastMod);
+        if (ts) cur.updatedAt = Math.max(cur.updatedAt ?? 0, ts);
+        map.set(id, cur);
+      }
+    } catch {}
+  }
+
+  agyMetaCache = { mtime, map };
+  return map;
+}
+
 // What the resume list needs, read from the head and tail of the file so large transcripts stay cheap.
-function cliSessionInfo(file) {
+function cliSessionInfo(file, sessionId = null) {
   const { size, mtimeMs, birthtimeMs } = fs.statSync(file);
   let text;
   if (size <= CLI_HEAD_TAIL * 2) text = fs.readFileSync(file, 'utf8');
@@ -858,8 +1549,33 @@ function cliSessionInfo(file) {
     fs.closeSync(fd);
     text = `${head.toString('utf8')}\n${tail.toString('utf8')}`; // cut lines fail to parse and are skipped
   }
-  const info = { cwd: null, title: null, aiTitle: null, firstPrompt: null, lastPrompt: null, model: null, mode: null, createdAt: null };
+  const agyMeta = sessionId ? getAgyConversationMeta().get(sessionId) : null;
+  if (agyMeta?.isSubagent) return null;
+
+  const info = {
+    cwd: agyMeta?.cwd ?? null,
+    title: agyMeta?.title ?? null,
+    aiTitle: null,
+    firstPrompt: agyMeta?.firstPrompt ?? null,
+    lastPrompt: agyMeta?.lastPrompt ?? null,
+    model: null,
+    mode: null,
+    createdAt: agyMeta?.createdAt ?? null,
+  };
   for (const r of readJsonl(file, text)) {
+    if (typeof r.step_index === 'number') {
+      if (r.type === 'USER_INPUT') {
+        const prompt = stripUserRequestTags(r.content ?? '');
+        if (prompt) {
+          if (!info.firstPrompt) {
+            info.firstPrompt = prompt;
+            info.createdAt ??= Date.parse(r.created_at) || null;
+          }
+          info.lastPrompt = prompt;
+        }
+      }
+      continue;
+    }
     if (r.cwd && !r.isSidechain) info.cwd ??= r.cwd;
     if (r.type === 'custom-title' && r.customTitle) info.title = r.customTitle;
     else if (r.type === 'ai-title' && r.aiTitle) info.aiTitle = r.aiTitle;
@@ -875,29 +1591,46 @@ function cliSessionInfo(file) {
     if (r.type === 'user' && !r.isSidechain && r.permissionMode) info.mode = r.permissionMode;
   }
   if (!info.firstPrompt) return null; // nothing was ever asked: not worth resuming
+  if (!info.cwd && sessionId && file.startsWith(agyDataDir)) info.cwd = opts.roots[0] ?? os.homedir();
   const firstLine = (s) => s.split('\n')[0].slice(0, 100);
   return {
     cwd: info.cwd,
     title: firstLine(info.title ?? info.aiTitle ?? info.firstPrompt),
     lastPrompt: (info.lastPrompt ?? info.firstPrompt).slice(0, 200),
     model: info.model,
-    mode: MODES.includes(info.mode) ? info.mode : 'default',
+    mode: MODES.includes(info.mode) ? info.mode : 'bypassPermissions',
     createdAt: info.createdAt ?? Math.round(birthtimeMs || mtimeMs),
-    updatedAt: Math.round(mtimeMs),
+    updatedAt: agyMeta?.updatedAt ?? Math.round(mtimeMs),
   };
 }
 
-/** Claude Code sessions on this machine that the bridge isn't already tracking, newest first. */
+/** CLI sessions on this machine that the bridge isn't already tracking, newest first. */
 function listCliSessions(limit = 50) {
+  const trackedCliIds = new Set();
+  for (const s of sessions.values()) {
+    trackedCliIds.add(s.id);
+    if (s.cliSessionId) trackedCliIds.add(s.cliSessionId);
+  }
   const files = [];
+  // 1. Scan agy brain transcripts
+  const brainDir = path.join(agyDataDir, 'brain');
+  try {
+    for (const id of fs.readdirSync(brainDir)) {
+      if (trackedCliIds.has(id)) continue;
+      const file = path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
+      try { files.push({ id, file, mtime: fs.statSync(file).mtimeMs }); } catch {}
+    }
+  } catch {}
+
+  // 2. Scan legacy .claude/projects transcripts
   let dirs = [];
-  try { dirs = fs.readdirSync(claudeProjectsDir); } catch { return []; }
+  try { dirs = fs.readdirSync(claudeProjectsDir); } catch {}
   for (const d of dirs) {
     let names = [];
     try { names = fs.readdirSync(path.join(claudeProjectsDir, d)); } catch { continue; }
     for (const n of names) {
       const id = n.slice(0, -'.jsonl'.length);
-      if (!n.endsWith('.jsonl') || sessions.has(id)) continue;
+      if (!n.endsWith('.jsonl') || trackedCliIds.has(id)) continue;
       const file = path.join(claudeProjectsDir, d, n);
       try { files.push({ id, file, mtime: fs.statSync(file).mtimeMs }); } catch {}
     }
@@ -907,26 +1640,26 @@ function listCliSessions(limit = 50) {
   for (const { id, file } of files) {
     if (out.length >= limit) break;
     let info;
-    try { info = cliSessionInfo(file); } catch { continue; }
+    try { info = cliSessionInfo(file, id); } catch { continue; }
     if (info?.cwd && fs.existsSync(info.cwd)) out.push({ id, ...info });
   }
   return out;
 }
 
-/** Makes a Claude Code session started elsewhere into a bridge session; the next message runs `claude --resume`. */
+/** Makes a CLI session started elsewhere into a bridge session; the next message runs `agy --conversation <id>`. */
 function importCliSession(id) {
   const file = findCliTranscript(id);
-  if (!file) throw new Error('No Claude Code session with that id on this machine.');
-  const info = cliSessionInfo(file);
+  if (!file) throw new Error('No AGY CLI session with that id on this machine.');
+  const info = cliSessionInfo(file, id);
   if (!info?.cwd) throw new Error('That session has no conversation to resume.');
   if (!fs.existsSync(info.cwd)) throw new Error(`Its folder no longer exists: ${info.cwd}`);
-  const s = new Session({ id, cwd: info.cwd, title: info.title, model: info.model, mode: info.mode, createdAt: info.createdAt });
+  const s = new Session({ id, cliSessionId: id, cwd: info.cwd, title: info.title, model: info.model, mode: info.mode, createdAt: info.createdAt });
   s.started = true;
   s.updatedAt = info.updatedAt;
-  s.lastActivity = 'Resumed from Claude Code';
+  s.lastActivity = 'Resumed from AGY CLI';
   s.cliSize = fs.statSync(file).size;
   const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean).map((e) => slimEvent(e, id));
-  events.push({ type: 'bridge', subtype: 'note', message: 'Resumed from Claude Code. New messages continue this session.' });
+  events.push({ type: 'bridge', subtype: 'note', message: 'Resumed from AGY CLI. New messages continue this session.' });
   s.events = events.slice(-MAX_EVENTS);
   fs.writeFileSync(s.logFile, s.events.map((e) => JSON.stringify(e) + '\n').join(''));
   sessions.set(id, s);
@@ -936,8 +1669,6 @@ function importCliSession(id) {
 
 // ---------- usage ----------
 
-// Plan limits come from the CLI's rate_limit_event, sent with every reply. They cover the whole
-// account (claude.ai and every Claude Code), not just this bridge, so the latest one is kept.
 const limitsFile = path.join(stateDir, 'limits.json');
 let limits = null;
 try { limits = JSON.parse(fs.readFileSync(limitsFile, 'utf8')); } catch {}
@@ -963,12 +1694,62 @@ function onRateLimit(info) {
   broadcast({ ev: 'limits', limits });
 }
 
-// Token use per assistant message, read from Claude Code's transcripts (terminal and bridge
-// sessions alike). Parsed files are cached until they change.
+/** Parses `agy -p /usage --output-format json` output into bridge `limits`. */
+function parseAgyLimitsOutput(parsed) {
+  const groups = parsed?.command?.data?.groups;
+  if (!Array.isArray(groups)) return false;
+  const windows = [];
+  let anyExhausted = false;
+  for (const g of groups) {
+    for (const b of g?.buckets ?? []) {
+      if (typeof b?.remaining_fraction !== 'number') continue;
+      const utilization = Math.max(0, Math.min(1, 1 - b.remaining_fraction));
+      if (b.remaining_fraction <= 0) anyExhausted = true;
+      const resetsAt = b.reset_time ? (Date.parse(b.reset_time) || 0) : 0;
+      windows.push({ id: b.id || b.label || 'quota', utilization, resetsAt });
+    }
+  }
+  if (!windows.length) return false;
+  limits = { status: anyExhausted ? 'rejected' : 'allowed', windows, updatedAt: Date.now() };
+  try { fs.writeFileSync(limitsFile, JSON.stringify(limits)); } catch {}
+  broadcast({ ev: 'limits', limits });
+  return true;
+}
+
+let refreshingLimits = false;
+let lastLimitsRefresh = 0;
+function refreshAgyLimits(force = false) {
+  if (refreshingLimits) return Promise.resolve(limits);
+  if (!force && Date.now() - lastLimitsRefresh < 60_000) return Promise.resolve(limits);
+  refreshingLimits = true;
+  lastLimitsRefresh = Date.now();
+  return new Promise((resolve) => {
+    execFile(claudeBin, ['-p', '/usage', '--output-format', 'json'], {
+      timeout: 15_000,
+      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+    }, (err, stdout) => {
+      refreshingLimits = false;
+      if (!err && stdout) {
+        try { parseAgyLimitsOutput(JSON.parse(stdout)); } catch {}
+      }
+      resolve(limits);
+    });
+  });
+}
+
+// Token use per assistant message, read from bridge session logs and CLI transcripts.
 /** @type {Map<string, {mtimeMs: number, size: number, records: object[]}>} */
 const usageCache = new Map();
 
 function transcriptFiles(dir = claudeProjectsDir, depth = 0, out = []) {
+  if (depth === 0) {
+    // Include bridge session jsonl logs (which store normalized assistant usage records from agy)
+    try {
+      for (const e of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+        if (e.isFile() && e.name.endsWith('.jsonl')) out.push(path.join(sessionsDir, e.name));
+      }
+    } catch {}
+  }
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   for (const e of entries) {
@@ -992,14 +1773,13 @@ function usageRecords(file, stat) {
     const u = r.message?.usage;
     if (r.type !== 'assistant' || !u || r.message.model === '<synthetic>') continue;
     records.push({
-      // A message split into several content blocks repeats its usage on each record.
       id: r.message.id ?? r.requestId ?? r.uuid,
-      t: Date.parse(r.timestamp) || 0,
+      t: Date.parse(r.timestamp) || stat.mtimeMs || 0,
       model: r.message.model ?? 'unknown',
       cwd: r.cwd ?? '',
       input: u.input_tokens ?? 0,
-      output: u.output_tokens ?? 0,
-      cacheRead: u.cache_read_input_tokens ?? 0,
+      output: (u.output_tokens ?? 0) + (u.thinking_tokens ?? 0),
+      cacheRead: u.cache_read_input_tokens ?? u.cache_read_tokens ?? 0,
       cacheWrite: u.cache_creation_input_tokens ?? 0,
     });
   }
@@ -1046,7 +1826,13 @@ function usageSummary(days, tzOffsetMin) {
 
 function describeInput(input) {
   if (!input || typeof input !== 'object') return '';
-  const v = input.command ?? input.file_path ?? input.path ?? input.pattern ?? input.url ?? input.query ?? input.description;
+  const v = input.CommandLine ?? input.command
+    ?? input.TargetFile ?? input.AbsolutePath ?? input.file_path
+    ?? input.DirectoryPath ?? input.SearchPath ?? input.SearchDirectory ?? input.path
+    ?? input.Query ?? input.Pattern ?? input.pattern
+    ?? input.Url ?? input.url
+    ?? input.query
+    ?? input.toolSummary ?? input.toolAction ?? input.description;
   return typeof v === 'string' ? v.slice(0, 160) : '';
 }
 
@@ -1064,17 +1850,15 @@ function loadSessions() {
       try {
         const lines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean).slice(-MAX_EVENTS);
         s.events = lines.map((l) => slimEvent(JSON.parse(l), s.id));
-        // Recount from the turn results: costUsd used to add up running totals, overstating it.
         if (s.events.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
           s.costUsd = 0;
           for (const e of s.events) if (e.type === 'result') s.addCost(e.total_cost_usd);
         }
-        // Logs written before slimEvent() existed can be tens of megabytes; rewrite them once.
         const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
         if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
       } catch {}
       sessions.set(s.id, s);
-      // Claude still running under a keeper from before the restart (or finished meanwhile):
+      // agy still running under a keeper from before the restart (or finished meanwhile):
       // restore what was in flight and carry on reading its output.
       if (fs.existsSync(path.join(s.keeperDir, 'keeper.json'))) {
         s.status = meta.status ?? 'idle';
@@ -1116,12 +1900,12 @@ function procStat(pid) {
 // /proc/uptime is off limits, so boot time comes from our own start time in clock ticks.
 const bootWall = Date.now() - process.uptime() * 1000 - procStat(process.pid).start * 1000 / CLK_TCK;
 
-/** A short name: the program, or interpreter plus script ("python3 render.py"), not the glibc loader. */
+/** A short name: the program, or interpreter plus script ("python3 render.py"), not the glibc/musl loader. */
 function processName(args) {
   const base = (s) => (s ?? '').split('/').pop();
   let i = 0;
-  if (/^ld-linux/.test(base(args[0]))) i = args.findIndex((a, k) => k > 0 && !a.startsWith('-') && args[k - 1] !== '--library-path');
-  const name = base(args[Math.max(i, 0)]).replace(/-native$/, '');
+  if (/^ld-(linux|musl)/.test(base(args[0]))) i = args.findIndex((a, k) => k > 0 && !a.startsWith('-') && args[k - 1] !== '--library-path');
+  const name = base(args[Math.max(i, 0)]).replace(/(-native|\.bin)$/, '');
   const script = args.slice(i + 1).find((a) => !a.startsWith('-'));
   return INTERPRETERS.has(name.replace(/[\d.]+$/, '')) && script && !script.includes(' ') ? `${name} ${base(script)}` : name;
 }
@@ -1151,8 +1935,10 @@ function envObject(pid) {
 function listProcesses() {
   const now = Date.now();
   const roles = new Map(); // pid -> { role, sid }
+  const cliIdToSid = new Map();
   roles.set(process.pid, { role: 'bridge' });
   for (const s of sessions.values()) {
+    if (s.cliSessionId) cliIdToSid.set(s.cliSessionId, s.id);
     const info = s.link?.info;
     if (info?.pid) roles.set(info.pid, { role: 'keeper', sid: s.id });
     if (info?.claudePid) roles.set(info.claudePid, { role: 'claude', sid: s.id });
@@ -1172,7 +1958,7 @@ function listProcesses() {
       const cpu = prev && now > prev.at ? Math.max(0, ((st.ticks - prev.ticks) / CLK_TCK) / ((now - prev.at) / 1000) * 100) : null;
       cpuSamples.set(pid, { ticks: st.ticks, at: now });
       const env = envObject(pid);
-      const sid = env.CLAUDE_CODE_SESSION_ID ?? null;
+      const sid = env.AGY_SESSION_ID ?? env.CLAUDE_CODE_SESSION_ID ?? (env.ANTIGRAVITY_CONVERSATION_ID ? cliIdToSid.get(env.ANTIGRAVITY_CONVERSATION_ID) : null) ?? null;
       list.push({
         pid, ppid: st.ppid, name: processName(args), args, cwd, state: st.state,
         startedAt: Math.round(bootWall + st.start * 1000 / CLK_TCK), cpuSeconds: st.ticks / CLK_TCK, cpu, rssKb: rss,
@@ -1180,8 +1966,8 @@ function listProcesses() {
       });
     } catch {} // gone meanwhile
   }
-  // Everything Claude started belongs to its task: by parentage, or by the session id Claude Code
-  // puts in each command's environment (which detached nohup/setsid jobs keep).
+  // Everything agy started belongs to its task: by parentage, or by the session id put in each
+  // command's environment (which detached nohup/setsid jobs keep).
   const byPid = new Map(list.map((p) => [p.pid, p]));
   for (const p of list) {
     if (p.role) continue;
@@ -1214,10 +2000,36 @@ function signalProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
+/** Recursively returns all process IDs that descend from rootPid. */
+function findDescendantPids(rootPid) {
+  if (!rootPid) return [];
+  const childrenOf = new Map();
+  try {
+    for (const entry of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      try {
+        const st = procStat(pid);
+        if (!childrenOf.has(st.ppid)) childrenOf.set(st.ppid, []);
+        childrenOf.get(st.ppid).push(pid);
+      } catch {}
+    }
+  } catch {}
+  const res = [];
+  const queue = [...(childrenOf.get(rootPid) ?? [])];
+  while (queue.length) {
+    const p = queue.shift();
+    res.push(p);
+    const ch = childrenOf.get(p);
+    if (ch) queue.push(...ch);
+  }
+  return res;
+}
+
 /** Stops a process and runs its command again in the same folder and environment; returns the new pid. */
 async function restartProcess(pid) {
   const p = ownProcess(pid);
-  if (['bridge', 'keeper', 'claude'].includes(p.role)) throw new Error("Restart a task's Claude by stopping the task and sending it a message.");
+  if (['bridge', 'keeper', 'claude'].includes(p.role)) throw new Error("Restart a task's AGY process by stopping the task and sending it a message.");
   const env = envObject(pid);
   // Checked before anything is stopped, so a restart that can't work leaves the process running.
   const program = resolveProgram(p.args[0], env);
@@ -1252,15 +2064,14 @@ function chrootShell() {
   return [process.env.CCM_SU ?? 'su', '-c', `sh ${path.join(path.dirname(ptyPy), '..', 'chroot', 'ccm-chroot')} shell`];
 }
 
-// `claude auth login` opens its sign-in page with $BROWSER, which can't show anything here. This stand-in
-// passes the link to the bridge instead, which sends it to the app to open (see Terminal.checkLink).
+// Sign-in pages opened with $BROWSER pass the link to the bridge instead, which sends it to the app to open.
 const openUrlSh = path.join(stateDir, 'open-url.sh');
 fs.writeFileSync(openUrlSh, `#!${['/bin/sh', '/system/bin/sh'].find((p) => fs.existsSync(p))}
 printf '%s\\n' "$1" > "$CCM_OPEN_URL.tmp" && mv "$CCM_OPEN_URL.tmp" "$CCM_OPEN_URL"
 `, { mode: 0o755 });
 
 class Terminal {
-  /** kind 'shell' is the Debian terminal; 'login' runs `claude auth login` where this bridge runs Claude. */
+  /** kind 'shell' is the Debian terminal; 'login' runs `agy` interactive login where this bridge runs AGY. */
   constructor(cols, rows, kind = 'shell') {
     this.id = randomUUID();
     this.kind = kind;
@@ -1268,10 +2079,10 @@ class Terminal {
     this.size = 0;
     this.clients = new Set();
     this.links = []; // sign-in pages for the app to open, as {url, local}
-    const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+    const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', AGY_CLI_DISABLE_AUTO_UPDATE: 'true' };
     let command = chrootShell;
     if (kind === 'login') {
-      command = () => [claudeBin, 'auth', 'login'];
+      command = () => process.env.CCM_LEGACY_PROTO === '1' ? [claudeBin, 'auth', 'login'] : [claudeBin];
       this.urlFile = path.join(stateDir, `login-${this.id}.url`);
       Object.assign(env, { BROWSER: openUrlSh, CCM_OPEN_URL: this.urlFile });
       this.urlCheck = setInterval(() => this.checkLink(), 250);
@@ -1292,7 +2103,7 @@ class Terminal {
     terminals.set(this.id, this);
   }
 
-  /** The page Claude asked $BROWSER to open. Its sign-in finishes by itself, through a server on localhost. */
+  /** The page $BROWSER was asked to open. */
   checkLink() {
     let url;
     try { url = fs.readFileSync(this.urlFile, 'utf8').trim(); } catch { return; }
@@ -1308,8 +2119,11 @@ class Terminal {
   }
 
   output(data) {
-    // The printed link (OSC 8) is the paste-a-code sign-in, for when the app is on another machine.
-    if (this.kind === 'login') for (const m of data.toString().matchAll(/\x1b\]8;;(https:\/\/[^\x07\x1b]+)/g)) this.link(m[1], false);
+    if (this.kind === 'login') {
+      const str = data.toString();
+      for (const m of str.matchAll(/\x1b\]8;;(https:\/\/[^\x07\x1b]+)/g)) this.link(m[1], false);
+      for (const m of str.matchAll(/(https:\/\/accounts\.google\.com\/[^\s\x1b"']+)/g)) this.link(m[1], true);
+    }
     this.chunks.push(data);
     this.size += data.length;
     while (this.size > TERM_BUFFER && this.chunks.length > 1) this.size -= this.chunks.shift().length;
@@ -1331,10 +2145,36 @@ function terminalFor(id) {
   return term;
 }
 
-/** Who Claude Code is signed in as here: `claude auth status` (it exits 1 when signed out, still printing JSON). */
+/** Who AGY is signed in as here: reads ~/.gemini/antigravity-cli/antigravity-oauth-token (or falls back to `auth status --json`). */
 function authStatus() {
-  return new Promise((resolve, reject) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
-    try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`Couldn't check the Claude login${err ? `: ${err.message}` : ''}`)); }
+  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
+  if (fs.existsSync(tokenPath) && process.env.CCM_LEGACY_PROTO !== '1') {
+    try {
+      const data = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
+      const loggedIn = Boolean(data?.token?.access_token || data?.token?.refresh_token);
+      let email = null;
+      let orgName = null;
+      if (typeof data?.id_token === 'string') {
+        const parts = data.id_token.split('.');
+        if (parts.length >= 2) {
+          const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+          email = claims.email ?? null;
+          orgName = claims.hd ?? claims.name ?? null;
+        }
+      }
+      return Promise.resolve({
+        loggedIn,
+        authMethod: data?.auth_method || 'google-oauth',
+        email,
+        subscriptionType: 'Antigravity',
+        orgName,
+      });
+    } catch {}
+  }
+  return new Promise((resolve) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
+    try { resolve(JSON.parse(stdout)); } catch {
+      resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null });
+    }
   }));
 }
 
@@ -1360,7 +2200,7 @@ async function listeningSockets() {
   return byInode;
 }
 
-/** Ports each task's processes listen on, by session id (the bridge's and Claude's own are left out). */
+/** Ports each task's processes listen on, by session id (the bridge's and AGY's own are left out). */
 async function taskPorts() {
   const sockets = await listeningSockets();
   const ports = new Map();
@@ -1504,6 +2344,7 @@ class Client {
         this.send({ ev: 'hello', version: VERSION, host: os.hostname(), platform: process.platform, roots: opts.roots, root: rootAvailable });
         this.send({ ev: 'sessions', sessions: [...sessions.values()].map((s) => s.summary()) });
         if (limits) this.send({ ev: 'limits', limits });
+        else refreshAgyLimits();
         for (const s of sessions.values()) for (const req of s.pending.values()) this.send({ ev: 'approval', sid: s.id, title: s.title, request: req });
       } else {
         this.send({ ev: 'error', message: 'Unauthorized' });
@@ -1529,7 +2370,7 @@ class Client {
         const prompt = String(msg.prompt ?? '').trim();
         const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
         if (!prompt && !attachments.length) throw new Error('Empty prompt');
-        const mode = MODES.includes(msg.mode) ? msg.mode : 'default';
+        const mode = MODES.includes(msg.mode) ? msg.mode : (process.env.CCM_LEGACY_PROTO === '1' ? 'default' : 'bypassPermissions');
         const title = prompt.split('\n')[0].slice(0, 100) || `Attached ${attachments.map((a) => a.name).join(', ')}`.slice(0, 100);
         const session = new Session({ id: randomUUID(), cwd, title, model: msg.model || null, effort: msg.effort, mode, autoContinue: !!msg.autoContinue });
         sessions.set(session.id, session);
@@ -1549,13 +2390,12 @@ class Client {
         // Attaches to the running terminal (or the one asked for), or starts one.
         const cols = Number(msg.cols) || 80;
         const rows = Number(msg.rows) || 24;
-        // kind 'login' signs Claude in (one at a time); a fresh one replaces a sign-in still waiting.
         const kind = msg.kind === 'login' ? 'login' : 'shell';
         const ofKind = [...terminals.values()].filter((t) => t.kind === kind);
         if (msg.fresh && kind === 'login') ofKind.forEach((t) => t.close());
         const term = terminals.get(String(msg.id ?? '')) ?? (msg.fresh ? null : ofKind.at(-1)) ?? new Terminal(cols, rows, kind);
         term.clients.add(this);
-        if (msg.cols && msg.rows) term.resize(cols, rows); // attaching without a size leaves it as it is
+        if (msg.cols && msg.rows) term.resize(cols, rows);
         this.send({ ev: 'term_opened', ref, id: term.id, kind: term.kind, data: term.replay(), links: term.links });
         break;
       }
@@ -1564,8 +2404,6 @@ class Client {
       case 'term_detach': terminals.get(String(msg.id ?? ''))?.clients.delete(this); break;
       case 'term_close': terminalFor(msg.id).close(); break;
       case 'auth': this.send({ ev: 'auth', ref, auth: await authStatus() }); break;
-      // Dictation through Claude's speech-to-text (Claude Code's /voice): the app streams
-      // 16 kHz mono 16-bit PCM in base64 and gets 'voice' events back with the same id.
       case 'voice_start': {
         const id = String(msg.id ?? '');
         if (!id || this.voices.has(id)) throw new Error('Bad voice id');
@@ -1597,7 +2435,11 @@ class Client {
         this.send({ ev: 'processes', ref, processes: listProcesses(), started });
         break;
       }
-      case 'usage': this.send({ ev: 'usage', ref, limits, ...usageSummary(msg.days, msg.tzOffsetMin) }); break;
+      case 'usage': {
+        await refreshAgyLimits();
+        this.send({ ev: 'usage', ref, limits, ...usageSummary(msg.days, msg.tzOffsetMin) });
+        break;
+      }
       case 'claude_sessions': this.send({ ev: 'claude_sessions', ref, sessions: listCliSessions() }); break;
       case 'resume': {
         const id = String(msg.id ?? '');
@@ -1638,6 +2480,9 @@ class Client {
         if (!MODES.includes(msg.mode)) throw new Error(`Unknown mode: ${msg.mode}`);
         s.setMode(msg.mode);
         break;
+      case 'model':
+        s.setModel(msg.model ? String(msg.model) : null);
+        break;
       case 'effort':
         if (msg.effort != null && !EFFORTS.includes(msg.effort)) throw new Error(`Unknown effort: ${msg.effort}`);
         s.setEffort(msg.effort ?? null);
@@ -1676,7 +2521,7 @@ server.listen(opts.port, opts.host, () => {
   const loopback = address === '127.0.0.1' || address === '::1';
   console.log(`ccm-bridge listening on ${address}:${port} (${sessions.size} saved sessions${rootAvailable ? ', root available' : ''})`);
   if (!loopback) console.log('Warning: listening beyond this device. Traffic is not encrypted; use a private network such as Tailscale or an SSH tunnel.');
-  const pairUrl = `ccmobile://pair?host=${encodeURIComponent(loopback ? '127.0.0.1' : address)}&port=${port}&token=${encodeURIComponent(token)}`;
+  const pairUrl = `agymobile://pair?host=${encodeURIComponent(loopback ? '127.0.0.1' : address)}&port=${port}&token=${encodeURIComponent(token)}`;
   if (opts.showToken) console.log(`Token: ${token}\nPair link: ${pairUrl}`);
   else console.log('Run with --pair to connect the app, or --show-token to print the token.');
   if (opts.pair) {
@@ -1688,7 +2533,7 @@ server.listen(opts.port, opts.host, () => {
 
 function shutdown() {
   try { if (Number(fs.readFileSync(pidFile, 'utf8')) === process.pid) fs.rmSync(pidFile); } catch {}
-  // Claude processes keep running under their keepers; the next bridge reattaches to them.
+  // AGY processes keep running under their keepers; the next bridge reattaches to them.
   for (const s of sessions.values()) if (s.link) { s.link.close(); s.persistMeta(); }
   server.close();
   process.exit(0);
