@@ -1275,7 +1275,10 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     const finalReply = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && m.msg.message.content.some((b) => b.type === 'text'));
     assert.equal(finalReply.msg.message.content[0].text, 'AGY reply to: build apk [effort: high]');
 
-    await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
+    const idleFirst = await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
+    assert.ok(idleFirst.session.outputTokens >= 30);
+    assert.ok(idleFirst.session.inputTokens > 0);
+    assert.ok(idleFirst.session.requests >= 1);
 
     // 5. Check usage & quota limits parsed from `agy -p /usage --output-format json`
     c.send({ op: 'usage', ref: 14, days: 7 });
@@ -1287,6 +1290,7 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     assert.equal(usage.limits.windows[1].id, 'gemini-weekly');
     assert.equal(Math.round(usage.limits.windows[1].utilization * 100), 85);
     assert.ok(usage.days.at(-1).output >= 30);
+    assert.equal(typeof usage.days.at(-1).thinking, 'number');
 
     // 6. Test built-in slash command (/models) executed via one-shot print mode
     c.send({ op: 'send', sid: session.id, text: '/models' });

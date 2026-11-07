@@ -28,6 +28,11 @@ data class SessionSummary(
     val lastActivity: String = "",
     val pending: Int = 0,
     val costUsd: Double = 0.0,
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    val thinkingTokens: Long = 0,
+    val cacheReadTokens: Long = 0,
+    val requests: Int = 0,
     val running: Boolean = false,
     /** Continue by itself once a usage limit resets. */
     val autoContinue: Boolean = false,
@@ -42,6 +47,7 @@ data class SessionSummary(
     /** Not finished: working, waiting for approval, paused by a usage limit, or running background work. */
     val isOpen: Boolean get() = isActive || status == "limited" || background.isNotEmpty()
     val repoName: String get() = cwd.trimEnd('/').substringAfterLast('/')
+    val readTokens: Long get() = inputTokens + cacheReadTokens
 }
 
 /** A Claude Code session on the bridge's machine that the bridge isn't tracking yet (see listCliSessions()). */
@@ -57,9 +63,15 @@ data class ClaudeSession(
     val repoName: String get() = cwd.trimEnd('/').substringAfterLast('/')
 }
 
-/** One plan-limit window from the CLI's rate_limit_event (see onRateLimit() in ccm-bridge.mjs). */
+/** One plan-limit window from the CLI's rate_limit_event or quota API. */
 @Serializable
-data class LimitWindow(val id: String, val utilization: Double, val resetsAt: Long = 0)
+data class LimitWindow(
+    val id: String,
+    val utilization: Double,
+    val resetsAt: Long = 0,
+    val disabled: Boolean = false,
+    val description: String? = null,
+)
 
 /** The account's plan limits as of Claude's last reply through the bridge. */
 @Serializable
@@ -70,6 +82,7 @@ data class DayUsage(
     val date: String,
     val input: Long = 0,
     val output: Long = 0,
+    val thinking: Long = 0,
     val cacheRead: Long = 0,
     val cacheWrite: Long = 0,
     val requests: Int = 0,
@@ -177,7 +190,7 @@ fun approvalFrom(sid: String, sessionTitle: String, message: JsonObject): Approv
         summary = ToolText.summary(tool, input),
         detail = ToolText.detail(tool, input),
         canAlways = canAlways,
-        questions = if (tool == "AskUserQuestion") questionsIn(input) else emptyList(),
+        questions = if (tool == "AskUserQuestion" || tool == "ask_question") questionsIn(input) else emptyList(),
     )
 }
 
@@ -186,9 +199,13 @@ private fun questionsIn(input: JsonObject): List<Question> = input.arr("question
         Question(
             question = it.str("question") ?: return@let null,
             header = it.str("header").orEmpty(),
-            multiSelect = it.bool("multiSelect") == true,
+            multiSelect = it.bool("multiSelect") == true || it.bool("is_multi_select") == true,
             options = it.arr("options").orEmpty().mapNotNull { o ->
-                (o as? JsonObject)?.str("label")?.let { label -> QuestionOption(label, o.str("description").orEmpty()) }
+                when (o) {
+                    is JsonPrimitive -> o.takeIf { p -> p.isString }?.content?.let { label -> QuestionOption(label, "") }
+                    is JsonObject -> o.str("label")?.let { label -> QuestionOption(label, o.str("description").orEmpty()) }
+                    else -> null
+                }
             },
         )
     }
@@ -198,34 +215,59 @@ private fun questionsIn(input: JsonObject): List<Question> = input.arr("question
 object ToolText {
     fun summary(name: String, input: JsonObject): String {
         val raw = when (name) {
-            "Bash" -> input.str("command")
-            "Read", "Write", "Edit", "MultiEdit", "NotebookEdit" -> (input.str("file_path") ?: input.str("notebook_path"))?.let(::shortPath)
-            "Grep", "Glob" -> input.str("pattern")?.let { "\"$it\"" }
-            "WebFetch" -> input.str("url")
-            "WebSearch" -> input.str("query")
-            "Task", "Agent" -> input.str("description")
+            "Bash", "run_command" -> input.str("CommandLine") ?: input.str("command") ?: input.str("toolSummary")
+            "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+            "view_file", "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file" ->
+                (input.str("TargetFile") ?: input.str("AbsolutePath") ?: input.str("file_path") ?: input.str("notebook_path"))?.let(::shortPath)
+            "Grep", "Glob", "grep_search", "find_by_name" ->
+                (input.str("Query") ?: input.str("Pattern") ?: input.str("pattern"))?.let { "\"$it\"" }
+            "LS", "list_dir" -> (input.str("DirectoryPath") ?: input.str("path"))?.let(::shortPath)
+            "WebFetch", "read_url_content", "open_browser_url", "read_browser_page" -> input.str("Url") ?: input.str("url")
+            "WebSearch", "search_web" -> input.str("query")
+            "Task", "Agent", "invoke_subagent", "browser_subagent", "define_subagent", "manage_subagents" ->
+                input.arr("Subagents")?.firstOrNull()?.let { (it as? JsonObject)?.let { s -> s.str("Role") ?: s.str("TypeName") ?: s.str("role") ?: s.str("type_name") } }
+                    ?: input.str("TaskName") ?: input.str("toolSummary") ?: input.str("description") ?: input.str("Action")
+            "ask_question", "AskUserQuestion" ->
+                input.arr("questions")?.firstOrNull()?.let { (it as? JsonObject)?.str("question") } ?: input.str("toolSummary")
             "ExitPlanMode" -> "Plan ready for review"
-            else -> input.values.firstNotNullOfOrNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+            else -> input.str("toolSummary") ?: input.str("toolAction")
+                ?: input.values.firstNotNullOfOrNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
         }
         return raw?.lineSequence()?.firstOrNull()?.take(200).orEmpty()
     }
 
     fun detail(name: String, input: JsonObject): String = when (name) {
-        "Bash" -> input.str("command").orEmpty()
+        "Bash", "run_command" -> (input.str("CommandLine") ?: input.str("command")).orEmpty()
         "ExitPlanMode" -> input.str("plan").orEmpty()
-        "Edit" -> buildString {
-            append(input.str("file_path").orEmpty())
-            input.str("old_string")?.lines()?.forEach { append("\n− ").append(it) }
-            input.str("new_string")?.lines()?.forEach { append("\n+ ").append(it) }
+        "Edit", "replace_file_content" -> buildString {
+            append((input.str("TargetFile") ?: input.str("file_path")).orEmpty())
+            (input.str("TargetContent") ?: input.str("old_string"))?.lines()?.forEach { append("\n− ").append(it) }
+            (input.str("ReplacementContent") ?: input.str("new_string"))?.lines()?.forEach { append("\n+ ").append(it) }
         }
-        "Write" -> input.str("file_path").orEmpty() + "\n" + input.str("content").orEmpty().take(4000)
+        "multi_replace_file_content" -> buildString {
+            append(input.str("TargetFile").orEmpty())
+            input.arr("ReplacementChunks").orEmpty().forEach { chunk ->
+                val c = chunk as? JsonObject ?: return@forEach
+                c.str("TargetContent")?.lines()?.forEach { append("\n− ").append(it) }
+                c.str("ReplacementContent")?.lines()?.forEach { append("\n+ ").append(it) }
+            }
+        }
+        "Write", "write_to_file" -> (input.str("TargetFile") ?: input.str("file_path")).orEmpty() + "\n" +
+            (input.str("CodeContent") ?: input.str("content")).orEmpty().take(4000)
         else -> prettyJson.encodeToString(JsonObject.serializer(), input)
     }
 
     /** Lines added and removed by an Edit or Write call, for the "+18 −4" badge. */
     fun lineDelta(name: String, input: JsonObject): Pair<Int, Int>? = when (name) {
-        "Edit" -> lineCount(input.str("new_string")) to lineCount(input.str("old_string"))
-        "Write" -> lineCount(input.str("content")) to 0
+        "Edit", "replace_file_content" ->
+            lineCount(input.str("ReplacementContent") ?: input.str("new_string")) to
+                lineCount(input.str("TargetContent") ?: input.str("old_string"))
+        "multi_replace_file_content" -> {
+            val chunks = input.arr("ReplacementChunks").orEmpty().mapNotNull { it as? JsonObject }
+            if (chunks.isEmpty()) null
+            else chunks.sumOf { lineCount(it.str("ReplacementContent")) } to chunks.sumOf { lineCount(it.str("TargetContent")) }
+        }
+        "Write", "write_to_file" -> lineCount(input.str("CodeContent") ?: input.str("content")) to 0
         else -> null
     }
 

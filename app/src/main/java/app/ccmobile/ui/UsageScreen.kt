@@ -55,9 +55,11 @@ import app.ccmobile.data.DayUsage
 import app.ccmobile.data.LimitWindow
 import app.ccmobile.data.Limits
 import app.ccmobile.data.Repository
+import app.ccmobile.data.SessionSummary
 import app.ccmobile.data.Usage
 import app.ccmobile.data.UsageShare
 import app.ccmobile.data.UsageText
+import androidx.compose.foundation.shape.CircleShape
 import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.LocalDate
@@ -72,6 +74,8 @@ import kotlin.math.pow
 @Composable
 fun UsageScreen(repository: Repository, onBack: () -> Unit) {
     val limits by repository.limits.collectAsStateWithLifecycle()
+    val sessions by repository.sessions.collectAsStateWithLifecycle()
+    val usageTick by repository.usageTick.collectAsStateWithLifecycle()
     val conn by repository.client.state.collectAsStateWithLifecycle()
     val connected = conn is ConnState.Connected
     var range by rememberSaveable { mutableIntStateOf(7) }
@@ -79,21 +83,76 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
     var loading by remember { mutableStateOf(false) }
     var reload by remember { mutableIntStateOf(0) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var lastUpdatedAt by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(range, connected, reload) {
         if (!connected) return@LaunchedEffect
         loading = true
-        repository.loadUsage(range)?.let { usage = it }
+        repository.loadUsage(range)?.let {
+            usage = it
+            lastUpdatedAt = System.currentTimeMillis()
+            now = lastUpdatedAt
+        }
         loading = false
     }
+    LaunchedEffect(usageTick, connected) {
+        if (!connected || usageTick <= 0L) return@LaunchedEffect
+        delay(300)
+        repository.loadUsage(range, quiet = true)?.let {
+            usage = it
+            lastUpdatedAt = System.currentTimeMillis()
+            now = lastUpdatedAt
+        }
+    }
+    val anyActive = sessions.any { it.isActive }
+    LaunchedEffect(connected, range, anyActive) {
+        if (!connected) return@LaunchedEffect
+        val intervalMs = if (anyActive) 5_000L else 15_000L
+        while (true) {
+            delay(intervalMs)
+            repository.loadUsage(range, quiet = true)?.let {
+                usage = it
+                lastUpdatedAt = System.currentTimeMillis()
+                now = lastUpdatedAt
+            }
+        }
+    }
     LaunchedEffect(Unit) {
-        while (true) { delay(30_000); now = System.currentTimeMillis() }
+        while (true) { delay(1_000); now = System.currentTimeMillis() }
+    }
+
+    val liveSessions = remember(sessions) {
+        sessions.filter { it.isOpen || it.outputTokens > 0 || it.readTokens > 0 }.take(5)
     }
 
     Column(Modifier.fillMaxSize().background(C.Bg).safeDrawingPadding()) {
         Row(Modifier.padding(start = 4.dp, end = 4.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconBtn(R.drawable.ic_back, "Back", onBack)
             Box(Modifier.weight(1f))
+            if (connected) {
+                val stamp = maxOf(lastUpdatedAt, limits?.updatedAt ?: 0L)
+                Row(
+                    Modifier
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(C.Surface)
+                        .border(1.dp, C.Border, RoundedCornerShape(999.dp))
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Box(
+                        Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(if (anyActive) C.Clay else C.Green),
+                    )
+                    Text(
+                        if (stamp > 0L) "Live · ${UsageText.ago(now - stamp)}" else "Live",
+                        color = C.Muted,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
             if (loading) CircularProgressIndicator(Modifier.padding(12.dp).size(20.dp), color = C.Muted, strokeWidth = 2.dp)
             else IconBtn(R.drawable.ic_refresh, "Refresh", { reload++ }, enabled = connected)
         }
@@ -105,12 +164,18 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Usage", fontFamily = Serif, fontSize = 30.sp, lineHeight = 35.sp, color = C.Text)
                 Text(
-                    "Your plan limits, and the tokens Claude Code used on the bridge's machine.",
+                    "Real-time plan quota limits and token usage across your AGY tasks.",
                     color = C.Muted, fontSize = 14.sp, lineHeight = 20.sp,
                 )
             }
 
             UsageSection("Plan limits") { LimitsCard(limits, now) }
+
+            if (liveSessions.isNotEmpty()) {
+                UsageSection(if (anyActive) "Live task usage" else "Recent task usage") {
+                    LiveSessionsCard(liveSessions, limits)
+                }
+            }
 
             UsageSection("Activity") {
                 Segmented(listOf(7 to "7 days", 30 to "30 days"), range, { range = it })
@@ -126,6 +191,58 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
             usage?.takeIf { it.projects.isNotEmpty() }?.let { u ->
                 UsageSection("By project") { ShareList(u.projects) { projectName(it) } }
                 UsageSection("By model") { ShareList(u.models) { UsageText.modelName(it) } }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LiveSessionsCard(sessions: List<SessionSummary>, limits: Limits?) {
+    UsageCard {
+        sessions.forEachIndexed { i, s ->
+            if (i > 0) HorizontalDivider(color = C.Border)
+            val modelLabel = s.model?.let(UsageText::modelName) ?: "Default model"
+            val win = limits?.windows?.let { UsageText.windowForModel(s.model, it) }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (s.isActive) C.Clay else if (s.status == "limited") C.Amber else C.Faint),
+                    )
+                    Text(
+                        s.title,
+                        color = C.Text,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        "${UsageText.compact(s.outputTokens)} out",
+                        color = C.Text,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val details = buildList {
+                        add(modelLabel)
+                        if (s.readTokens > 0) add("${UsageText.compact(s.readTokens)} in")
+                        if (s.thinkingTokens > 0) add("${UsageText.compact(s.thinkingTokens)} think")
+                        if (s.requests > 0) add("${s.requests} req")
+                        if (win != null) add("${UsageText.percent(win.utilization)} quota")
+                    }.joinToString(" · ")
+                    Text(
+                        details,
+                        color = C.Muted,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
     }
@@ -166,7 +283,7 @@ private fun levelOf(utilization: Double) = when {
 private fun LimitsCard(limits: Limits?, now: Long) {
     UsageCard {
         if (limits == null || limits.windows.isEmpty()) {
-            Text("Limits show up after Claude's next reply to a task here.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
+            Text("Limits show up after AGY's next reply, or tap Refresh above.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
             return@UsageCard
         }
         limits.windows.forEachIndexed { i, w ->
@@ -174,7 +291,7 @@ private fun LimitsCard(limits: Limits?, now: Long) {
             LimitRow(w, now)
         }
         Text(
-            "As of Claude's last reply here, ${relativeTime(limits.updatedAt, now)}. Counts all your Claude use, including claude.ai.",
+            "Updated ${UsageText.ago(now - limits.updatedAt)} · Counts all your Antigravity quota usage.",
             color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
         )
     }
@@ -185,14 +302,16 @@ private fun LimitRow(w: LimitWindow, now: Long) {
     val (name, sub) = UsageText.windowLabel(w.id)
     // Once a window has reset, the last reading no longer applies; it starts again from 0.
     val reset = w.resetsAt in 1..now
-    val utilization = if (reset) 0.0 else w.utilization
+    val utilization = if (reset) 0.0 else w.utilization.coerceIn(0.0, 1.0)
     val level = levelOf(utilization)
-    val fill = when (level) {
-        Level.Normal -> C.Clay
-        Level.Warning -> C.Amber
-        Level.Critical -> C.Red
+    val fill = when {
+        w.disabled && utilization < 1.0 -> C.Amber
+        level == Level.Normal -> C.Clay
+        level == Level.Warning -> C.Amber
+        else -> C.Red
     }
-    val pct = "${Math.round(utilization * 100)}%"
+    val pct = UsageText.percent(utilization)
+    val leftPct = UsageText.percent((1.0 - utilization).coerceIn(0.0, 1.0))
 
     Column(
         Modifier.semantics(mergeDescendants = true) {},
@@ -204,19 +323,19 @@ private fun LimitRow(w: LimitWindow, now: Long) {
                 if (sub.isNotEmpty()) Text(sub, color = C.Muted, fontSize = 12.sp)
             }
             Text(pct, color = C.Text, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-            Text(" used", color = C.Muted, fontSize = 13.sp, modifier = Modifier.padding(bottom = 3.dp))
+            Text(" used · $leftPct left", color = C.Muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 3.dp))
         }
         Meter(utilization, fill)
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            when (level) {
-                Level.Warning -> LevelTag("Nearly used", C.Amber, C.AmberBg)
-                Level.Critical -> LevelTag("Limit reached", C.Red, C.DelBg)
-                Level.Normal -> {}
+            when {
+                w.disabled && utilization < 1.0 -> LevelTag("Paused by weekly limit", C.Amber, C.AmberBg)
+                level == Level.Warning -> LevelTag("Nearly used", C.Amber, C.AmberBg)
+                level == Level.Critical -> LevelTag("Limit reached", C.Red, C.DelBg)
             }
             val at = resetTime(w.resetsAt, now)
             Text(
                 when {
-                    w.resetsAt <= 0 -> ""
+                    w.resetsAt <= 0 -> if (w.disabled) "Unavailable until weekly quota resets" else ""
                     reset -> "Reset $at"
                     else -> "Resets $at · ${UsageText.until(w.resetsAt - now)}"
                 },
@@ -270,10 +389,28 @@ fun resetTime(epochMs: Long, now: Long = System.currentTimeMillis()): String {
 
 @Composable
 private fun Totals(u: Usage) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        StatTile("Tokens out", UsageText.compact(u.days.sumOf { it.output }), Modifier.weight(1f))
-        StatTile("Tokens in", UsageText.compact(u.days.sumOf { it.read }), Modifier.weight(1f))
-        StatTile("Requests", UsageText.compact(u.days.sumOf { it.requests }.toLong()), Modifier.weight(1f))
+    val totalOut = u.days.sumOf { it.output }
+    val totalRead = u.days.sumOf { it.read }
+    val totalReq = u.days.sumOf { it.requests }.toLong()
+    val totalThinking = u.days.sumOf { it.thinking }
+    val totalCacheRead = u.days.sumOf { it.cacheRead }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatTile("Tokens out", UsageText.compact(totalOut), Modifier.weight(1f))
+            StatTile("Tokens in", UsageText.compact(totalRead), Modifier.weight(1f))
+            StatTile("Requests", UsageText.compact(totalReq), Modifier.weight(1f))
+        }
+        val extra = buildList {
+            if (totalThinking > 0) add("${UsageText.compact(totalThinking)} thinking")
+            if (totalCacheRead > 0 && totalRead > 0) {
+                val pct = Math.round(totalCacheRead.toDouble() / totalRead * 100)
+                add("${UsageText.compact(totalCacheRead)} cached ($pct%)")
+            }
+            if (u.sessions > 0) add("${u.sessions} ${if (u.sessions == 1) "session" else "sessions"}")
+        }.joinToString(" · ")
+        if (extra.isNotEmpty()) {
+            Text(extra, color = C.Muted, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 4.dp))
+        }
     }
 }
 
@@ -306,7 +443,13 @@ private fun DailyChart(days: List<DayUsage>) {
             Text(dayLabel(day.date, long = true), color = C.Muted, fontSize = 12.sp)
             Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(UsageText.compact(day.output), color = C.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-                Text("out · ${UsageText.compact(day.read)} in · ${day.requests} requests", color = C.Muted, fontSize = 13.sp,
+                val daySummary = buildList {
+                    add("out")
+                    if (day.thinking > 0) add("(${UsageText.compact(day.thinking)} think)")
+                    add("· ${UsageText.compact(day.read)} in")
+                    add("· ${day.requests} req")
+                }.joinToString(" ")
+                Text(daySummary, color = C.Muted, fontSize = 13.sp,
                     modifier = Modifier.padding(bottom = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
@@ -393,7 +536,8 @@ private fun ShareList(shares: List<UsageShare>, label: (String) -> String) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(label(s.key), color = C.Text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                     Text("${UsageText.compact(s.output)} out", color = C.TextSoft, fontSize = 13.sp)
-                    Text(" · ${s.requests} req", color = C.Muted, fontSize = 13.sp)
+                    val inText = if (s.input > 0) " · ${UsageText.compact(s.input)} in" else ""
+                    Text("$inText · ${s.requests} req", color = C.Muted, fontSize = 13.sp)
                 }
                 Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)).background(C.Surface2)) {
                     Box(

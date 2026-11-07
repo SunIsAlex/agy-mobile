@@ -90,7 +90,11 @@ const keepersDir = path.join(stateDir, 'keepers');
   ];
   const dirs = (process.env.PATH ?? '').split(':').filter(Boolean);
   for (const b of extraBins.reverse()) {
-    if (fs.existsSync(b) && !dirs.includes(b)) dirs.unshift(b);
+    if (fs.existsSync(b)) {
+      const idx = dirs.indexOf(b);
+      if (idx >= 0) dirs.splice(idx, 1);
+      dirs.unshift(b);
+    }
   }
   process.env.PATH = dirs.join(':');
 }
@@ -360,6 +364,11 @@ class Session {
     this.costUsd = 0;
     this.costBase = 0; // totals from earlier processes, if one started counting from zero
     this.costLast = 0;
+    this.inputTokens = 0;
+    this.outputTokens = 0;
+    this.thinkingTokens = 0;
+    this.cacheReadTokens = 0;
+    this.requests = 0;
     // Usage limits: a task that hits one waits in status 'limited' until resumeAt; with
     // autoContinue it then carries on by itself.
     this.autoContinue = !!autoContinue;
@@ -385,10 +394,27 @@ class Session {
       id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
+      inputTokens: this.inputTokens, outputTokens: this.outputTokens, thinkingTokens: this.thinkingTokens,
+      cacheReadTokens: this.cacheReadTokens, requests: this.requests,
       running: this.link !== null, autoContinue: this.autoContinue, resumeAt: this.resumeAt,
       background: this.background.map((t) => t.description),
       ports: this.ports ?? [],
     };
+  }
+
+  addUsage(u) {
+    if (!u || typeof u !== 'object') return false;
+    const inp = Number(u.input_tokens) || 0;
+    const out = Number(u.output_tokens) || 0;
+    const think = Number(u.thinking_tokens) || 0;
+    const cacheRead = Number(u.cache_read_input_tokens ?? u.cache_read_tokens) || 0;
+    if (!inp && !out && !think && !cacheRead) return false;
+    this.inputTokens += inp;
+    this.outputTokens += out + think;
+    this.thinkingTokens += think;
+    this.cacheReadTokens += cacheRead;
+    this.requests += 1;
+    return true;
   }
 
   get logFile() { return path.join(sessionsDir, `${this.id}.jsonl`); }
@@ -411,7 +437,17 @@ class Session {
   record(msg) {
     this.events.push(msg);
     if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
-    fs.appendFile(this.logFile, JSON.stringify(msg) + '\n', () => {});
+    const u = msg?.type === 'assistant' && msg.message?.model !== '<synthetic>' ? msg.message?.usage : null;
+    if (u) {
+      try { fs.appendFileSync(this.logFile, JSON.stringify(msg) + '\n'); } catch {}
+      if (this.addUsage(u)) {
+        this.persistMeta();
+        broadcast({ ev: 'session', session: this.summary() });
+        broadcast({ ev: 'usage_tick', sid: this.id, t: Date.now() });
+      }
+    } else {
+      fs.appendFile(this.logFile, JSON.stringify(msg) + '\n', () => {});
+    }
   }
 
   setStatus(status, activity) {
@@ -599,7 +635,9 @@ class Session {
     const file = findCliTranscript(this.cliSessionId ?? this.id);
     if (!file || !fs.existsSync(file)) return;
 
+    const minActiveStep = Math.min(...this.emittedTools);
     let maxTranscriptStep = -1;
+    let taskKilled = false;
     try {
       const stat = fs.statSync(file);
       const readLen = Math.min(stat.size, 65536);
@@ -612,21 +650,24 @@ class Session {
         if (!line.includes('"step_index"')) continue;
         try {
           const r = JSON.parse(line);
-          if (typeof r.step_index === 'number' && r.step_index > maxTranscriptStep) {
-            maxTranscriptStep = r.step_index;
+          if (typeof r.step_index === 'number') {
+            if (r.step_index > maxTranscriptStep) maxTranscriptStep = r.step_index;
+            if (r.step_index > minActiveStep && line.includes('manage_task') && line.includes('kill')) {
+              taskKilled = true;
+            }
           }
         } catch {}
       }
     } catch {}
 
-    const minActiveStep = Math.min(...this.emittedTools);
     if (maxTranscriptStep > minActiveStep) {
       const now = Date.now();
       if (!this.stuckToolDetectedAt) {
         this.stuckToolDetectedAt = now;
         return;
       }
-      const graceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : 3000;
+      const defaultGraceMs = taskKilled ? 2_000 : (maxTranscriptStep >= minActiveStep + 4 ? 15_000 : 180_000);
+      const graceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : defaultGraceMs;
       if (now - this.stuckToolDetectedAt >= graceMs) {
         const descendants = findDescendantPids(claudePid);
         if (descendants.length > 0) {
@@ -725,6 +766,7 @@ class Session {
                 ...(usage ? { usage } : {}),
               },
             });
+            if (usage) refreshAgyLimits(false);
           }
         }
         return;
@@ -803,6 +845,7 @@ class Session {
                 usage,
               },
             });
+            refreshAgyLimits(false);
           }
           this.onCliMessage({
             type: 'user',
@@ -855,14 +898,14 @@ class Session {
 
       const isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
       const errText = isError ? (res.error || res.response || '') : '';
+      const turnUsage = res.usage ? {
+        input_tokens: res.usage.input_tokens ?? 0,
+        output_tokens: res.usage.output_tokens ?? 0,
+        cache_read_input_tokens: res.usage.cache_read_tokens ?? 0,
+        cache_creation_input_tokens: 0,
+        thinking_tokens: res.usage.thinking_tokens ?? 0,
+      } : undefined;
       if (!this.turnHadText && !isError && typeof res.response === 'string' && res.response.trim()) {
-        const usage = res.usage ? {
-          input_tokens: res.usage.input_tokens ?? 0,
-          output_tokens: res.usage.output_tokens ?? 0,
-          cache_read_input_tokens: res.usage.cache_read_tokens ?? 0,
-          cache_creation_input_tokens: 0,
-          thinking_tokens: res.usage.thinking_tokens ?? 0,
-        } : undefined;
         this.onCliMessage({
           type: 'assistant',
           uuid: `turn-${Date.now()}`,
@@ -873,7 +916,7 @@ class Session {
             model: this.currentModel ?? this.model ?? 'agy',
             role: 'assistant',
             content: [{ type: 'text', text: res.response }],
-            ...(usage ? { usage } : {}),
+            ...(turnUsage ? { usage: turnUsage } : {}),
           },
         });
       }
@@ -901,8 +944,9 @@ class Session {
         duration_ms: Math.round((res.duration_seconds ?? 0) * 1000),
         num_turns: res.num_turns ?? 1,
         total_cost_usd: 0,
+        ...(turnUsage ? { usage: turnUsage } : {}),
       });
-      refreshAgyLimits();
+      refreshAgyLimits(true);
     }
   }
 
@@ -1694,19 +1738,32 @@ function onRateLimit(info) {
   broadcast({ ev: 'limits', limits });
 }
 
-/** Parses `agy -p /usage --output-format json` output into bridge `limits`. */
+/** Parses `agy -p /usage --output-format json` or direct `retrieveUserQuotaSummary` output into bridge `limits`. */
 function parseAgyLimitsOutput(parsed) {
-  const groups = parsed?.command?.data?.groups;
+  const groups = parsed?.command?.data?.groups ?? parsed?.groups;
   if (!Array.isArray(groups)) return false;
   const windows = [];
   let anyExhausted = false;
   for (const g of groups) {
     for (const b of g?.buckets ?? []) {
-      if (typeof b?.remaining_fraction !== 'number') continue;
-      const utilization = Math.max(0, Math.min(1, 1 - b.remaining_fraction));
-      if (b.remaining_fraction <= 0) anyExhausted = true;
-      const resetsAt = b.reset_time ? (Date.parse(b.reset_time) || 0) : 0;
-      windows.push({ id: b.id || b.label || 'quota', utilization, resetsAt });
+      const rem = typeof b?.remaining_fraction === 'number'
+        ? b.remaining_fraction
+        : (typeof b?.remainingFraction === 'number' ? b.remainingFraction : null);
+      if (rem === null) continue;
+      const utilization = Math.max(0, Math.min(1, 1 - rem));
+      if (rem <= 0) anyExhausted = true;
+      const resetStr = b.reset_time ?? b.resetTime;
+      const resetsAt = resetStr ? (Date.parse(resetStr) || 0) : 0;
+      const id = b.id || b.bucketId || b.label || b.displayName || 'quota';
+      const disabled = Boolean(b.disabled);
+      const description = typeof b.description === 'string' && b.description ? b.description : undefined;
+      windows.push({
+        id,
+        utilization,
+        resetsAt,
+        ...(disabled ? { disabled: true } : {}),
+        ...(description ? { description } : {}),
+      });
     }
   }
   if (!windows.length) return false;
@@ -1716,25 +1773,74 @@ function parseAgyLimitsOutput(parsed) {
   return true;
 }
 
-let refreshingLimits = false;
+/**
+ * Fetches quota directly from Cloud Code PA (`retrieveUserQuotaSummary`) in ~400ms using AGY's
+ * saved OAuth token, avoiding a 12-second `agy.bin -p /usage` subprocess spawn when possible.
+ */
+async function fetchDirectAgyQuota() {
+  if (process.env.CCM_LEGACY_PROTO === '1') return false;
+  if (process.env.FAKE_AGY_USAGE === '1' && !process.env.CCM_QUOTA_URL) return false;
+  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
+  if (!fs.existsSync(tokenPath)) return false;
+  let accessToken = null;
+  try {
+    const data = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
+    accessToken = data?.token?.access_token;
+  } catch { return false; }
+  if (!accessToken || typeof accessToken !== 'string') return false;
+  if (!process.env.CCM_QUOTA_URL && (accessToken === 'ya29.test' || accessToken.startsWith('ya29.fake'))) return false;
+  let project = 'default-cli-project';
+  try {
+    const p = fs.readFileSync(path.join(agyDataDir, 'cache', 'default_project_id.txt'), 'utf8').trim();
+    if (p) project = p;
+  } catch {}
+  const url = process.env.CCM_QUOTA_URL || 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary';
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': `antigravity/cli/1.2.7 (aidev_client; os_type=${process.platform}; arch=${process.arch}; cl=984112147; auth_method=consumer)`,
+      },
+      body: JSON.stringify({ project }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) return false;
+    const json = await res.json();
+    return parseAgyLimitsOutput(json);
+  } catch {
+    return false;
+  }
+}
+
+let limitsRefreshPromise = null;
 let lastLimitsRefresh = 0;
 function refreshAgyLimits(force = false) {
-  if (refreshingLimits) return Promise.resolve(limits);
-  if (!force && Date.now() - lastLimitsRefresh < 60_000) return Promise.resolve(limits);
-  refreshingLimits = true;
+  if (process.env.CCM_LEGACY_PROTO === '1') return Promise.resolve(limits);
+  if (limitsRefreshPromise) return limitsRefreshPromise;
+  if (!force && Date.now() - lastLimitsRefresh < 4_000) return Promise.resolve(limits);
   lastLimitsRefresh = Date.now();
-  return new Promise((resolve) => {
-    execFile(claudeBin, ['-p', '/usage', '--output-format', 'json'], {
-      timeout: 15_000,
-      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
-    }, (err, stdout) => {
-      refreshingLimits = false;
-      if (!err && stdout) {
-        try { parseAgyLimitsOutput(JSON.parse(stdout)); } catch {}
-      }
-      resolve(limits);
-    });
-  });
+  limitsRefreshPromise = (async () => {
+    try {
+      if (await fetchDirectAgyQuota()) return limits;
+      await new Promise((resolve) => {
+        execFile(claudeBin, ['-p', '/usage', '--output-format', 'json'], {
+          timeout: 15_000,
+          env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+        }, (err, stdout) => {
+          if (!err && stdout) {
+            try { parseAgyLimitsOutput(JSON.parse(stdout)); } catch {}
+          }
+          resolve();
+        });
+      });
+    } finally {
+      limitsRefreshPromise = null;
+    }
+    return limits;
+  })();
+  return limitsRefreshPromise;
 }
 
 // Token use per assistant message, read from bridge session logs and CLI transcripts.
@@ -1779,6 +1885,7 @@ function usageRecords(file, stat) {
       cwd: r.cwd ?? '',
       input: u.input_tokens ?? 0,
       output: (u.output_tokens ?? 0) + (u.thinking_tokens ?? 0),
+      thinking: u.thinking_tokens ?? 0,
       cacheRead: u.cache_read_input_tokens ?? u.cache_read_tokens ?? 0,
       cacheWrite: u.cache_creation_input_tokens ?? 0,
     });
@@ -1795,7 +1902,7 @@ function usageSummary(days, tzOffsetMin) {
   const today = Date.now();
   const byDay = new Map();
   for (let i = days - 1; i >= 0; i--) {
-    byDay.set(dayOf(today - i * 86_400_000), { date: dayOf(today - i * 86_400_000), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 });
+    byDay.set(dayOf(today - i * 86_400_000), { date: dayOf(today - i * 86_400_000), input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0, requests: 0 });
   }
   const since = Date.parse(byDay.keys().next().value + 'T00:00:00Z') - offset;
   const byModel = new Map();
@@ -1812,7 +1919,7 @@ function usageSummary(days, tzOffsetMin) {
       const d = byDay.get(dayOf(r.t));
       if (!d) continue;
       sessionFiles.add(file);
-      d.input += r.input; d.output += r.output; d.cacheRead += r.cacheRead; d.cacheWrite += r.cacheWrite; d.requests++;
+      d.input += r.input; d.output += r.output; d.thinking += r.thinking ?? 0; d.cacheRead += r.cacheRead; d.cacheWrite += r.cacheWrite; d.requests++;
       for (const [map, key] of [[byModel, r.model], [byProject, r.cwd]]) {
         const e = map.get(key) ?? { key, output: 0, input: 0, requests: 0 };
         e.output += r.output; e.input += r.input + r.cacheRead + r.cacheWrite; e.requests++;
@@ -1845,6 +1952,11 @@ function loadSessions() {
       s.updatedAt = meta.updatedAt ?? s.createdAt;
       s.lastActivity = meta.lastActivity ?? '';
       s.costUsd = meta.costUsd ?? 0;
+      s.inputTokens = meta.inputTokens ?? 0;
+      s.outputTokens = meta.outputTokens ?? 0;
+      s.thinkingTokens = meta.thinkingTokens ?? 0;
+      s.cacheReadTokens = meta.cacheReadTokens ?? 0;
+      s.requests = meta.requests ?? 0;
       s.started = !!meta.started;
       s.cliSize = meta.cliSize;
       try {
@@ -1853,6 +1965,14 @@ function loadSessions() {
         if (s.events.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
           s.costUsd = 0;
           for (const e of s.events) if (e.type === 'result') s.addCost(e.total_cost_usd);
+        }
+        if (s.events.some((e) => e.type === 'assistant' && e.message?.usage)) {
+          s.inputTokens = 0; s.outputTokens = 0; s.thinkingTokens = 0; s.cacheReadTokens = 0; s.requests = 0;
+          for (const e of s.events) {
+            if (e.type === 'assistant' && e.message?.model !== '<synthetic>' && e.message?.usage) {
+              s.addUsage(e.message.usage);
+            }
+          }
         }
         const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
         if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
@@ -2344,7 +2464,7 @@ class Client {
         this.send({ ev: 'hello', version: VERSION, host: os.hostname(), platform: process.platform, roots: opts.roots, root: rootAvailable });
         this.send({ ev: 'sessions', sessions: [...sessions.values()].map((s) => s.summary()) });
         if (limits) this.send({ ev: 'limits', limits });
-        else refreshAgyLimits();
+        refreshAgyLimits(false);
         for (const s of sessions.values()) for (const req of s.pending.values()) this.send({ ev: 'approval', sid: s.id, title: s.title, request: req });
       } else {
         this.send({ ev: 'error', message: 'Unauthorized' });
@@ -2436,7 +2556,7 @@ class Client {
         break;
       }
       case 'usage': {
-        await refreshAgyLimits();
+        await refreshAgyLimits(true);
         this.send({ ev: 'usage', ref, limits, ...usageSummary(msg.days, msg.tzOffsetMin) });
         break;
       }
@@ -2514,6 +2634,11 @@ function resumeDue() { for (const s of sessions.values()) s.resumeIfDue(); }
 resumeDue();
 setInterval(resumeDue, RESUME_CHECK_MS);
 setInterval(updatePorts, PORTS_CHECK_MS);
+setInterval(() => {
+  if (clients.size > 0 && [...sessions.values()].some((s) => s.status === 'working')) {
+    refreshAgyLimits(false);
+  }
+}, 15_000).unref();
 rootAvailable = await detectRoot();
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {

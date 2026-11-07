@@ -76,6 +76,7 @@ import app.ccmobile.data.SessionSummary
 import app.ccmobile.data.ToolItem
 import app.ccmobile.data.ToolState
 import app.ccmobile.data.TurnEndItem
+import app.ccmobile.data.UsageText
 import app.ccmobile.data.UserItem
 import app.ccmobile.data.VoiceInput
 
@@ -88,6 +89,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
     val sessions by repository.sessions.collectAsStateWithLifecycle()
     val allItems by repository.items.collectAsStateWithLifecycle()
     val approvals by repository.approvals.collectAsStateWithLifecycle()
+    val limits by repository.limits.collectAsStateWithLifecycle()
     val session = sessions.firstOrNull { it.id == sid }
     val items = allItems[sid]
     val approval = approvals.firstOrNull { it.sid == sid }
@@ -109,10 +111,37 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             Column(Modifier.weight(1f)) {
                 Text(session?.title ?: "Task", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    listOfNotNull(session?.let { statusStyle(it.status).label }, session?.repoName, session?.effort?.let { "${effortLabel(it)} effort" }, session?.costUsd?.takeIf { it > 0 }?.let { "$%.2f API".format(it) })
-                        .joinToString(" · "),
-                    color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1,
+                    listOfNotNull(
+                        session?.let { statusStyle(it.status).label },
+                        session?.repoName,
+                        session?.model?.takeIf { it.isNotBlank() }?.let(::modelLabel),
+                        session?.effort?.let { "${effortLabel(it)} effort" },
+                    ).joinToString(" · "),
+                    color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+                val modelWindow = remember(session?.model, limits) {
+                    limits?.windows?.let { UsageText.windowForModel(session?.model, it) }
+                }
+                val usageLine = remember(session?.outputTokens, session?.readTokens, session?.costUsd, modelWindow) {
+                    buildList {
+                        if ((session?.costUsd ?: 0.0) > 0) add("$%.2f API".format(session!!.costUsd))
+                        if ((session?.outputTokens ?: 0L) > 0 || (session?.readTokens ?: 0L) > 0) {
+                            add("${UsageText.compact(session?.outputTokens ?: 0L)} out")
+                            if ((session?.readTokens ?: 0L) > 0) add("${UsageText.compact(session!!.readTokens)} in")
+                        }
+                        if (modelWindow != null) {
+                            add("${UsageText.percent(modelWindow.utilization)} quota")
+                        }
+                    }.joinToString(" · ")
+                }
+                if (usageLine.isNotEmpty()) {
+                    val quotaTone = when {
+                        modelWindow != null && (modelWindow.utilization >= 1.0 || modelWindow.disabled) -> C.Red
+                        modelWindow != null && modelWindow.utilization >= 0.8 -> C.Amber
+                        else -> C.Muted
+                    }
+                    Text(usageLine, color = quotaTone, fontSize = 11.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
                 if (session?.mode == YOLO) Text("YOLO · runs without asking", color = C.Red, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
                 session?.background?.takeIf { it.isNotEmpty() }?.let { jobs ->
                     Text(
@@ -121,18 +150,23 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                     )
                 }
             }
-            if (working) IconBtn(R.drawable.ic_stop, "Interrupt Claude", { repository.interrupt(sid) })
+            if (working) IconBtn(R.drawable.ic_stop, "Interrupt AGY", { repository.interrupt(sid) })
             val startVoice = rememberWithMic({ repository.reportError("Voice mode needs access to the microphone.") }) { voiceMode = true }
             IconBtn(
-                R.drawable.ic_voice, if (voiceMode) "End voice mode" else "Voice mode: talk with Claude",
+                R.drawable.ic_voice, if (voiceMode) "End voice mode" else "Voice mode: talk with AGY",
                 { if (voiceMode) voiceMode = false else startVoice() }, tint = if (voiceMode) C.ClayText else C.Text,
             )
             var menu by remember { mutableStateOf(false) }
+            var modelMenu by remember { mutableStateOf(false) }
             var effortMenu by remember { mutableStateOf(false) }
             var moving by remember { mutableStateOf(false) }
             if (moving && session != null) MoveFolderDialog(repository, session) { moving = false }
             Box {
                 IconBtn(R.drawable.ic_more, "More options", { menu = true })
+                DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
+                    MenuHeading("Model, from the next reply")
+                    ModelItems(session?.model.orEmpty()) { modelMenu = false; repository.setModel(sid, it) }
+                }
                 DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
                     MenuHeading("Reasoning effort, from the next reply")
                     EffortItems(session?.effort.orEmpty()) { effortMenu = false; repository.setEffort(sid, it) }
@@ -146,6 +180,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                             onClick = { menu = false; repository.setMode(sid, YOLO) },
                         )
                     }
+                    DropdownMenuItem(
+                        text = { Text("Model: ${modelLabel(session?.model)}") },
+                        onClick = { menu = false; modelMenu = true },
+                    )
                     DropdownMenuItem(
                         text = { Text("Reasoning effort: ${effortLabel(session?.effort)}") },
                         onClick = { menu = false; effortMenu = true },
@@ -215,6 +253,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 voice = repository.voice, sid = sid,
                 text = draft, onText = { draft = it; repository.settings.setDraft(sid, it) },
                 attachments = repository.draftAttachments(sid),
+                model = session?.model.orEmpty(), onModel = { repository.setModel(sid, it) },
                 effort = session?.effort.orEmpty(), onEffort = { repository.setEffort(sid, it) },
                 onSend = { text, files -> repository.sendMessage(sid, text, files) }, onError = repository::reportError,
             )
@@ -245,9 +284,9 @@ private fun TranscriptItem(item: Item, onDiff: () -> Unit, loadImage: ImageLoade
         is PermissionItem -> {
             val asking = item.approval.questions.isNotEmpty()
             val (text, color) = when {
-                asking && item.decision == null -> "Claude is asking: ${item.approval.questions.first().question}" to C.ClayPill
-                asking && item.decision == "allow" -> "You replied to Claude\u2019s question" to C.Muted
-                asking -> "Claude\u2019s question was withdrawn" to C.Faint
+                asking && item.decision == null -> "AGY is asking: ${item.approval.questions.first().question}" to C.ClayPill
+                asking && item.decision == "allow" -> "You replied to AGY\u2019s question" to C.Muted
+                asking -> "AGY\u2019s question was withdrawn" to C.Faint
                 else -> when (item.decision) {
                 null -> "Waiting for your approval: ${item.approval.toolName}" to C.ClayPill
                 "allow" -> "You allowed ${item.approval.toolName}" to C.Muted
@@ -337,7 +376,7 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             CcIcon(R.drawable.ic_shield, C.Clay, 18.dp)
             Text(
-                if (plan) "Claude has a plan and wants to start" else "Claude wants to use ${approval.toolName}",
+                if (plan) "AGY has a plan and wants to start" else "AGY wants to use ${approval.toolName}",
                 color = C.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
             )
         }
@@ -360,19 +399,37 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
 private fun ReplyBar(
     voice: VoiceInput, sid: String,
     text: String, onText: (String) -> Unit, attachments: SnapshotStateList<PendingAttachment>,
+    model: String, onModel: (String) -> Unit,
     effort: String, onEffort: (String) -> Unit,
     onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit,
 ) {
-    // Effort applies from the next reply, so it sits with the message box rather than in a menu.
+    // Model and effort apply from the next reply, so they sit with the message box as well as in the menu.
+    var modelMenu by remember { mutableStateOf(false) }
     var effortMenu by remember { mutableStateOf(false) }
-    Box(Modifier.padding(start = 12.dp, top = 8.dp)) {
-        Chip(
-            if (effort.isEmpty()) "Default effort" else "${effortLabel(effort)} effort",
-            onClick = { effortMenu = true }, on = effort.isNotEmpty(),
-        )
-        DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
-            MenuHeading("Reasoning effort, from the next reply")
-            EffortItems(effort) { effortMenu = false; onEffort(it) }
+    Row(
+        Modifier.padding(start = 12.dp, top = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box {
+            Chip(
+                if (model.isEmpty()) "Default model" else modelLabel(model),
+                onClick = { modelMenu = true }, on = model.isNotEmpty(),
+            )
+            DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
+                MenuHeading("Model, from the next reply")
+                ModelItems(model) { modelMenu = false; onModel(it) }
+            }
+        }
+        Box {
+            Chip(
+                if (effort.isEmpty()) "Default effort" else "${effortLabel(effort)} effort",
+                onClick = { effortMenu = true }, on = effort.isNotEmpty(),
+            )
+            DropdownMenu(expanded = effortMenu, onDismissRequest = { effortMenu = false }) {
+                MenuHeading("Reasoning effort, from the next reply")
+                EffortItems(effort) { effortMenu = false; onEffort(it) }
+            }
         }
     }
     AttachmentChips(attachments, Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp))
@@ -380,11 +437,11 @@ private fun ReplyBar(
         Box(Modifier.height(52.dp), contentAlignment = Alignment.Center) { AttachButton(attachments, onError) }
         TextField(
             value = text, onValueChange = onText,
-            placeholder = { Text("Steer Claude, or /command…", color = C.Faint) },
+            placeholder = { Text("Steer AGY, or /command…", color = C.Faint) },
             trailingIcon = { MicButton(voice, owner = sid, sid = sid, text = text, onText = onText, onError = onError, size = 40.dp) },
             maxLines = 6,
             textStyle = TextStyle(fontSize = 15.sp, color = C.Text),
-            modifier = Modifier.weight(1f).border(1.dp, C.Surface3, RoundedCornerShape(16.dp)).semantics { contentDescription = "Message Claude" },
+            modifier = Modifier.weight(1f).border(1.dp, C.Surface3, RoundedCornerShape(16.dp)).semantics { contentDescription = "Message AGY" },
             shape = RoundedCornerShape(16.dp),
             colors = TextFieldDefaults.colors(
                 focusedContainerColor = C.Surface, unfocusedContainerColor = C.Surface,
@@ -408,7 +465,7 @@ private fun ReplyBar(
     }
 }
 
-/** Shown while a usage limit pauses the task: when it resets, and whether Claude continues then. */
+/** Shown while a usage limit pauses the task: when it resets, and whether AGY continues then. */
 @Composable
 private fun LimitBanner(session: SessionSummary, onAutoContinue: (Boolean) -> Unit) {
     val at = session.resumeAt?.let { resetTime(it) }
@@ -428,7 +485,7 @@ private fun LimitBanner(session: SessionSummary, onAutoContinue: (Boolean) -> Un
             Text(session.lastActivity.ifBlank { "Usage limit reached" }, color = C.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
             Text(
                 when {
-                    session.autoContinue && at != null -> "Claude continues by itself at $at."
+                    session.autoContinue && at != null -> "AGY continues by itself at $at."
                     at != null -> "Resets around $at. Send a message then, or continue automatically."
                     else -> "Send a message to try again."
                 },
@@ -459,7 +516,7 @@ private fun MoveFolderDialog(repository: Repository, session: SessionSummary, on
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Claude carries on in the new folder from your next message, in the same conversation. Its project memory is the new folder\u2019s.",
+                    "AGY carries on in the new folder from your next message, in the same conversation. Its project memory is the new folder\u2019s.",
                     color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp,
                 )
                 OutlinedTextField(
@@ -499,7 +556,7 @@ private fun MoveFolderDialog(repository: Repository, session: SessionSummary, on
     )
 }
 
-/** Claude's questions (AskUserQuestion): pick an option, several where allowed, or write your own answer. */
+/** AGY's questions (ask_question / AskUserQuestion): pick an option, several where allowed, or write your own answer. */
 @Composable
 private fun QuestionCard(approval: Approval, onSend: (Map<String, String>) -> Unit, onSkip: () -> Unit) {
     val picks = remember(approval.requestId) { mutableStateMapOf<Int, Set<String>>() }
@@ -523,7 +580,7 @@ private fun QuestionCard(approval: Approval, onSend: (Map<String, String>) -> Un
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(if (approval.questions.size == 1) "Claude has a question" else "Claude has ${approval.questions.size} questions",
+        Text(if (approval.questions.size == 1) "AGY has a question" else "AGY has ${approval.questions.size} questions",
             color = C.ClayText, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         approval.questions.forEachIndexed { i, q ->
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {

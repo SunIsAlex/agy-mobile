@@ -135,4 +135,30 @@ class TranscriptTest {
         assertEquals(listOf("Red" to "Warm", "Blue" to "Cool"), a.questions[0].options.map { it.label to it.description })
         assertEquals(false, a.questions[0].multiSelect)
     }
+
+    @Test
+    fun agyStreamEventsToolsAndQuestions() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"stream_event","step_index":1,"text_delta":"Checking "}"""))
+        t.apply(msg("""{"type":"stream_event","step_index":1,"text_delta":"files..."}"""))
+        val live = t.snapshot().single() as AssistantItem
+        assertEquals("Checking files...", live.text)
+        assertTrue(live.streaming)
+
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"text","text":"Checking files..."}]}}"""))
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-2","name":"replace_file_content","input":{"TargetFile":"/r/app/Main.kt","TargetContent":"old","ReplacementContent":"new1\nnew2"}}]}}"""))
+        val tool = t.snapshot().filterIsInstance<ToolItem>().single()
+        assertEquals("app/Main.kt", tool.summary)
+        assertEquals(2 to 1, tool.delta)
+
+        val qReq = msg("""{"type":"control_request","request_id":"q-2","request":{"subtype":"can_use_tool","tool_name":"ask_question","input":{"questions":[{"question":"Pick targets","is_multi_select":true,"options":["Android","Chroot"]}]}}}""")
+        val qa = approvalFrom("s", "Task", qReq)!!
+        assertEquals(true, qa.questions[0].multiSelect)
+        assertEquals(listOf("Android" to "", "Chroot" to ""), qa.questions[0].options.map { it.label to it.description })
+
+        t.apply(msg("""{"type":"assistant","message":{"content":[],"usage":{"input_tokens":2000,"output_tokens":900,"thinking_tokens":300,"cache_read_input_tokens":10000}}}"""))
+        t.apply(msg("""{"type":"result","subtype":"success","is_error":false,"duration_ms":3000,"total_cost_usd":0}"""))
+        val end = t.snapshot().last() as TurnEndItem
+        assertEquals("Done · 3s · 1.2k out · 12k in", end.text)
+    }
 }

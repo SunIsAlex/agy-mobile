@@ -75,6 +75,7 @@ import app.ccmobile.data.PendingAttachment
 import app.ccmobile.data.Repo
 import app.ccmobile.data.Repository
 import app.ccmobile.data.SessionSummary
+import app.ccmobile.data.UsageText
 import kotlinx.coroutines.launch
 
 @Composable
@@ -146,11 +147,13 @@ fun TasksScreen(
                 onNewFolder = { newFolder = true }.takeIf { conn is ConnState.Connected && roots.isNotEmpty() },
                 modifier = Modifier.weight(1f),
             )
-            // Tinted when a plan limit is nearly used, so it shows before a task stalls on it.
+            // Tinted when the selected model's plan limit is nearly used, so it shows before a task stalls on it.
             val now = System.currentTimeMillis()
-            val peak = limits?.windows?.filter { it.resetsAt > now }?.maxOfOrNull { it.utilization } ?: 0.0
+            val activeWindows = limits?.windows?.filter { it.resetsAt <= 0 || it.resetsAt > now }.orEmpty()
+            val modelWin = UsageText.windowForModel(model.ifBlank { active.firstOrNull()?.model }, activeWindows)
+            val peak = modelWin?.utilization ?: 0.0
             IconBtn(
-                R.drawable.ic_gauge, if (peak >= 0.8) "Usage, ${Math.round(peak * 100)}% of a limit used" else "Usage", onUsage,
+                R.drawable.ic_gauge, if (peak >= 0.8) "Usage, ${UsageText.percent(peak)} of limit used" else "Usage", onUsage,
                 tint = if (peak >= 1.0) C.Red else if (peak >= 0.8) C.Amber else C.Text,
             )
             IconBtn(R.drawable.ic_terminal, "Debian terminal", onTerminal)
@@ -189,8 +192,8 @@ fun TasksScreen(
                 if (list.isNullOrEmpty()) {
                     item {
                         Text(
-                            if (list == null) "Loading Claude Code sessions…"
-                            else "No other Claude Code sessions on the bridge's machine. Sessions you start with claude in a terminal show up here.",
+                            if (list == null) "Loading AGY sessions…"
+                            else "No other AGY sessions on the bridge's machine. Sessions you start with agy in a terminal show up here.",
                             color = C.Faint, fontSize = 14.sp, modifier = Modifier.padding(24.dp),
                         )
                     }
@@ -461,6 +464,9 @@ private fun TaskRow(s: SessionSummary, host: String, onClick: () -> Unit, onArch
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusPill(s.status)
                 Text(relativeTime(s.updatedAt), color = C.Faint, fontSize = 12.sp)
+                if (s.outputTokens > 0) {
+                    Text("· ${UsageText.compact(s.outputTokens)} out", color = C.Faint, fontSize = 12.sp, fontFamily = Mono)
+                }
                 Spacer(Modifier.weight(1f))
                 s.ports.forEach { PortChip(it, host) }
             }
@@ -512,6 +518,18 @@ fun MenuHeading(text: String) {
         text.uppercase(), color = C.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.8.sp,
         modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 4.dp),
     )
+}
+
+/** Models as menu items; [selected] is ticked. */
+@Composable
+fun ModelItems(selected: String, onSelect: (String) -> Unit) {
+    modelLabels.forEach { (value, label) ->
+        DropdownMenuItem(
+            text = { Text(if (value.isEmpty()) "Default model" else label, fontWeight = FontWeight.Medium) },
+            onClick = { onSelect(value) },
+            trailingIcon = { if (value == selected) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
+        )
+    }
 }
 
 /** Effort levels as menu items, with what each one means; [selected] is ticked. */

@@ -39,6 +39,8 @@ class Transcript(private val sid: String, private val title: String) {
     private val live = StringBuilder()
     private var counter = 0
     private var lastCost = 0.0 // the session's running total at the previous result
+    private var turnInput = 0L
+    private var turnOutput = 0L
 
     fun snapshot(): List<Item> = items.toList()
 
@@ -50,7 +52,7 @@ class Transcript(private val sid: String, private val title: String) {
         if (parent != null && parent !is JsonNull) return
 
         when (msg.str("type")) {
-            "stream_event" -> onStreamEvent(msg.obj("event") ?: return)
+            "stream_event" -> onStreamEvent(msg)
             "assistant" -> onAssistant(msg)
             "user" -> onUser(msg)
             "control_request" -> approvalFrom(sid, title, msg)?.let { add(PermissionItem(it.requestId, it)) }
@@ -74,13 +76,24 @@ class Transcript(private val sid: String, private val title: String) {
                 val total = msg.num("total_cost_usd") ?: 0.0
                 val cost = if (total >= lastCost) total - lastCost else total
                 if (total > 0) lastCost = total
+                val resUsage = msg.obj("usage")
+                val resOut = resUsage?.let { ((it.num("output_tokens") ?: 0.0) + (it.num("thinking_tokens") ?: 0.0)).toLong() } ?: 0L
+                val resIn = resUsage?.let { ((it.num("input_tokens") ?: 0.0) + (it.num("cache_read_input_tokens") ?: it.num("cache_read_tokens") ?: 0.0)).toLong() } ?: 0L
+                val outTokens = turnOutput.takeIf { it > 0 } ?: resOut
+                val inTokens = turnInput.takeIf { it > 0 } ?: resIn
+                turnOutput = 0L
+                turnInput = 0L
+                val tokenSummary = listOfNotNull(
+                    outTokens.takeIf { it > 0 }?.let { "${UsageText.compact(it)} out" },
+                    inTokens.takeIf { it > 0 }?.let { "${UsageText.compact(it)} in" },
+                ).joinToString(" · ").takeIf { it.isNotEmpty() }
                 val text = if (error) {
                     "Stopped: " + (msg.str("result") ?: msg.str("subtype") ?: "error")
                 } else {
                     listOfNotNull(
                         "Done",
                         if (seconds > 0) "%.0fs".format(seconds) else null,
-                        cost.takeIf { it >= 0.005 }?.let { "$%.2f".format(it) },
+                        cost.takeIf { it >= 0.005 }?.let { "$%.2f".format(it) } ?: tokenSummary,
                     ).joinToString(" · ")
                 }
                 add(TurnEndItem(nextKey(), text, error))
@@ -88,7 +101,14 @@ class Transcript(private val sid: String, private val title: String) {
         }
     }
 
-    private fun onStreamEvent(event: JsonObject) {
+    private fun onStreamEvent(msg: JsonObject) {
+        val directDelta = msg.str("text_delta")
+        if (directDelta != null) {
+            live.append(directDelta)
+            upsert(AssistantItem(LIVE_KEY, live.toString(), streaming = true))
+            return
+        }
+        val event = msg.obj("event") ?: return
         when (event.str("type")) {
             "message_start" -> live.clear()
             "content_block_delta" -> {
@@ -102,7 +122,15 @@ class Transcript(private val sid: String, private val title: String) {
     }
 
     private fun onAssistant(msg: JsonObject) {
-        val content = msg.obj("message")?.arr("content") ?: return
+        val message = msg.obj("message") ?: return
+        message.obj("usage")?.let { u ->
+            val inp = (u.num("input_tokens") ?: 0.0).toLong()
+            val cache = (u.num("cache_read_input_tokens") ?: u.num("cache_read_tokens") ?: 0.0).toLong()
+            val out = (u.num("output_tokens") ?: 0.0).toLong() + (u.num("thinking_tokens") ?: 0.0).toLong()
+            turnInput += inp + cache
+            turnOutput += out
+        }
+        val content = message.arr("content") ?: return
         for (block in content) {
             block as? JsonObject ?: continue
             when (block.str("type")) {
@@ -125,11 +153,17 @@ class Transcript(private val sid: String, private val title: String) {
         // Notes Claude Code adds for the model (an image's size, say), not the user's words.
         if (msg.bool("isSynthetic") == true) return
         when (val content = msg.obj("message")?.get("content")) {
-            is JsonPrimitive -> add(UserItem(nextKey(), content.content, attachmentNames(msg)))
+            is JsonPrimitive -> {
+                turnInput = 0L; turnOutput = 0L
+                add(UserItem(nextKey(), content.content, attachmentNames(msg)))
+            }
             is kotlinx.serialization.json.JsonArray -> for (block in content) {
                 block as? JsonObject ?: continue
                 when (block.str("type")) {
-                    "text" -> add(UserItem(nextKey(), block.str("text").orEmpty()))
+                    "text" -> {
+                        turnInput = 0L; turnOutput = 0L
+                        add(UserItem(nextKey(), block.str("text").orEmpty()))
+                    }
                     "tool_result" -> {
                         val id = block.str("tool_use_id") ?: continue
                         val index = items.indexOfFirst { it.key == id }

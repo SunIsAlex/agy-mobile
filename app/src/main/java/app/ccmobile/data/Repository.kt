@@ -64,6 +64,9 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     private val _limits = MutableStateFlow<Limits?>(null)
     /** Plan limits as of Claude's last reply; null until the bridge has seen one. */
     val limits: StateFlow<Limits?> = _limits.asStateFlow()
+    private val _usageTick = MutableStateFlow(0L)
+    /** Bumped whenever token usage or plan limits change on the bridge. */
+    val usageTick: StateFlow<Long> = _usageTick.asStateFlow()
     private val _approvals = MutableStateFlow<List<Approval>>(emptyList())
     val approvals: StateFlow<List<Approval>> = _approvals.asStateFlow()
     private val _items = MutableStateFlow<Map<String, List<Item>>>(emptyMap())
@@ -174,9 +177,10 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     }
 
     /** Token use over the last [days] days, bucketed by this phone's calendar days. */
-    suspend fun loadUsage(days: Int): Usage? {
+    suspend fun loadUsage(days: Int, quiet: Boolean = false): Usage? {
         val tzOffsetMin = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
-        val reply = request("usage", "days" to days, "tzOffsetMin" to tzOffsetMin) ?: return null
+        val reply = call("usage", quiet = quiet, "days" to days, "tzOffsetMin" to tzOffsetMin)
+            ?.takeUnless { it.str("ev") == "error" } ?: return null
         reply.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
         return json.decodeFromJsonElement(Usage.serializer(), reply)
     }
@@ -272,6 +276,8 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
     fun reportError(message: String) { _errors.tryEmit(message) }
     fun interrupt(sid: String) = fire("interrupt", "sid" to sid)
     fun setMode(sid: String, mode: String) = fire("mode", "sid" to sid, "mode" to mode)
+    /** Changes model from the next turn; blank goes back to the default model. */
+    fun setModel(sid: String, model: String) = fire("model", "sid" to sid, "model" to model.ifBlank { null })
     /** Changes effort from the next turn; blank goes back to the model's default. */
     fun setEffort(sid: String, effort: String) = fire("effort", "sid" to sid, "effort" to effort.ifBlank { null })
     fun stop(sid: String) = fire("stop", "sid" to sid)
@@ -371,7 +377,13 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
                 json.decodeFromJsonElement(ListSerializer(ClaudeSession.serializer()), ev["sessions"]!!)
             "term_output", "term_exit", "term_link" -> { _terminal.tryEmit(ev); return }
             "voice" -> { voice.onEvent(ev); return }
-            "limits" -> ev.obj("limits")?.let { _limits.value = json.decodeFromJsonElement(Limits.serializer(), it) }
+            "limits" -> ev.obj("limits")?.let {
+                _limits.value = json.decodeFromJsonElement(Limits.serializer(), it)
+                _usageTick.value = System.currentTimeMillis()
+            }
+            "usage_tick" -> {
+                _usageTick.value = System.currentTimeMillis()
+            }
             "repos" -> _repos.value = json.decodeFromJsonElement(ListSerializer(Repo.serializer()), ev["repos"]!!)
             "history" -> {
                 val sid = ev.str("sid") ?: return
@@ -387,6 +399,9 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
                 transcript.apply(msg)
                 if (msg.str("type") == "control_cancel_request") {
                     _approvals.update { list -> list.filterNot { it.requestId == msg.str("request_id") } }
+                }
+                if (msg.str("type") == "result" || msg.obj("message")?.obj("usage") != null) {
+                    _usageTick.value = System.currentTimeMillis()
                 }
                 _items.update { it + (sid to transcript.snapshot()) }
             }
