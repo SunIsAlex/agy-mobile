@@ -140,7 +140,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                         modelWindow != null && modelWindow.utilization >= 0.8 -> C.Amber
                         else -> C.Muted
                     }
-                    Text(usageLine, color = quotaTone, fontSize = 11.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(usageLine, color = quotaTone, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 if (session?.mode == YOLO) Text("YOLO · runs without asking", color = C.Red, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
                 session?.background?.takeIf { it.isNotEmpty() }?.let { jobs ->
@@ -341,12 +341,14 @@ private fun ToolRow(item: ToolItem, onDiff: () -> Unit, loadImage: ImageLoader, 
             ToolImages(item.images, loadImage, onImage, Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp))
         }
         if (expanded && !item.output.isNullOrBlank()) {
-            CodeBlock(
-                item.output.take(2000),
-                modifier = Modifier.heightIn(max = 260.dp).verticalScroll(rememberScrollState()),
-                color = if (item.state == ToolState.Failed) C.DelText else C.Muted,
-                padding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-            )
+            SelectionContainer {
+                CodeBlock(
+                    item.output.take(2000),
+                    modifier = Modifier.heightIn(max = 260.dp).verticalScroll(rememberScrollState()),
+                    color = if (item.state == ToolState.Failed) C.DelText else C.Muted,
+                    padding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                )
+            }
         }
     }
 }

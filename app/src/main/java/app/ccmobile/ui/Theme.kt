@@ -1,12 +1,16 @@
 package app.ccmobile.ui
 
 import android.content.res.Configuration
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -138,5 +142,13 @@ fun CcTheme(content: @Composable () -> Unit) {
             outline = p.borderStrong, outlineVariant = p.border, error = p.red,
         )
     }
-    MaterialTheme(colorScheme = scheme, content = content)
+    val selectionColors = remember(p) {
+        TextSelectionColors(
+            handleColor = p.clay,
+            backgroundColor = p.clay.copy(alpha = if (p.dark) 0.42f else 0.34f),
+        )
+    }
+    MaterialTheme(colorScheme = scheme) {
+        CompositionLocalProvider(LocalTextSelectionColors provides selectionColors, content = content)
+    }
 }
