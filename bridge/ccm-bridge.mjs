@@ -641,6 +641,7 @@ class Session {
     const minActiveStep = Math.min(...this.emittedTools);
     let maxTranscriptStep = -1;
     let taskKilled = false;
+    let minActiveStepDone = false;
     try {
       const stat = fs.statSync(file);
       const readLen = Math.min(stat.size, 65536);
@@ -658,19 +659,36 @@ class Session {
             if (r.step_index > minActiveStep && line.includes('manage_task') && line.includes('kill')) {
               taskKilled = true;
             }
+            if (r.step_index === minActiveStep && r.type === 'GENERIC' && r.status === 'DONE') {
+              minActiveStepDone = true;
+            }
+            if (
+              r.step_index > minActiveStep &&
+              r.type === 'SYSTEM_MESSAGE' &&
+              typeof r.content === 'string' &&
+              r.content.includes(`/task-${minActiveStep}"`) &&
+              (r.content.includes('finished with result:') || r.content.includes('was canceled'))
+            ) {
+              minActiveStepDone = true;
+            }
           }
         } catch {}
       }
     } catch {}
 
-    if (maxTranscriptStep > minActiveStep) {
+    const forcedGraceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : null;
+    const isStuck =
+      maxTranscriptStep > minActiveStep &&
+      (forcedGraceMs !== null || taskKilled || minActiveStepDone || maxTranscriptStep >= minActiveStep + 4);
+
+    if (isStuck) {
       const now = Date.now();
       if (!this.stuckToolDetectedAt) {
         this.stuckToolDetectedAt = now;
         return;
       }
-      const defaultGraceMs = taskKilled ? 2_000 : (maxTranscriptStep >= minActiveStep + 4 ? 15_000 : 180_000);
-      const graceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : defaultGraceMs;
+      const defaultGraceMs = taskKilled ? 2_000 : (minActiveStepDone ? 3_000 : 10_000);
+      const graceMs = forcedGraceMs ?? defaultGraceMs;
       if (now - this.stuckToolDetectedAt >= graceMs) {
         const descendants = findDescendantPids(claudePid);
         if (descendants.length > 0) {
@@ -2128,7 +2146,7 @@ function signalProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
-/** Recursively returns all process IDs that descend from rootPid. */
+/** Recursively returns all tool subprocess IDs that descend from rootPid (excluding agy.bin and its proxy). */
 function findDescendantPids(rootPid) {
   if (!rootPid) return [];
   const childrenOf = new Map();
@@ -2143,11 +2161,19 @@ function findDescendantPids(rootPid) {
       } catch {}
     }
   } catch {}
+  const isAgyRuntime = (pid) => {
+    try {
+      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+      return /(?:^|\/|\0)(?:agy\.bin|termux-http-proxy|dns-proxy)(?:\0|$)/.test(cmd);
+    } catch {
+      return false;
+    }
+  };
   const res = [];
   const queue = [...(childrenOf.get(rootPid) ?? [])];
   while (queue.length) {
     const p = queue.shift();
-    res.push(p);
+    if (!isAgyRuntime(p)) res.push(p);
     const ch = childrenOf.get(p);
     if (ch) queue.push(...ch);
   }
