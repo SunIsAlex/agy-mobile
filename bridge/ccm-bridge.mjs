@@ -410,7 +410,7 @@ class Session {
     const cacheRead = Number(u.cache_read_input_tokens ?? u.cache_read_tokens) || 0;
     if (!inp && !out && !think && !cacheRead) return false;
     this.inputTokens += inp;
-    this.outputTokens += out + think;
+    this.outputTokens += out >= think ? out : out + think;
     this.thinkingTokens += think;
     this.cacheReadTokens += cacheRead;
     this.requests += 1;
@@ -435,8 +435,11 @@ class Session {
   }
 
   record(msg) {
-    this.events.push(msg);
-    if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
+    const isEmptyAssistant = msg?.type === 'assistant' && Array.isArray(msg.message?.content) && msg.message.content.length === 0;
+    if (!isEmptyAssistant) {
+      this.events.push(msg);
+      if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
+    }
     const u = msg?.type === 'assistant' && msg.message?.model !== '<synthetic>' ? msg.message?.usage : null;
     if (u) {
       try { fs.appendFileSync(this.logFile, JSON.stringify(msg) + '\n'); } catch {}
@@ -1878,14 +1881,16 @@ function usageRecords(file, stat) {
     try { r = JSON.parse(line); } catch { continue; }
     const u = r.message?.usage;
     if (r.type !== 'assistant' || !u || r.message.model === '<synthetic>') continue;
+    const outTok = u.output_tokens ?? 0;
+    const thinkTok = u.thinking_tokens ?? 0;
     records.push({
       id: r.message.id ?? r.requestId ?? r.uuid,
       t: Date.parse(r.timestamp) || stat.mtimeMs || 0,
       model: r.message.model ?? 'unknown',
       cwd: r.cwd ?? '',
       input: u.input_tokens ?? 0,
-      output: (u.output_tokens ?? 0) + (u.thinking_tokens ?? 0),
-      thinking: u.thinking_tokens ?? 0,
+      output: outTok >= thinkTok ? outTok : outTok + thinkTok,
+      thinking: thinkTok,
       cacheRead: u.cache_read_input_tokens ?? u.cache_read_tokens ?? 0,
       cacheWrite: u.cache_creation_input_tokens ?? 0,
     });
@@ -1960,22 +1965,25 @@ function loadSessions() {
       s.started = !!meta.started;
       s.cliSize = meta.cliSize;
       try {
-        const lines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean).slice(-MAX_EVENTS);
-        s.events = lines.map((l) => slimEvent(JSON.parse(l), s.id));
-        if (s.events.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
+        const allLines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean);
+        const parsedAll = allLines.map((l) => slimEvent(JSON.parse(l), s.id));
+        if (parsedAll.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
           s.costUsd = 0;
-          for (const e of s.events) if (e.type === 'result') s.addCost(e.total_cost_usd);
+          for (const e of parsedAll) if (e.type === 'result') s.addCost(e.total_cost_usd);
         }
-        if (s.events.some((e) => e.type === 'assistant' && e.message?.usage)) {
+        if (parsedAll.some((e) => e.type === 'assistant' && e.message?.usage)) {
           s.inputTokens = 0; s.outputTokens = 0; s.thinkingTokens = 0; s.cacheReadTokens = 0; s.requests = 0;
-          for (const e of s.events) {
+          for (const e of parsedAll) {
             if (e.type === 'assistant' && e.message?.model !== '<synthetic>' && e.message?.usage) {
               s.addUsage(e.message.usage);
             }
           }
         }
-        const slim = s.events.map((e) => JSON.stringify(e) + '\n').join('');
-        if (slim.length < lines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
+        const slim = parsedAll.map((e) => JSON.stringify(e) + '\n').join('');
+        if (slim.length < allLines.reduce((n, l) => n + l.length + 1, 0)) fs.writeFileSync(s.logFile, slim);
+        s.events = parsedAll
+          .filter((e) => !(e.type === 'assistant' && Array.isArray(e.message?.content) && e.message.content.length === 0))
+          .slice(-MAX_EVENTS);
       } catch {}
       sessions.set(s.id, s);
       // agy still running under a keeper from before the restart (or finished meanwhile):

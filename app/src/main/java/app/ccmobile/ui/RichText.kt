@@ -11,6 +11,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.TextUnit
@@ -22,7 +23,7 @@ private data class Prose(val text: String) : Block
 private data class Fence(val code: String) : Block
 private data class Heading(val text: String) : Block
 
-/** Just enough Markdown for Claude's replies: fenced code, headings, `code`, **bold**, and [links](url). */
+/** Just enough Markdown for Claude's replies: fenced code, headings, `code`, **bold**, *italic*, and [links](url). */
 @Composable
 fun RichText(text: String) {
     val blocks = remember(text) { parseBlocks(text) }
@@ -66,6 +67,7 @@ private fun parseBlocks(text: String): List<Block> {
                 flushProse()
                 blocks.add(Heading(line.trimStart('#').trim()))
             }
+            line.isBlank() -> flushProse()
             else -> prose.appendLine(line.replace(Regex("^(\\s*)[-*] "), "$1• "))
         }
         i++
@@ -76,18 +78,27 @@ private fun parseBlocks(text: String): List<Block> {
 
 internal fun inline(text: String): AnnotatedString = buildAnnotatedString {
     val codeStyle = SpanStyle(fontFamily = Mono, background = Color_InlineCodeBg, color = C.ClayPill, fontSize = 13.5.sp)
-    val pattern = Regex("\\[([^\\[\\]\\n]+)]\\(([^)\\s]+)\\)|`([^`]+)`|\\*\\*([^*]+)\\*\\*")
+    val pattern = Regex(
+        "\\[([^\\[\\]\\n]+)]\\(([^)\\s]+)\\)" +
+            "|(?<!`)``+([^\\n]+?)``+(?!`)" +
+            "|(?<!`)`([^`\\n]+)`(?!`)" +
+            "|\\*\\*([^\\n]+?)\\*\\*" +
+            "|(?<!\\*)\\*([^\\s*](?:[^\\n*]*?[^\\s*])?)\\*(?!\\*)",
+    )
     var last = 0
     for (m in pattern.findAll(text)) {
         append(text.substring(last, m.range.first))
         val linkLabel = m.groupValues[1]
         val linkUrl = m.groupValues[2]
-        val code = m.groupValues[3]
-        val bold = m.groupValues[4]
+        val multiCode = m.groupValues[3]
+        val singleCode = m.groupValues[4]
+        val bold = m.groupValues[5]
+        val italic = m.groupValues[6]
         when {
             linkLabel.isNotEmpty() -> {
-                val isBackticked = linkLabel.startsWith("`") && linkLabel.endsWith("`") && linkLabel.length >= 2
-                val cleanLabel = if (isBackticked) linkLabel.substring(1, linkLabel.length - 1) else linkLabel
+                val trimmedLabel = linkLabel.trim()
+                val isBackticked = trimmedLabel.startsWith("`") && trimmedLabel.endsWith("`") && trimmedLabel.length >= 2
+                val cleanLabel = if (isBackticked) trimmedLabel.trim('`').trim() else linkLabel
                 when {
                     linkUrl.startsWith("http://") || linkUrl.startsWith("https://") || linkUrl.startsWith("mailto:") -> {
                         pushLink(LinkAnnotation.Url(linkUrl))
@@ -116,14 +127,29 @@ internal fun inline(text: String): AnnotatedString = buildAnnotatedString {
                     }
                 }
             }
-            code.isNotEmpty() -> {
+            multiCode.isNotEmpty() -> {
+                val cleaned = if (multiCode.length >= 2 && multiCode.startsWith(" ") && multiCode.endsWith(" ")) {
+                    multiCode.substring(1, multiCode.length - 1)
+                } else {
+                    multiCode
+                }
                 pushStyle(codeStyle)
-                append(code)
+                append(cleaned)
                 pop()
             }
-            else -> {
+            singleCode.isNotEmpty() -> {
+                pushStyle(codeStyle)
+                append(singleCode)
+                pop()
+            }
+            bold.isNotEmpty() -> {
                 pushStyle(SpanStyle(fontWeight = FontWeight.SemiBold))
                 append(inline(bold))
+                pop()
+            }
+            italic.isNotEmpty() -> {
+                pushStyle(SpanStyle(fontStyle = FontStyle.Italic))
+                append(inline(italic))
                 pop()
             }
         }
