@@ -6,7 +6,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
@@ -39,14 +38,8 @@ import app.ccmobile.notify.BridgeService
 import app.ccmobile.notify.Notifier
 import app.ccmobile.ui.C
 import app.ccmobile.ui.CcTheme
-import app.ccmobile.ui.DiffScreen
-import app.ccmobile.ui.SessionScreen
-import app.ccmobile.ui.SettingsScreen
-import app.ccmobile.ui.TasksScreen
-import app.ccmobile.ui.UsageScreen
-import app.ccmobile.ui.TerminalScreen
+import app.ccmobile.ui.PredictiveNavHost
 import app.ccmobile.ui.applyTheme
-import app.ccmobile.ui.ProcessesScreen
 
 sealed interface Screen {
     data object Tasks : Screen
@@ -61,8 +54,28 @@ sealed interface Screen {
 
 class Nav : ViewModel() {
     val stack = mutableStateListOf<Screen>(Screen.Tasks)
-    fun push(screen: Screen) { if (stack.lastOrNull() != screen) stack.add(screen) }
-    fun pop() { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
+    var pushHandler: ((Screen) -> Unit)? = null
+    var popHandler: (() -> Unit)? = null
+
+    fun push(screen: Screen) {
+        if (stack.lastOrNull() != screen) {
+            pushHandler?.invoke(screen) ?: stack.add(screen)
+        }
+    }
+
+    fun pop() {
+        if (stack.size > 1) {
+            popHandler?.invoke() ?: stack.removeAt(stack.lastIndex)
+        }
+    }
+
+    fun rawPush(screen: Screen) {
+        if (stack.lastOrNull() != screen) stack.add(screen)
+    }
+
+    fun rawPop() {
+        if (stack.size > 1) stack.removeAt(stack.lastIndex)
+    }
 }
 
 const val EXTRA_SCREEN = "screen"
@@ -153,7 +166,7 @@ class MainActivity : ComponentActivity() {
         // The "Debian terminal" launcher shortcut (res/xml/shortcuts.xml).
         if (intent?.getStringExtra(EXTRA_SCREEN) == "terminal") nav.push(Screen.Terminal)
         val uri: Uri = intent?.data ?: return
-        if (uri.scheme == "ccmobile" && uri.host == "pair") {
+        if ((uri.scheme == "agymobile" || uri.scheme == "ccmobile") && uri.host == "pair") {
             val host = uri.getQueryParameter("host")
             val port = uri.getQueryParameter("port")?.toIntOrNull()
             val token = uri.getQueryParameter("token")
@@ -175,23 +188,9 @@ class MainActivity : ComponentActivity() {
 private fun AppRoot(repository: Repository, nav: Nav) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { repository.errors.collect { snackbar.showSnackbar(it) } }
-    BackHandler(enabled = nav.stack.size > 1) { nav.pop() }
 
     Box(Modifier.fillMaxSize()) {
-        when (val screen = nav.stack.last()) {
-            Screen.Tasks -> TasksScreen(
-                repository, onOpen = { nav.push(Screen.Session(it)) },
-                onSettings = { nav.push(Screen.Settings) }, onUsage = { nav.push(Screen.Usage) },
-                onProcesses = { nav.push(Screen.Processes) }, onTerminal = { nav.push(Screen.Terminal) },
-            )
-            is Screen.Session -> SessionScreen(repository, screen.sid, onBack = nav::pop, onDiff = { nav.push(Screen.Diff(screen.sid)) })
-            is Screen.Diff -> DiffScreen(repository, screen.sid, onBack = nav::pop)
-            Screen.Usage -> UsageScreen(repository, onBack = nav::pop)
-            Screen.Terminal -> TerminalScreen(repository, onBack = nav::pop)
-            Screen.Login -> TerminalScreen(repository, onBack = nav::pop, login = true)
-            Screen.Processes -> ProcessesScreen(repository, onBack = nav::pop, onOpenTask = { nav.push(Screen.Session(it)) })
-            Screen.Settings -> SettingsScreen(repository, onBack = if (nav.stack.size > 1) nav::pop else null, onLogin = { nav.push(Screen.Login) })
-        }
+        PredictiveNavHost(nav, repository)
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 80.dp)) {
             Snackbar(it, containerColor = C.Surface3, contentColor = C.Text)
         }
