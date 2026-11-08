@@ -197,7 +197,7 @@ rl.on('line', (line) => {
       event: 'result',
       result: {
         conversation_id: sid,
-        status: 'SUCCESS',
+        status: said.includes('stale-quota-status-error') ? 'ERROR' : 'SUCCESS',
         ...(staleError ? { error: staleError } : {}),
         response: fullText,
         duration_seconds: 0.2,

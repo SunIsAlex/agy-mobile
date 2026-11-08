@@ -1013,8 +1013,29 @@ class Session {
       this.stepText.clear();
       this.emittedTools.clear();
 
-      const isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
-      const errText = isError ? (res.error || res.response || '') : '';
+      const hadTurnResponse = this.turnHadText || Boolean(typeof res.response === 'string' && res.response.trim());
+      let isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
+      const rawErrorText = String(res.error || (res.status === 'ERROR' ? res.response : '') || '');
+      const isRateLimit = isError && /rate.?limit|quota|429|resource_exhausted/i.test(rawErrorText);
+      const activeModel = this.currentModel ?? this.model ?? 'agy';
+      const hasKnownLimits = Array.isArray(limits?.windows) && limits.windows.length > 0;
+      const modelExhausted = hasKnownLimits ? isModelQuotaExhausted(activeModel, limits) : true;
+
+      // If the turn produced a complete response, stale error details from earlier turns (e.g. model switches)
+      // must not fail the turn or mark it as rate-limited.
+      if (hadTurnResponse && isError) {
+        if (isRateLimit || !res.status || res.status === 'SUCCESS') {
+          isError = false;
+        }
+      }
+
+      // If no response was produced but this is a rate-limit error, only treat as rate-limited if the
+      // active model's quota window is actually exhausted in limits.json.
+      if (isError && isRateLimit && hasKnownLimits && !modelExhausted) {
+        isError = false;
+      }
+
+      const errText = isError ? rawErrorText : '';
       const turnUsage = res.usage ? {
         input_tokens: res.usage.input_tokens ?? 0,
         output_tokens: res.usage.output_tokens ?? 0,
@@ -1050,7 +1071,7 @@ class Session {
       if (isError && (this.idleExit || /stream input cancelled/i.test(errText))) {
         return;
       }
-      if (isError && /rate.?limit|quota|429|resource_exhausted/i.test(errText)) {
+      if (isError && isRateLimit) {
         this.limitHit = true;
       }
       this.onCliMessage({
@@ -1103,7 +1124,13 @@ class Session {
       this.pending.delete(msg.request_id);
       if (this.pending.size === 0 && this.status === 'needs_approval') this.setStatus('working');
     } else if (msg.type === 'assistant') {
-      if (msg.error === 'rate_limit') this.limitHit = true;
+      if (msg.error === 'rate_limit') {
+        const activeModel = this.currentModel ?? this.model ?? 'agy';
+        const hasKnownLimits = Array.isArray(limits?.windows) && limits.windows.length > 0;
+        if (!hasKnownLimits || isModelQuotaExhausted(activeModel, limits)) {
+          this.limitHit = true;
+        }
+      }
       const tool = msg.message?.content?.find((c) => c.type === 'tool_use');
       const text = msg.message?.content?.find((c) => c.type === 'text');
       if (this.status !== 'needs_approval' && (tool || text)) {
@@ -1393,7 +1420,10 @@ class Session {
   /** The turn ended because a usage limit was reached: wait for it to reset. */
   onLimited() {
     const now = Date.now();
-    const resetAt = this.rejectedResetAt > now ? this.rejectedResetAt : null;
+    const activeModel = this.currentModel ?? this.model ?? 'agy';
+    const modelWin = windowForModel(activeModel, limits?.windows);
+    const winResetAt = modelWin?.resetsAt > now ? modelWin.resetsAt : null;
+    const resetAt = this.rejectedResetAt > now ? this.rejectedResetAt : winResetAt;
     this.limitRetryMs = resetAt ? 0 : Math.min(this.limitRetryMs ? this.limitRetryMs * 2 : LIMIT_RETRY_MS, 60 * 60_000);
     this.resumeAt = resetAt ? resetAt + LIMIT_GRACE_MS : now + this.limitRetryMs;
     this.setStatus('limited', resetAt ? 'Usage limit reached' : 'Rate limited');
@@ -1833,6 +1863,37 @@ function importCliSession(id) {
 const limitsFile = path.join(stateDir, 'limits.json');
 let limits = null;
 try { limits = JSON.parse(fs.readFileSync(limitsFile, 'utf8')); } catch {}
+
+/** Returns the most relevant quota window for model (or default Gemini model). */
+function windowForModel(model, windows) {
+  if (!Array.isArray(windows) || !windows.length) return null;
+  const m = (model || '').toLowerCase();
+  let matching;
+  if (m.startsWith('claude-') || m.startsWith('gpt-')) {
+    matching = windows.filter((w) => w.id.startsWith('3p-') || w.id === 'five_hour' || w.id.startsWith('seven_day'));
+  } else if (m.includes('argon')) {
+    matching = windows.filter((w) => w.id.includes('argon'));
+    if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
+  } else if (m.startsWith('gemini-')) {
+    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon'));
+    if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
+  } else {
+    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon'));
+    if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
+    if (!matching.length) matching = windows.filter((w) => !w.id.startsWith('3p-'));
+  }
+  const pool = matching.length ? matching : windows;
+  const active = pool.filter((w) => !w.disabled);
+  const candidates = active.length ? active : pool;
+  return candidates.reduce((max, w) => (!max || (w.utilization ?? 0) > (max.utilization ?? 0) ? w : max), null);
+}
+
+/** Returns true only if the model's active quota window is exhausted (utilization >= 1). */
+function isModelQuotaExhausted(model, limitsObj) {
+  if (!limitsObj?.windows) return false;
+  const win = windowForModel(model, limitsObj.windows);
+  return win ? (!win.disabled && (win.utilization ?? 0) >= 1) : false;
+}
 
 /** When a rejected rate_limit_event's limit resets (ms), or null if it doesn't say. */
 function limitResetAt(info) {
