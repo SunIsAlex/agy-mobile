@@ -96,7 +96,6 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
     val working = session?.status == "working"
     val loadImage: ImageLoader = remember(sid) { { ref -> repository.image(sid, ref) } }
     var viewing by remember { mutableStateOf<Pair<ToolItem, Int>?>(null) }
-    var voiceMode by rememberSaveable(sid) { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
@@ -151,11 +150,6 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 }
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt AGY", { repository.interrupt(sid) })
-            val startVoice = rememberWithMic({ repository.reportError("Voice mode needs access to the microphone.") }) { voiceMode = true }
-            IconBtn(
-                R.drawable.ic_voice, if (voiceMode) "End voice mode" else "Voice mode: talk with AGY",
-                { if (voiceMode) voiceMode = false else startVoice() }, tint = if (voiceMode) C.ClayText else C.Text,
-            )
             var menu by remember { mutableStateOf(false) }
             var modelMenu by remember { mutableStateOf(false) }
             var effortMenu by remember { mutableStateOf(false) }
@@ -245,9 +239,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 onAlways = { repository.answer(approval, allow = true, always = true) },
             )
         }
-        if (voiceMode) {
-            VoiceModePanel(repository, sid) { voiceMode = false }
-        } else if (approval == null) {
+        if (approval == null) {
             var draft by remember(sid) { mutableStateOf(repository.settings.draft(sid)) }
             ReplyBar(
                 voice = repository.voice, sid = sid,

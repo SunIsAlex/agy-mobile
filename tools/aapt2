@@ -1,0 +1,5 @@
+#!/bin/sh
+q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+cmd="cd $(q "$PWD") && exec /data/data/com.termux/files/usr/bin/aapt2"
+for a in "$@"; do cmd="$cmd $(q "$a")"; done
+exec su -c "exec su $(id -u) -c $(q "$cmd")"

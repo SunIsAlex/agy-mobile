@@ -1,0 +1,4 @@
+#!/bin/sh
+cd "$(dirname "$0")/.." || exit 1
+export GRADLE_USER_HOME=/data/ccm/home/.gradle
+exec ./gradlew -Pandroid.aapt2FromMavenOverride="$PWD/tools/aapt2" --console=plain "$@"
