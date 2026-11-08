@@ -385,6 +385,7 @@ class Session {
     this.stepText = new Map(); // step_index -> accumulated streamed text
     this.emittedTools = new Set(); // step_index where tool_use was emitted
     this.emittedThinking = new Set(); // step_index where thinking was emitted
+    this.syncedTranscriptSteps = new Set(); // step_index synced from transcript while a background tool was running
     this.turnHadText = false;
     this.stuckToolDetectedAt = null;
   }
@@ -642,6 +643,8 @@ class Session {
     let maxTranscriptStep = -1;
     let taskKilled = false;
     let minActiveStepDone = false;
+    const stepsByIndex = new Map();
+    const completedBgTasks = new Map(); // taskStepIdx -> { state, output }
     try {
       const stat = fs.statSync(file);
       const readLen = Math.min(stat.size, 65536);
@@ -655,6 +658,7 @@ class Session {
         try {
           const r = JSON.parse(line);
           if (typeof r.step_index === 'number') {
+            stepsByIndex.set(r.step_index, r);
             if (r.step_index > maxTranscriptStep) maxTranscriptStep = r.step_index;
             if (r.step_index > minActiveStep && line.includes('manage_task') && line.includes('kill')) {
               taskKilled = true;
@@ -662,24 +666,115 @@ class Session {
             if (r.step_index === minActiveStep && r.type === 'GENERIC' && r.status === 'DONE') {
               minActiveStepDone = true;
             }
-            if (
-              r.step_index > minActiveStep &&
-              r.type === 'SYSTEM_MESSAGE' &&
-              typeof r.content === 'string' &&
-              r.content.includes(`/task-${minActiveStep}"`) &&
-              (r.content.includes('finished with result:') || r.content.includes('was canceled'))
-            ) {
-              minActiveStepDone = true;
+            if (r.type === 'SYSTEM_MESSAGE' && typeof r.content === 'string') {
+              const m = r.content.match(/Task id "[^"]*\/task-(\d+)" (finished with result:|was canceled(?: with result:)?)\s*([\s\S]*?)(?:\n\nLog: file:\/\/|\n<\/SYSTEM_MESSAGE>|$)/);
+              if (m) {
+                const taskStep = Number(m[1]);
+                const canceled = m[2].startsWith('was canceled');
+                completedBgTasks.set(taskStep, {
+                  state: canceled ? 'CANCELED' : 'DONE',
+                  output: (m[3] ?? '').trim(),
+                });
+              }
             }
           }
         } catch {}
       }
     } catch {}
 
+    const findToolCallForStep = (stepIdx) => {
+      for (let pIdx = stepIdx - 1; pIdx >= Math.max(0, stepIdx - 10); pIdx--) {
+        const p = stepsByIndex.get(pIdx);
+        if (!p) break;
+        if (p.type === 'PLANNER_RESPONSE' && Array.isArray(p.tool_calls) && p.tool_calls.length > 0) {
+          return p.tool_calls[stepIdx - pIdx - 1] ?? p.tool_calls[0];
+        }
+        if (p.type !== 'GENERIC') break;
+      }
+      return null;
+    };
+
+    // If a background task (task-N) has already finished and posted its SYSTEM_MESSAGE wakeup to
+    // transcript.jsonl, complete its tool step immediately without killing any processes.
+    for (const [taskStep, info] of completedBgTasks.entries()) {
+      if (this.emittedTools.has(taskStep) && !this.syncedTranscriptSteps.has(taskStep)) {
+        const tc = findToolCallForStep(taskStep);
+        const toolName = tc?.name || 'run_command';
+        const params = tc ? parseAgyToolArgs(tc.args) : {};
+        this.syncedTranscriptSteps.add(taskStep);
+        this.onAgyMessage({
+          event: 'step_update',
+          step_update: {
+            step_index: taskStep,
+            step_type: 'tool',
+            state: info.state,
+            tool_name: toolName,
+            tool_info: {
+              name: toolName,
+              parameters: params,
+              output: info.output,
+              ...(info.state === 'CANCELED' ? { error: { message: info.output || 'Task canceled' } } : {}),
+            },
+          },
+        }, true);
+      }
+    }
+
+    // While a legitimate background task (minActiveStep) is still RUNNING, AGY's sequential stdout
+    // emitter buffers subsequent completed steps (like view_file on a QR image, an assistant status
+    // message, or wakeup steps) until minActiveStep finishes. Sync those completed steps from
+    // transcript.jsonl immediately so the user sees them in real time without killing the task.
+    if (!taskKilled && maxTranscriptStep > minActiveStep) {
+      const sorted = [...stepsByIndex.entries()].sort((a, b) => a[0] - b[0]);
+      for (const [stepIdx, r] of sorted) {
+        if (stepIdx <= minActiveStep || this.syncedTranscriptSteps.has(stepIdx)) continue;
+        if (r.type === 'PLANNER_RESPONSE' && r.status === 'DONE') {
+          const hasText = typeof r.content === 'string' && r.content.trim().length > 0;
+          const hasPureThinking = (!Array.isArray(r.tool_calls) || r.tool_calls.length === 0) &&
+            typeof r.thinking === 'string' && r.thinking.trim().length > 0;
+          if ((hasText || hasPureThinking) && !this.stepText.has(stepIdx)) {
+            this.syncedTranscriptSteps.add(stepIdx);
+            if (hasText) this.stepText.set(stepIdx, r.content);
+            this.onAgyMessage({
+              event: 'step_update',
+              step_update: {
+                step_index: stepIdx,
+                step_type: 'agent_response',
+                state: 'DONE',
+              },
+            }, true);
+          }
+        } else if (r.type === 'GENERIC' && (r.status === 'DONE' || r.status === 'ERROR' || r.status === 'CANCELED')) {
+          const tc = findToolCallForStep(stepIdx);
+          if (tc) {
+            const toolName = tc.name || 'tool';
+            const params = parseAgyToolArgs(tc.args);
+            this.syncedTranscriptSteps.add(stepIdx);
+            this.onAgyMessage({
+              event: 'step_update',
+              step_update: {
+                step_index: stepIdx,
+                step_type: 'tool',
+                state: r.status,
+                tool_name: toolName,
+                tool_info: {
+                  name: toolName,
+                  parameters: params,
+                  output: r.content ?? '',
+                  ...(r.status === 'ERROR' ? { error: { message: r.content || 'Tool error' } } : {}),
+                },
+              },
+            }, true);
+          }
+        }
+      }
+    }
+
     const forcedGraceMs = process.env.CCM_STUCK_TOOL_GRACE_MS ? Number(process.env.CCM_STUCK_TOOL_GRACE_MS) : null;
     const isStuck =
+      this.emittedTools.size > 0 &&
       maxTranscriptStep > minActiveStep &&
-      (forcedGraceMs !== null || taskKilled || minActiveStepDone || maxTranscriptStep >= minActiveStep + 4);
+      (forcedGraceMs !== null || taskKilled || minActiveStepDone);
 
     if (isStuck) {
       const now = Date.now();
@@ -716,7 +811,7 @@ class Session {
   }
 
   /** Normalizes agy's stream-json events ({event: 'init' | 'step_update' | 'result'}) into bridge events. */
-  onAgyMessage(msg) {
+  onAgyMessage(msg, fromTranscriptSync = false) {
     if (msg.event === 'init') {
       if (msg.conversation_id && this.cliSessionId !== msg.conversation_id) {
         this.cliSessionId = msg.conversation_id;
@@ -743,6 +838,7 @@ class Session {
         this.persistMeta();
       }
       const idx = su.step_index ?? 0;
+      if (!fromTranscriptSync && this.syncedTranscriptSteps.has(idx)) return;
 
       if (su.step_type === 'agent_response') {
         if (typeof su.text_delta === 'string' && su.text_delta.length > 0) {
