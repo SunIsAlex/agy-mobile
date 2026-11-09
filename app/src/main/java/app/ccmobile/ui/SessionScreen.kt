@@ -141,7 +141,16 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                     }
                     Text(usageLine, color = quotaTone, fontSize = 11.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                if (session?.mode == YOLO) Text("YOLO · runs without asking", color = C.Red, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
+                val modeText = when (session?.mode) {
+                    YOLO -> "YOLO · runs without asking"
+                    "fast", "acceptEdits" -> "Fast mode"
+                    "plan" -> "Planning mode"
+                    "default" -> "Ask first"
+                    else -> null
+                }
+                if (modeText != null) {
+                    Text(modeText, color = if (session?.mode == YOLO) C.Red else C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1)
+                }
                 session?.background?.takeIf { it.isNotEmpty() }?.let { jobs ->
                     Text(
                         "In the background: ${jobs.joinToString(", ")}", color = C.TextSoft, fontSize = 12.sp, fontFamily = Mono,
@@ -151,12 +160,28 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             }
             if (working) IconBtn(R.drawable.ic_stop, "Interrupt AGY", { repository.interrupt(sid) })
             var menu by remember { mutableStateOf(false) }
+            var modeMenu by remember { mutableStateOf(false) }
             var modelMenu by remember { mutableStateOf(false) }
             var effortMenu by remember { mutableStateOf(false) }
             var moving by remember { mutableStateOf(false) }
             if (moving && session != null) MoveFolderDialog(repository, session) { moving = false }
             Box {
                 IconBtn(R.drawable.ic_more, "More options", { menu = true })
+                DropdownMenu(expanded = modeMenu, onDismissRequest = { modeMenu = false }) {
+                    MenuHeading("Agent mode, from the next reply")
+                    modeLabels.forEach { (value, label) ->
+                        DropdownMenuItem(
+                            text = {
+                                Column(Modifier.padding(vertical = 4.dp)) {
+                                    Text(label, fontWeight = FontWeight.Medium)
+                                    Text(modeDescription(value), fontSize = 12.sp, lineHeight = 16.sp, color = C.Muted)
+                                }
+                            },
+                            onClick = { modeMenu = false; repository.setMode(sid, value) },
+                            trailingIcon = { if (value == session?.mode || (value == "fast" && session?.mode == "acceptEdits")) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
+                        )
+                    }
+                }
                 DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
                     MenuHeading("Model, from the next reply")
                     ModelItems(session?.model.orEmpty()) { modelMenu = false; repository.setModel(sid, it) }
@@ -166,14 +191,10 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                     EffortItems(session?.effort.orEmpty()) { effortMenu = false; repository.setEffort(sid, it) }
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    if (session?.mode == YOLO) {
-                        DropdownMenuItem(text = { Text("Turn off YOLO (ask first)") }, onClick = { menu = false; repository.setMode(sid, "default") })
-                    } else {
-                        DropdownMenuItem(
-                            text = { Text("Turn on YOLO (don't ask)", color = C.Red) },
-                            onClick = { menu = false; repository.setMode(sid, YOLO) },
-                        )
-                    }
+                    DropdownMenuItem(
+                        text = { Text("Mode: ${modeLabel(session?.mode.orEmpty())}") },
+                        onClick = { menu = false; modeMenu = true },
+                    )
                     DropdownMenuItem(
                         text = { Text("Model: ${modelLabel(session?.model)}") },
                         onClick = { menu = false; modelMenu = true },
@@ -245,6 +266,7 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 voice = repository.voice, sid = sid,
                 text = draft, onText = { draft = it; repository.settings.setDraft(sid, it) },
                 attachments = repository.draftAttachments(sid),
+                mode = session?.mode.orEmpty(), onMode = { repository.setMode(sid, it) },
                 model = session?.model.orEmpty(), onModel = { repository.setModel(sid, it) },
                 effort = session?.effort.orEmpty(), onEffort = { repository.setEffort(sid, it) },
                 onSend = { text, files -> repository.sendMessage(sid, text, files) }, onError = repository::reportError,
@@ -393,11 +415,13 @@ private fun PermissionCard(approval: Approval, onDeny: () -> Unit, onAllow: () -
 private fun ReplyBar(
     voice: VoiceInput, sid: String,
     text: String, onText: (String) -> Unit, attachments: SnapshotStateList<PendingAttachment>,
+    mode: String, onMode: (String) -> Unit,
     model: String, onModel: (String) -> Unit,
     effort: String, onEffort: (String) -> Unit,
     onSend: (String, List<PendingAttachment>) -> Unit, onError: (String) -> Unit,
 ) {
-    // Model and effort apply from the next reply, so they sit with the message box as well as in the menu.
+    // Mode, model and effort apply from the next reply, so they sit with the message box as well as in the menu.
+    var modeMenu by remember { mutableStateOf(false) }
     var modelMenu by remember { mutableStateOf(false) }
     var effortMenu by remember { mutableStateOf(false) }
     Row(
@@ -405,6 +429,28 @@ private fun ReplyBar(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        Box {
+            Chip(
+                modeLabel(mode),
+                onClick = { modeMenu = true }, on = mode.isNotEmpty(),
+                warn = mode == YOLO,
+            )
+            DropdownMenu(expanded = modeMenu, onDismissRequest = { modeMenu = false }) {
+                MenuHeading("Agent mode, from the next reply")
+                modeLabels.forEach { (value, label) ->
+                    DropdownMenuItem(
+                        text = {
+                            Column(Modifier.padding(vertical = 4.dp)) {
+                                Text(label, fontWeight = FontWeight.Medium)
+                                Text(modeDescription(value), fontSize = 12.sp, lineHeight = 16.sp, color = C.Muted)
+                            }
+                        },
+                        onClick = { modeMenu = false; onMode(value) },
+                        trailingIcon = { if (value == mode || (value == "fast" && mode == "acceptEdits")) CcIcon(R.drawable.ic_check, C.ClayText, 16.dp) },
+                    )
+                }
+            }
+        }
         Box {
             Chip(
                 if (model.isEmpty()) "Default model" else modelLabel(model),

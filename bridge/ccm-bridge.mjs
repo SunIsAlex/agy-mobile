@@ -102,7 +102,7 @@ const claudeBin = process.env.CCM_AGY_BIN ?? process.env.CCM_CLAUDE_BIN ?? 'agy'
 const agyDataDir = process.env.CCM_AGY_DIR ?? process.env.AGY_DATA_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli');
 const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects');
 // bypassPermissions is the app's "YOLO" mode (--dangerously-skip-permissions).
-const MODES = ['default', 'acceptEdits', 'plan', 'auto', 'manual', 'dontAsk', 'bypassPermissions'];
+const MODES = ['fast', 'acceptEdits', 'plan', 'default', 'auto', 'manual', 'dontAsk', 'bypassPermissions'];
 // Reasoning effort (--effort); null leaves it to the model's default.
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -513,9 +513,13 @@ class Session {
       if (this.model) args.push('--model', this.model);
       args.push(...(this.started ? ['--resume', this.id] : ['--session-id', this.id]));
     } else {
-      if (this.mode === 'plan') args.push('--mode', 'plan');
-      else if (this.mode === 'acceptEdits') args.push('--mode', 'accept-edits');
-      else args.push('--dangerously-skip-permissions');
+      if (this.mode === 'plan') {
+        args.push('--mode', 'plan');
+      } else if (this.mode === 'fast' || this.mode === 'acceptEdits') {
+        args.push('--mode', 'accept-edits');
+      } else if (this.mode === 'bypassPermissions') {
+        args.push('--dangerously-skip-permissions');
+      }
       const { model, effort } = this.resolveAgyModelEffort(this.model, this.effort);
       if (model) args.push('--model', model);
       if (effort) args.push('--effort', effort);
@@ -1248,6 +1252,41 @@ class Session {
       this.setModel(resolved);
       return;
     }
+    const fastCmd = !saved.length && trimmed.match(/^\/fast(?:mode)?(?:\s+(.*))?$/i);
+    if (fastCmd) {
+      this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+      const arg = (fastCmd[1] ?? '').trim().toLowerCase();
+      const enable = arg === 'on' ? true : (arg === 'off' ? false : (this.mode !== 'fast' && this.mode !== 'acceptEdits'));
+      this.setMode(enable ? 'fast' : 'default');
+      return;
+    }
+    const planCmd = !saved.length && trimmed.match(/^\/plan(?:\s+(.*))?$/i);
+    if (planCmd) {
+      const arg = (planCmd[1] ?? '').trim();
+      this.setMode('plan');
+      if (!arg) {
+        this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+        return;
+      }
+      text = arg;
+    }
+    const yoloCmd = !saved.length && trimmed.match(/^\/yolo(?:\s+(.*))?$/i);
+    if (yoloCmd) {
+      this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+      const arg = (yoloCmd[1] ?? '').trim().toLowerCase();
+      const enable = arg === 'on' ? true : (arg === 'off' ? false : this.mode !== 'bypassPermissions');
+      this.setMode(enable ? 'bypassPermissions' : 'default');
+      return;
+    }
+    const effortCmd = !saved.length && trimmed.match(/^\/effort(?:\s+(.*))?$/i);
+    if (effortCmd) {
+      const arg = (effortCmd[1] ?? '').trim().toLowerCase();
+      if (arg && ['low', 'medium', 'high', 'xhigh', 'max', 'default', 'auto'].includes(arg)) {
+        this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
+        this.setEffort(arg === 'default' || arg === 'auto' ? null : arg);
+        return;
+      }
+    }
     // Built-in CLI slash commands cannot be sent over stream-json stdin in agy; run them via one-shot print mode.
     if (!saved.length && /^\/(usage|quota|credits|models|agents|skills|permissions|effort|help|config|changelog)(\s|$)/i.test(trimmed)) {
       this.emitLocal({ type: 'user', message: { role: 'user', content: text }, local: true });
@@ -1360,7 +1399,11 @@ class Session {
     } else {
       this.restartProcessForNextTurn();
     }
-    this.emitLocal({ type: 'bridge', subtype: 'note', message: mode === 'bypassPermissions' ? 'YOLO mode on: tools run without asking' : `Permission mode: ${mode}` });
+    const label = mode === 'fast' || mode === 'acceptEdits'
+      ? 'Fast mode: AGY executes edits directly without an upfront plan'
+      : (mode === 'plan' ? 'Planning mode: AGY analyzes and creates a plan before making changes'
+        : (mode === 'bypassPermissions' ? 'YOLO mode on: tools run without asking' : `Agent mode: Ask first`));
+    this.emitLocal({ type: 'bridge', subtype: 'note', message: label });
     this.setStatus(this.status);
   }
 

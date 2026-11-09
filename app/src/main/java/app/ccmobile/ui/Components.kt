@@ -204,14 +204,20 @@ fun relativeTime(epochMs: Long, now: Long = System.currentTimeMillis()): String 
 }
 
 const val YOLO = "bypassPermissions"
-val modeLabels = listOf("default" to "Ask first", "acceptEdits" to "Auto-edit", "plan" to "Plan only", YOLO to "YOLO")
+val modeLabels = listOf("fast" to "Fast", "plan" to "Planning", "default" to "Ask first", YOLO to "YOLO")
 
-fun modeLabel(mode: String): String = modeLabels.firstOrNull { it.first == mode }?.second ?: mode
+fun modeLabel(mode: String): String = when (mode) {
+    "fast", "acceptEdits" -> "Fast"
+    "plan" -> "Planning"
+    "default" -> "Ask first"
+    YOLO -> "YOLO"
+    else -> modeLabels.firstOrNull { it.first == mode }?.second ?: mode
+}
 
 fun modeDescription(mode: String): String = when (mode) {
-    "acceptEdits" -> "AGY edits files without asking. Commands still need your OK."
-    "plan" -> "AGY researches and proposes a plan. Nothing changes until you approve it."
-    YOLO -> "AGY runs commands and edits files without asking (--dangerously-skip-permissions)."
+    "fast", "acceptEdits" -> "Fast mode: AGY executes edits directly without an upfront plan."
+    "plan" -> "Planning mode: AGY analyzes and creates a plan before making changes."
+    YOLO -> "YOLO mode: AGY runs commands and edits files without asking (--dangerously-skip-permissions)."
     else -> "AGY asks before editing files or running commands."
 }
 val effortLabels = listOf("" to "Default", "low" to "Low", "medium" to "Medium", "high" to "High")

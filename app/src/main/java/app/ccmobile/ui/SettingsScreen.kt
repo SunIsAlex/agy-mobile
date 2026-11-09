@@ -182,7 +182,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                 )
             }
 
-            Section("Default permissions for new tasks") {
+            Section("Default agent mode") {
                 Segmented(modeLabels, mode, { mode = it; settings.mode = it })
                 Text(modeDescription(mode), color = if (mode == YOLO) C.Red else C.Muted, fontSize = 13.sp)
             }
