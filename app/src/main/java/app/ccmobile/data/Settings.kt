@@ -17,9 +17,9 @@ class Settings(context: Context) {
         get() = prefs.getString("token", "")!!
         set(v) = prefs.edit { putString("token", v) }
 
-    /** Claude Code permission mode for new tasks: default | acceptEdits | plan | bypassPermissions (YOLO). */
+    /** AGY permission mode for new tasks: default | acceptEdits | plan | bypassPermissions (YOLO). */
     var mode: String
-        get() = prefs.getString("mode", "default")!!
+        get() = prefs.getString("mode", "bypassPermissions")!!
         set(v) = prefs.edit { putString("mode", v) }
 
     /** Model alias passed to `--model`, or blank for the CLI's default. */

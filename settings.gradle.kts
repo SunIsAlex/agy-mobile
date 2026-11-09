@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "cc-mobile"
+rootProject.name = "agy-mobile"
 include(":app")

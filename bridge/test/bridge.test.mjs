@@ -1323,6 +1323,14 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     assert.equal(finalSessionErr.status, 'idle');
     assert.equal(finalSessionErr.resumeAt, null);
 
+    // 8c. Result with stream interrupted error on completed turn does NOT fail turn or mark session as error
+    c.send({ op: 'send', sid: session.id, text: 'turn with stream-interrupted-after-response' });
+    const resMsgInterrupted = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'result' && m.msg.result.includes('stream-interrupted'));
+    assert.equal(resMsgInterrupted.msg.is_error, false);
+    assert.equal(resMsgInterrupted.msg.subtype, 'success');
+    const sessionAfterInterrupted = (await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle')).session;
+    assert.equal(sessionAfterInterrupted.status, 'idle');
+
     // 9. Stuck background tool unblocking: when a command runs forever and transcript advances, bridge terminates child process to unblock stream
     c.send({ op: 'send', sid: session.id, text: 'test-stuck-tool' });
     const stuckNote = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'bridge' && m.msg.subtype === 'note' && m.msg.message.includes('Unblocking AGY stream'));

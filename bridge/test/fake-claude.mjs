@@ -190,14 +190,17 @@ rl.on('line', (line) => {
         usage: { input_tokens: 120, output_tokens: 20, thinking_tokens: 10, cache_read_tokens: 60, total_tokens: 210 },
       },
     });
+    const isStreamInterrupted = said.includes('stream-interrupted-after-response');
     const staleError = said.includes('stale-quota-error')
       ? 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 146h37m35s.'
+      : isStreamInterrupted
+      ? 'The stream was interrupted. Please continue the task you were working on.'
       : undefined;
     out({
       event: 'result',
       result: {
         conversation_id: sid,
-        status: said.includes('stale-quota-status-error') ? 'ERROR' : 'SUCCESS',
+        status: (said.includes('stale-quota-status-error') || isStreamInterrupted) ? 'ERROR' : 'SUCCESS',
         ...(staleError ? { error: staleError } : {}),
         response: fullText,
         duration_seconds: 0.2,

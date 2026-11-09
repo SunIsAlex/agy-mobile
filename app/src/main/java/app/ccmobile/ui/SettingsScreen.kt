@@ -85,7 +85,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
         val kind = waitingFor ?: return@rememberLauncherForActivityResult
         waitingFor = null
         if (granted) launch(kind)
-        else repository.reportError("CC Mobile needs permission to run commands in Termux (App info › Permissions).")
+        else repository.reportError("AGY Mobile needs permission to run commands in Termux (App info › Permissions).")
     }
     fun start(kind: BridgeKind) {
         when {
@@ -100,7 +100,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
         else if (starting != null) { kotlinx.coroutines.delay(45_000); starting = null }
     }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
-    // Who Claude Code on the connected bridge is signed in as; checked again after logging in.
+    // Who AGY on the connected bridge is signed in as; checked again after logging in.
     var auth by remember { mutableStateOf<Result<AuthStatus>?>(null) }
     LaunchedEffect(conn) { auth = if (conn is ConnState.Connected) repository.authStatus() else null }
 
@@ -116,9 +116,9 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
         if (onBack != null) Row(Modifier.padding(start = 4.dp, top = 8.dp)) { IconBtn(R.drawable.ic_back, "Back", onBack) }
         Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Where Claude runs", fontFamily = Serif, fontSize = 30.sp, lineHeight = 35.sp, color = C.Text)
+                Text("Where AGY runs", fontFamily = Serif, fontSize = 30.sp, lineHeight = 35.sp, color = C.Text)
                 Text(
-                    "This app is a front end. Claude Code runs in a small bridge on the machine that has your code: this phone (in Termux) or a computer you can reach.",
+                    "This app is a front end. Antigravity CLI (agy) runs in a small bridge on the machine that has your code: this phone (in Termux) or a computer you can reach.",
                     color = C.Muted, fontSize = 14.sp, lineHeight = 20.sp,
                 )
             }
@@ -160,24 +160,24 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                 )
             }
 
-            Section("Claude account") {
+            Section("AGY account") {
                 val status = auth?.getOrNull()
                 Text(
                     when {
-                        conn !is ConnState.Connected -> "Connect to a bridge to see which account Claude uses."
+                        conn !is ConnState.Connected -> "Connect to a bridge to see which account AGY uses."
                         auth == null -> "Checking…"
                         status == null -> auth?.exceptionOrNull()?.message ?: "Couldn't check the login."
-                        !status.loggedIn -> "Not signed in. Tasks fail until Claude Code on the bridge is logged in."
+                        !status.loggedIn -> "Not signed in. Tasks fail until AGY on the bridge is logged in."
                         else -> "Signed in" + (status.email?.let { " as $it" } ?: "") +
-                            (status.subscriptionType?.let { " · Claude ${it.replaceFirstChar(Char::uppercase)}" }
-                                ?: if (status.authMethod == "claude.ai") "" else " · ${status.authMethod}")
+                            (status.subscriptionType?.let { " · ${it.replaceFirstChar(Char::uppercase)}" }
+                                ?: if (status.authMethod == "google") "" else " · ${status.authMethod}")
                     },
                     color = if (status?.loggedIn == false) C.Red else C.TextSoft, fontSize = 14.sp,
                 )
                 if (status?.loggedIn == true) SecondaryButton("Log in with another account", onLogin, modifier = Modifier.fillMaxWidth())
-                else PrimaryButton("Log in to Claude", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
+                else PrimaryButton("Log in to AGY", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
                 Text(
-                    "Runs claude auth login on the bridge and opens the sign-in page in your browser.",
+                    "Runs agy auth login on the bridge and opens the sign-in page in your browser.",
                     color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
                 )
             }
@@ -192,7 +192,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                 Segmented(themeLabels, theme, { theme = it; settings.theme = it; applyTheme(it, config) })
             }
 
-                        Section("Default model") {
+            Section("Default model") {
                 Segmented(modelLabels, model, { model = it; settings.model = it })
             }
 
@@ -201,7 +201,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                 Text(effortDescription(effort), color = C.Muted, fontSize = 13.sp)
             }
 
-            Section("Keep phone awake while Claude works") {
+            Section("Keep phone awake while AGY works") {
                 Segmented(
                     listOf("never" to "Never", "charging" to "Charging", "always" to "Always"), keepAwake,
                     { keepAwake = it; settings.keepAwake = it },
@@ -218,7 +218,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
 
             SwitchRow(
                 "Continue after usage limits reset",
-                "When a task hits your plan's limit, Claude picks it up again once the limit resets. You can change this per task.",
+                "When a task hits your plan's limit, AGY picks it up again once the limit resets. You can change this per task.",
                 autoContinue,
             ) { autoContinue = it; settings.autoContinue = it }
 
@@ -243,7 +243,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("Notify when Claude needs me", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                    Text("Notify when AGY needs me", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium)
                     Text("Keeps a connection open in the background. Approve or deny from the notification.", color = C.Muted, fontSize = 12.sp)
                 }
                 Switch(

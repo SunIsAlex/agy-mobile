@@ -11,13 +11,13 @@ import app.ccmobile.repository
 enum class BridgeKind(val label: String, val port: Int, val command: String, val detail: String) {
     Termux(
         "Termux", 8765,
-        "node ~/claude-code-mobile/bridge/ccm-bridge.mjs --pair",
+        "DIR=$( [ -d ~/agy-mobile ] && echo ~/agy-mobile || echo ~/claude-code-mobile ); node \$DIR/bridge/ccm-bridge.mjs --pair",
         "Runs in Termux. Works on any phone.",
     ),
     Chroot(
         "Debian chroot", 8766,
-        "sh ~/claude-code-mobile/chroot/ccm-chroot start && sh ~/claude-code-mobile/chroot/ccm-chroot pair",
-        "Rooted phones, after ccm-chroot install. Official Claude Code and apt tools; keeps running without Termux.",
+        "DIR=$( [ -d ~/agy-mobile ] && echo ~/agy-mobile || echo ~/claude-code-mobile ); sh \$DIR/chroot/ccm-chroot start && sh \$DIR/chroot/ccm-chroot pair",
+        "Rooted phones, after ccm-chroot install. Antigravity CLI (agy) and apt tools; keeps running without Termux.",
     ),
 }
 

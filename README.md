@@ -27,7 +27,7 @@ In Termux (needs Node and a logged-in `claude`):
 
 ```sh
 termux-wake-lock        # optional: stops Android pausing Termux while tasks run
-node ~/claude-code-mobile/bridge/ccm-bridge.mjs --pair
+node ~/agy-mobile/bridge/ccm-bridge.mjs --pair
 ```
 
 `--pair` opens the app with the address and token; confirm the dialog and you're connected.

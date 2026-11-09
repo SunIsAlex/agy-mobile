@@ -144,15 +144,15 @@ private fun groups(list: List<ProcInfo>, sessions: List<SessionSummary>): List<T
     val other = list.filter { it.role == "other" || (it.role in order && it.sid == null) }
     return tasks + listOfNotNull(
         other.takeIf { it.isNotEmpty() }?.let { Triple("Other", null, it) },
-        own.takeIf { it.isNotEmpty() }?.let { Triple("CC Mobile", null, it) },
+        own.takeIf { it.isNotEmpty() }?.let { Triple("AGY Mobile", null, it) },
     )
 }
 
 /** A dialog for actions that end or disrupt work; null for those that don't need one. */
 private fun confirmation(p: ProcInfo, action: String): Pending? = when {
     action == "SIGSTOP" || action == "SIGCONT" -> null
-    p.role == "claude" -> Pending(p, action, "Stop Claude?", "This ends the task's Claude process and anything it's running. The task's next message starts it again.")
-    p.role == "keeper" -> Pending(p, action, "Stop keeper?", "The keeper runs this task's Claude. Stopping it ends Claude too.")
+    p.role == "claude" -> Pending(p, action, "Stop AGY?", "This ends the task's AGY process and anything it's running. The task's next message starts it again.")
+    p.role == "keeper" -> Pending(p, action, "Stop keeper?", "The keeper runs this task's AGY. Stopping it ends AGY too.")
     action == "SIGKILL" -> Pending(p, action, "Kill ${p.name}?", "It ends at once, without a chance to save its work.")
     action == "restart" -> Pending(p, action, "Restart ${p.name}?", "It's stopped and run again with the same command and folder. Its output goes to the bridge's process-logs folder.")
     else -> null
@@ -173,7 +173,7 @@ private fun ProcessRow(p: ProcInfo, busy: Boolean, onAction: (String) -> Unit) {
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(if (p.role == "claude") "Claude" else p.name, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium,
+            Text(if (p.role == "claude") "AGY" else p.name, color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.Medium,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             roleLabel(p)?.let { Tag(it) }
             if (p.paused) Tag("paused", warn = true)

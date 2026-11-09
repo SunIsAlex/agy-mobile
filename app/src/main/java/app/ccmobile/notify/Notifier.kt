@@ -32,7 +32,7 @@ object Notifier {
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_APPROVALS, "Approvals", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Claude is waiting for you to allow or deny an action"
+                description = "AGY is waiting for you to allow or deny an action"
             },
         )
         nm.createNotificationChannel(
@@ -41,13 +41,13 @@ object Notifier {
             },
         )
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_ACTIVITY, "Claude's progress", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "What Claude is doing in each running task"
+            NotificationChannel(CHANNEL_ACTIVITY, "AGY's progress", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "What AGY is doing in each running task"
             },
         )
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_FINISHED, "Finished tasks", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Claude finished a task or stopped with an error"
+                description = "AGY finished a task or stopped with an error"
             },
         )
     }
@@ -77,7 +77,7 @@ object Notifier {
             val q = approval.questions.first()
             val question = NotificationCompat.Builder(context, CHANNEL_APPROVALS)
                 .setSmallIcon(R.drawable.ic_shield)
-                .setContentTitle("Claude has a question")
+                .setContentTitle("AGY has a question")
                 .setContentText(q.question)
                 .setSubText(approval.sessionTitle)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(q.question + "\n" + q.options.joinToString(" · ") { it.label }))

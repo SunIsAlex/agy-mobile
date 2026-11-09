@@ -169,7 +169,7 @@ class BridgeService : LifecycleService() {
 
     private fun status(text: String) = NotificationCompat.Builder(this, Notifier.CHANNEL_SERVICE)
         .setSmallIcon(R.drawable.ic_terminal)
-        .setContentTitle("CC Mobile")
+        .setContentTitle("AGY Mobile")
         .setContentText(text)
         .setOngoing(true)
         .setContentIntent(Notifier.openSessionIntent(this, null))

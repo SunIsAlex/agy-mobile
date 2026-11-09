@@ -109,9 +109,13 @@ setup_storage() {
   fi
 }
 
-# The chroot's ~/.claude/projects becomes a link to Termux's. What the chroot had is merged in first
-# without overwriting anything (a differing memory file is kept as NAME.chroot.md) and kept as a backup.
+# The chroot's ~/.gemini and ~/.claude/projects become links to Termux's.
 share_projects() {
+  if [ -d "$TERMUX_HOME/.gemini" ] && [ ! -e "$CHOME/.gemini" ] && [ ! -L "$CHOME/.gemini" ]; then
+    ln -s "$TERMUX_HOME/.gemini" "$CHOME/.gemini"
+    "$BB" chown -h "$TUID:$TUID" "$CHOME/.gemini"
+    chcon -h "$1" "$CHOME/.gemini" || true
+  fi
   mine=$CHOME/.claude/projects
   theirs=$TERMUX_HOME/.claude/projects
   [ -L "$mine" ] && return 0
@@ -187,7 +191,7 @@ start_rootd() {
   [ -f "$BASE/root-off" ] && return 0
   rootd_pid >/dev/null && return 0
   "$BB" setsid /system/bin/sh "$SELF" _rootd < /dev/null > /dev/null 2>&1 &
-  # The bridge checks for root (phone use) when it starts, so wait for the helper to listen.
+  # The bridge checks for root when it starts, so wait for the helper to listen.
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -S "$ROOT/run/ccm-root.sock" ] && return 0; sleep 1; done
   echo "ccm-chroot: the root helper didn't start (see $BASE/rootd.log)" >&2
 }
@@ -197,10 +201,21 @@ stop_rootd() {
   rm -f "$ROOT/run/ccm-root.sock"
 }
 
-# Files Claude in the chroot relies on: the su shim and a note on what it does.
+# Files agy in the chroot relies on: the su shim, agy wrapper, and environment notes.
 install_helpers() {
   cp "$(dirname "$SELF")/su" "$ROOT/usr/local/bin/su" 2>/dev/null || cp "$(dirname "$BRIDGE")/../chroot/su" "$ROOT/usr/local/bin/su"
   chmod 755 "$ROOT/usr/local/bin/su"
+  mkdir -p "$CHOME/.local/bin"
+  cat > "$CHOME/.local/bin/agy" <<EOF
+#!/bin/sh
+export AGY_CLI_DISABLE_AUTO_UPDATE="\${AGY_CLI_DISABLE_AUTO_UPDATE:-true}"
+if [ -x "$TERMUX_HOME/.agy-termux-musl/agy.bin" ]; then
+  exec "$TERMUX_HOME/.agy-termux-musl/agy.bin" "\$@"
+fi
+exec "$TERMUX_HOME/.local/bin/agy" "\$@"
+EOF
+  chmod 755 "$CHOME/.local/bin/agy"
+  "$BB" chown -R "$TUID:$TUID" "$CHOME/.local"
   notes=$ROOT/home/claude/.claude/CLAUDE.md
   if [ ! -f "$notes" ]; then
     mkdir -p "$ROOT/home/claude/.claude"
@@ -215,8 +230,7 @@ $TERMUX_HOME has the same path in both, but other chroot paths are under /data/c
 (\$CCM_ROOTFS), so put files for Android (APKs to install, for example) in $TERMUX_HOME.
 
 Your files live in /data/ccm/home (your home), separate from Termux's home at $TERMUX_HOME; both have
-the same paths here and in Termux. ~/.claude/projects (session records and project memory) is shared with
-Claude Code in Termux.
+the same paths here and in Termux. ~/.gemini (Antigravity CLI state and conversations) is shared with Termux.
 
 To install Debian packages, run apt as root in this chroot from the Android side:
 su -c 'chroot /data/ccm/rootfs /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive apt-get install -y PACKAGE'
@@ -269,21 +283,22 @@ cmd_install() {
   # Debian calls it fdfind.
   in_root ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
-  echo "Installing Claude Code…"
-  as_claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-  as_claude bash -lc 'claude --version'
+  setup_storage
+  install_helpers
+  as_claude bash -lc 'agy --version'
   echo
   echo "Installed. Next: ccm-chroot login (sign in once), then ccm-chroot start and ccm-chroot pair."
 }
 
 cmd_start() {
   [ -d "$ROOT/usr" ] || die "not installed; run: ccm-chroot install"
+  cp "$SELF" "$BASE/ccm-chroot" 2>/dev/null || true
   setup_storage
   do_mount
   install_helpers
   start_rootd
   if pid=$(bridge_pid); then echo "bridge already running (pid $pid) on port $PORT"; return; fi
-  as_claude test -x /home/claude/.local/bin/claude || die "Claude Code isn't installed in the chroot"
+  as_claude test -x /home/claude/.local/bin/agy || die "agy isn't installed in the chroot"
   as_claude mkdir -p /home/claude/.local/state/ccm-bridge
   # In its own session, so it outlives the su that started it.
   "$BB" setsid /system/bin/sh "$SELF" _bridge < /dev/null > /dev/null 2>&1 &
@@ -296,7 +311,7 @@ cmd_start() {
 }
 
 cmd_stop() {
-  # Everything whose root is the chroot: the bridge, keepers, Claude and the jobs it started.
+  # Everything whose root is the chroot: the bridge, keepers, agy and the jobs it started.
   for sig in TERM KILL; do
     found=
     for p in /proc/[0-9]*; do
@@ -313,7 +328,7 @@ cmd_status() {
   [ -d "$ROOT/usr" ] || { echo "not installed"; return; }
   mounted "$ROOT$TERMUX_HOME" && echo "mounted" || echo "not mounted"
   if pid=$(bridge_pid); then echo "bridge running (pid $pid) on 127.0.0.1:$PORT"; else echo "bridge not running"; fi
-  as_claude bash -lc 'claude --version 2>/dev/null || echo "Claude Code: not installed"' 2>/dev/null || true
+  as_claude bash -lc 'agy --version 2>/dev/null || echo "agy: not installed"' 2>/dev/null || true
   [ -f /data/adb/service.d/ccm-chroot.sh ] && echo "starts at boot" || echo "doesn't start at boot"
   if pid=$(rootd_pid); then echo "root on (helper pid $pid)"; elif [ -f "$BASE/root-off" ]; then echo "root off"; else echo "root helper not running"; fi
 }
@@ -321,7 +336,7 @@ cmd_status() {
 cmd_pair() {
   token=$(cat "$STATE/token" 2>/dev/null) || die "no token yet; run: ccm-chroot start"
   token=$(echo "$token" | "$BB" tr -d '[:space:]')
-  url="ccmobile://pair?host=127.0.0.1&port=$PORT&token=$token"
+  url="agymobile://pair?host=127.0.0.1&port=$PORT&token=$token"
   am start -a android.intent.action.VIEW -d "$url" >/dev/null 2>&1 || echo "Pair link: $url"
 }
 
@@ -341,7 +356,7 @@ cmd_boot() {
       mkdir -p /data/adb/service.d
       cat > /data/adb/service.d/ccm-chroot.sh <<EOF
 #!/system/bin/sh
-# Starts CC Mobile's chroot bridge once Android has booted and /data is unlocked.
+# Starts AGY Mobile's chroot bridge once Android has booted and /data is unlocked.
 until [ "\$(getprop sys.boot_completed)" = 1 ] && [ -d $TERMUX_HOME ]; do sleep 5; done
 /system/bin/sh $BASE/ccm-chroot start > $BASE/boot.log 2>&1
 EOF
@@ -374,7 +389,7 @@ case "$1" in
   root) cmd_root "$2" ;;
   uninstall) cmd_uninstall ;;
   shell) setup_storage; do_mount; as_claude bash -l ;;
-  login) setup_storage; do_mount; as_claude bash -lc claude ;;
+  login) setup_storage; do_mount; as_claude bash -lc agy ;;
   mount) do_mount ;;
   _rootd) "$BB" chroot "$ROOT" /usr/bin/env -i HOME=/root LANG=C.UTF-8 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       node "$(dirname "$BRIDGE")/../chroot/ccm-rootd.mjs" /run/ccm-root.sock "$ROOT" "$TERMUX_HOME" "$TUID" >> "$BASE/rootd.log" 2>&1 ;;

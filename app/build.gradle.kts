@@ -10,7 +10,7 @@ android {
     buildToolsVersion = "36.1.0"
 
     defaultConfig {
-        applicationId = "app.ccmobile"
+        applicationId = "app.agymobile"
         minSdk = 29
         targetSdk = 36
         versionCode = 1

@@ -223,7 +223,7 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
         Row(Modifier.padding(start = 4.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             IconBtn(R.drawable.ic_back, "Back", ::leave)
             Column(Modifier.weight(1f)) {
-                Text(if (login) "Log in to Claude" else "Debian", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (login) "Log in to AGY" else "Debian", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 Text(if (connected) "${size.first}×${size.second}" else "Not connected", color = C.Muted, fontSize = 12.sp, fontFamily = Mono)
             }
             ToolText("A−", "Smaller text") { setFont(fontSize - 1) }

@@ -161,4 +161,13 @@ class TranscriptTest {
         val end = t.snapshot().last() as TurnEndItem
         assertEquals("Done · 3s · 1.2k out · 12k in", end.text)
     }
+
+    @Test
+    fun streamInterruptedErrorFormatting() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"result","subtype":"error","is_error":true,"result":"The stream was interrupted. Please continue the task you were working on."}"""))
+        val end = t.snapshot().last() as TurnEndItem
+        assertEquals("Stream interrupted", end.text)
+        assertTrue(end.error)
+    }
 }

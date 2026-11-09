@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">CC Mobile</string>
+    <string name="app_name">AGY Mobile</string>
     <string name="shortcut_terminal">Debian terminal</string>
     <string name="shortcut_terminal_long">Open the Debian terminal</string>
 </resources>

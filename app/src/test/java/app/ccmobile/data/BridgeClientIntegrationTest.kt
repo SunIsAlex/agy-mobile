@@ -43,7 +43,10 @@ class BridgeClientIntegrationTest {
         }
         val port = 20000 + (Math.random() * 20000).toInt()
         val proc = ProcessBuilder(node, File(bridgeDir, "ccm-bridge.mjs").path, "--port", "$port", "--roots", File(tmp, "repos").path, "--state-dir", File(tmp, "state").path)
-            .apply { environment()["CCM_CLAUDE_BIN"] = fake.path }
+            .apply {
+                environment()["CCM_CLAUDE_BIN"] = fake.path
+                environment()["CCM_LEGACY_PROTO"] = "1"
+            }
             .redirectErrorStream(true)
             .start()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

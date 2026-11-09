@@ -9,7 +9,7 @@
         android:shortcutLongLabel="@string/shortcut_terminal_long">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetPackage="app.ccmobile"
+            android:targetPackage="app.agymobile"
             android:targetClass="app.ccmobile.MainActivity">
             <extra android:name="screen" android:value="terminal" />
         </intent>

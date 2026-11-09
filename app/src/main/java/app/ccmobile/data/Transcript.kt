@@ -88,7 +88,11 @@ class Transcript(private val sid: String, private val title: String) {
                     inTokens.takeIf { it > 0 }?.let { "${UsageText.compact(it)} in" },
                 ).joinToString(" · ").takeIf { it.isNotEmpty() }
                 val text = if (error) {
-                    "Stopped: " + (msg.str("result") ?: msg.str("subtype") ?: "error")
+                    val raw = (msg.str("result") ?: msg.str("subtype") ?: "error").trim()
+                    when {
+                        raw.contains("stream was interrupted", ignoreCase = true) || raw.contains("interrupted", ignoreCase = true) -> "Stream interrupted"
+                        else -> "Stopped: $raw"
+                    }
                 } else {
                     listOfNotNull(
                         "Done",

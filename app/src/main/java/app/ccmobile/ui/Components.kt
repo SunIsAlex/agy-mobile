@@ -209,24 +209,29 @@ val modeLabels = listOf("default" to "Ask first", "acceptEdits" to "Auto-edit", 
 fun modeLabel(mode: String): String = modeLabels.firstOrNull { it.first == mode }?.second ?: mode
 
 fun modeDescription(mode: String): String = when (mode) {
-    "acceptEdits" -> "Claude edits files without asking. Commands still need your OK."
-    "plan" -> "Claude researches and proposes a plan. Nothing changes until you approve it."
-    YOLO -> "Claude runs commands and edits files without asking. Only changes to settings, git and tool config still need your OK."
-    else -> "Claude asks before editing files or running commands."
+    "acceptEdits" -> "AGY edits files without asking. Commands still need your OK."
+    "plan" -> "AGY researches and proposes a plan. Nothing changes until you approve it."
+    YOLO -> "AGY runs commands and edits files without asking (--dangerously-skip-permissions)."
+    else -> "AGY asks before editing files or running commands."
 }
-val effortLabels = listOf("" to "Default", "low" to "Low", "medium" to "Medium", "high" to "High", "xhigh" to "Extra high", "max" to "Max")
+val effortLabels = listOf("" to "Default", "low" to "Low", "medium" to "Medium", "high" to "High")
 
 fun effortLabel(effort: String?): String = effortLabels.firstOrNull { it.first == effort.orEmpty() }?.second ?: effort.orEmpty()
 
 fun effortDescription(effort: String): String = when (effort) {
     "low" -> "Quick answers with little thinking. Fastest, and lightest on your limits."
-    "medium" -> "Some thinking. A good fit for routine edits."
-    "high" -> "Thinks things through before acting."
-    "xhigh" -> "Thinks longer, for tricky bugs and designs."
-    "max" -> "Thinks as long as it needs. Slowest, and uses the most of your limits."
+    "medium" -> "Balanced thinking. A good fit for routine tasks and edits."
+    "high" -> "Deep thinking before acting, for complex bugs and architecture."
     else -> "Uses the model's own default."
 }
-// Haiku 5.5 by its full id: Claude Code 2.1.289's "haiku" alias still means Haiku 4.5.
 val modelLabels = listOf(
-    "" to "Default", "opus" to "Opus", "sonnet" to "Sonnet", "claude-haiku-5-5" to "Haiku 5.5", "haiku" to "Haiku 4.5",
+    "" to "Default",
+    "gemini-4-argon" to "Argon",
+    "gemini-3.8-flash" to "Flash",
+    "claude-opus-5-5" to "Opus",
+    "claude-sonnet-5-5" to "Sonnet",
+    "gpt-oss-120b" to "GPT-OSS",
 )
+
+fun modelLabel(model: String?): String = modelLabels.firstOrNull { it.first == model.orEmpty() }?.second ?: model.orEmpty()
+

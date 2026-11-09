@@ -1017,14 +1017,15 @@ class Session {
       let isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
       const rawErrorText = String(res.error || (res.status === 'ERROR' ? res.response : '') || '');
       const isRateLimit = isError && /rate.?limit|quota|429|resource_exhausted/i.test(rawErrorText);
+      const isStreamInterrupted = isError && /stream.*interrupted|interrupted.*stream/i.test(rawErrorText);
       const activeModel = this.currentModel ?? this.model ?? 'agy';
       const hasKnownLimits = Array.isArray(limits?.windows) && limits.windows.length > 0;
       const modelExhausted = hasKnownLimits ? isModelQuotaExhausted(activeModel, limits) : true;
 
       // If the turn produced a complete response, stale error details from earlier turns (e.g. model switches)
-      // must not fail the turn or mark it as rate-limited.
+      // or post-response stream interruptions must not fail the turn or mark it as rate-limited.
       if (hadTurnResponse && isError) {
-        if (isRateLimit || !res.status || res.status === 'SUCCESS') {
+        if (isRateLimit || isStreamInterrupted || !res.status || res.status === 'SUCCESS') {
           isError = false;
         }
       }
@@ -1043,7 +1044,7 @@ class Session {
         cache_creation_input_tokens: 0,
         thinking_tokens: res.usage.thinking_tokens ?? 0,
       } : undefined;
-      if (!this.turnHadText && !isError && typeof res.response === 'string' && res.response.trim()) {
+      if (!this.turnHadText && !isError && typeof res.response === 'string' && res.response.trim() && !isStreamInterrupted) {
         this.onCliMessage({
           type: 'assistant',
           uuid: `turn-${Date.now()}`,
@@ -1068,7 +1069,7 @@ class Session {
           message: `Denied in ${this.mode} mode: ${names}. Switch mode to YOLO to allow all tool actions automatically.`,
         });
       }
-      if (isError && (this.idleExit || /stream input cancelled/i.test(errText))) {
+      if (isError && (this.idleExit || this.status === 'idle' || /stream input cancelled/i.test(errText))) {
         return;
       }
       if (isError && isRateLimit) {
