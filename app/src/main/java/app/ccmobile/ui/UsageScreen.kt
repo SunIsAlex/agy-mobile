@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
+import app.ccmobile.data.AuthStatus
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.DayUsage
 import app.ccmobile.data.LimitWindow
@@ -84,6 +85,11 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
     var reload by remember { mutableIntStateOf(0) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var lastUpdatedAt by remember { mutableLongStateOf(0L) }
+    var auth by remember { mutableStateOf<AuthStatus?>(null) }
+    LaunchedEffect(connected) {
+        if (connected) auth = repository.authStatus().getOrNull()
+    }
+    val isGemini = auth?.provider == "gemini" || auth?.subscriptionType == "Gemini API"
 
     LaunchedEffect(range, connected, reload) {
         if (!connected) return@LaunchedEffect
@@ -169,7 +175,7 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
                 )
             }
 
-            UsageSection("Plan limits") { LimitsCard(limits, now) }
+            UsageSection("Plan limits") { LimitsCard(limits, now, isGemini) }
 
             if (liveSessions.isNotEmpty()) {
                 UsageSection(if (anyActive) "Live task usage" else "Recent task usage") {
@@ -280,10 +286,17 @@ private fun levelOf(utilization: Double) = when {
 }
 
 @Composable
-private fun LimitsCard(limits: Limits?, now: Long) {
+private fun LimitsCard(limits: Limits?, now: Long, isGemini: Boolean = false) {
     UsageCard {
         if (limits == null || limits.windows.isEmpty()) {
-            Text("Limits show up after AGY's next reply, or tap Refresh above.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
+            if (isGemini) {
+                Text(
+                    "Using Gemini API key. API rate limits and token quotas are managed in Google AI Studio / Google Cloud Console.",
+                    color = C.TextSoft, fontSize = 13.sp, lineHeight = 18.sp,
+                )
+            } else {
+                Text("Limits show up after AGY's next reply, or tap Refresh above.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
+            }
             return@UsageCard
         }
         limits.windows.forEachIndexed { i, w ->

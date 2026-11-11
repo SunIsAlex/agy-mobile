@@ -13,6 +13,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const bridgePath = path.join(here, '..', 'ccm-bridge.mjs');
 const fakeClaude = path.join(here, 'fake-claude.mjs');
 
+// Isolate test processes from ambient agent environment if tests are run from inside an active AGY session.
+delete process.env.AGY_SESSION_ID;
+delete process.env.ANTIGRAVITY_CONVERSATION_ID;
+delete process.env.ANTIGRAVITY_SOURCE_METADATA;
+
 // A wrapper script, because shebangs like /usr/bin/env don't exist everywhere (e.g. Termux).
 function fakeClaudeWrapper(dir) {
   const sh = ['/bin/sh', '/system/bin/sh'].find((p) => fs.existsSync(p));
@@ -1235,6 +1240,20 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     assert.equal(auth.loggedIn, true);
     assert.equal(auth.email, 'user@antigravity.dev');
     assert.equal(auth.subscriptionType, 'Antigravity');
+
+    // 1b. Switch to Gemini API key and back
+    c.send({ op: 'set_auth', ref: 101, provider: 'gemini', apiKey: 'AQ.TestKey123456789' });
+    const geminiAuth = (await c.next((m) => m.ev === 'auth' && m.ref === 101)).auth;
+    assert.equal(geminiAuth.loggedIn, true);
+    assert.equal(geminiAuth.provider, 'gemini');
+    assert.equal(geminiAuth.subscriptionType, 'Gemini API');
+    assert.equal(geminiAuth.hasGeminiKey, true);
+
+    c.send({ op: 'set_auth', ref: 102, provider: 'google' });
+    const googleAuth = (await c.next((m) => m.ev === 'auth' && m.ref === 102)).auth;
+    assert.equal(googleAuth.loggedIn, true);
+    assert.equal(googleAuth.provider, 'google');
+    assert.equal(googleAuth.subscriptionType, 'Antigravity');
 
     // 2. Check AGY resume list from brain/<id>/transcript.jsonl
     c.send({ op: 'claude_sessions', ref: 11 });

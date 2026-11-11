@@ -22,6 +22,11 @@ class Settings(context: Context) {
         get() = prefs.getString("mode", "bypassPermissions")!!
         set(v) = prefs.edit { putString("mode", v) }
 
+    /** Google Gemini API key when using modelProvider: "gemini". */
+    var geminiApiKey: String
+        get() = prefs.getString("geminiApiKey", "")!!
+        set(v) = prefs.edit { putString("geminiApiKey", v) }
+
     /** Model alias passed to `--model`, or blank for the CLI's default. */
     var model: String
         get() = prefs.getString("model", "")!!

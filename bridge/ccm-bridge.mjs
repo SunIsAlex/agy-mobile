@@ -534,11 +534,13 @@ class Session {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     execFileSync('mkfifo', ['-m', '600', path.join(dir, 'in')]);
+    const geminiApiKey = getGeminiApiKey();
     const env = {
       ...process.env,
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       AGY_SESSION_ID: this.id,
       CLAUDE_CODE_SESSION_ID: this.id,
+      ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
     };
     spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env }).unref();
     this.started = true;
@@ -1170,10 +1172,15 @@ class Session {
   runSlashCommand(cmd) {
     const args = ['-p', cmd, '--output-format', 'json'];
     if (this.cliSessionId) args.push('--conversation', this.cliSessionId);
+    const geminiApiKey = getGeminiApiKey();
     execFile(claudeBin, args, {
       cwd: this.cwd,
       timeout: 30_000,
-      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+      env: {
+        ...process.env,
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+        ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
+      },
     }, (err, stdout, stderr) => {
       let reply = '';
       let isError = false;
@@ -1241,6 +1248,14 @@ class Session {
         'gemini-4-argon': 'gemini-4-argon',
         flash: 'gemini-3.8-flash',
         'gemini-3.8-flash': 'gemini-3.8-flash',
+        '3.8-flash': 'gemini-3.8-flash',
+        'flash-3.8': 'gemini-3.8-flash',
+        '3.7-flash': 'gemini-3.7-flash',
+        'flash-3.7': 'gemini-3.7-flash',
+        'gemini-3.7-flash': 'gemini-3.7-flash',
+        '3.1-pro': 'gemini-3.1-pro',
+        'pro-3.1': 'gemini-3.1-pro',
+        'gemini-3.1-pro': 'gemini-3.1-pro',
         opus: 'claude-opus-5-5',
         'claude-opus-5-5': 'claude-opus-5-5',
         sonnet: 'claude-sonnet-5-5',
@@ -2006,6 +2021,7 @@ function parseAgyLimitsOutput(parsed) {
  */
 async function fetchDirectAgyQuota() {
   if (process.env.CCM_LEGACY_PROTO === '1') return false;
+  if (isGeminiApiActive()) return false;
   if (process.env.FAKE_AGY_USAGE === '1' && !process.env.CCM_QUOTA_URL) return false;
   const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
   if (!fs.existsSync(tokenPath)) return false;
@@ -2051,10 +2067,15 @@ function refreshAgyLimits(force = false) {
   limitsRefreshPromise = (async () => {
     try {
       if (await fetchDirectAgyQuota()) return limits;
+      const geminiApiKey = getGeminiApiKey();
       await new Promise((resolve) => {
         execFile(claudeBin, ['-p', '/usage', '--output-format', 'json'], {
           timeout: 15_000,
-          env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
+          env: {
+            ...process.env,
+            AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+            ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
+          },
         }, (err, stdout) => {
           if (!err && stdout) {
             try { parseAgyLimitsOutput(JSON.parse(stdout)); } catch {}
@@ -2439,7 +2460,14 @@ class Terminal {
     this.size = 0;
     this.clients = new Set();
     this.links = []; // sign-in pages for the app to open, as {url, local}
-    const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', AGY_CLI_DISABLE_AUTO_UPDATE: 'true' };
+    const geminiApiKey = getGeminiApiKey();
+    const env = {
+      ...process.env,
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor',
+      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
+    };
     let command = chrootShell;
     if (kind === 'login') {
       command = () => process.env.CCM_LEGACY_PROTO === '1' ? [claudeBin, 'auth', 'login'] : [claudeBin];
@@ -2505,8 +2533,107 @@ function terminalFor(id) {
   return term;
 }
 
-/** Who AGY is signed in as here: reads ~/.gemini/antigravity-cli/antigravity-oauth-token (or falls back to `auth status --json`). */
+/** Reads the stored or configured Gemini API key if present. */
+function getGeminiApiKey() {
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
+    return process.env.GEMINI_API_KEY.trim();
+  }
+  const candidates = [
+    path.join(agyDataDir, 'gemini-api-key'),
+    path.join(stateDir, 'gemini-api-key'),
+  ];
+  for (const f of candidates) {
+    if (fs.existsSync(f)) {
+      try {
+        const k = fs.readFileSync(f, 'utf8').trim();
+        if (k) return k;
+      } catch {}
+    }
+  }
+  const settingsFile = path.join(agyDataDir, 'settings.json');
+  if (fs.existsSync(settingsFile)) {
+    try {
+      const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      if (s.geminiApiKey && typeof s.geminiApiKey === 'string') return s.geminiApiKey.trim();
+    } catch {}
+  }
+  return null;
+}
+
+/** Checks whether AGY is configured to use the Gemini API directly. */
+function isGeminiApiActive() {
+  const settingsFile = path.join(agyDataDir, 'settings.json');
+  if (fs.existsSync(settingsFile)) {
+    try {
+      const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      if (s.modelProvider === 'gemini') return true;
+    } catch {}
+  }
+  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
+  return !fs.existsSync(tokenPath) && Boolean(getGeminiApiKey());
+}
+
+/** Updates settings.json in agyDataDir safely. */
+function updateAgySettings(updater) {
+  try {
+    fs.mkdirSync(agyDataDir, { recursive: true, mode: 0o700 });
+    const p = path.join(agyDataDir, 'settings.json');
+    let current = {};
+    if (fs.existsSync(p)) {
+      try { current = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
+    }
+    updater(current);
+    fs.writeFileSync(p, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 });
+  } catch {}
+}
+
+/** Saves the Gemini API key across known config locations. */
+function saveGeminiApiKey(apiKey) {
+  const key = String(apiKey ?? '').trim();
+  if (!key) return;
+  process.env.GEMINI_API_KEY = key;
+  for (const d of [agyDataDir, stateDir]) {
+    try {
+      fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(d, 'gemini-api-key'), key + '\n', { mode: 0o600 });
+    } catch {}
+  }
+  updateAgySettings((s) => {
+    s.geminiApiKey = key;
+    s.modelProvider = 'gemini';
+  });
+}
+
+/** Sets model provider ('gemini' or null/'google'). */
+function setAgyModelProvider(provider) {
+  if (provider === 'gemini') {
+    updateAgySettings((s) => {
+      s.modelProvider = 'gemini';
+    });
+  } else {
+    updateAgySettings((s) => {
+      delete s.modelProvider;
+    });
+  }
+}
+
+/** Who AGY is signed in as here: reads ~/.gemini/antigravity-cli/antigravity-oauth-token, Gemini API key, or falls back to `auth status --json`. */
 function authStatus() {
+  const geminiKey = getGeminiApiKey();
+  const geminiActive = isGeminiApiActive();
+  if (geminiActive && geminiKey) {
+    const masked = geminiKey.length > 8 ? `${geminiKey.slice(0, 4)}...${geminiKey.slice(-4)}` : 'Key configured';
+    return Promise.resolve({
+      loggedIn: true,
+      authMethod: 'gemini-api-key',
+      email: null,
+      subscriptionType: 'Gemini API',
+      orgName: masked,
+      provider: 'gemini',
+      hasGeminiKey: true,
+    });
+  }
+
   const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
   if (fs.existsSync(tokenPath) && process.env.CCM_LEGACY_PROTO !== '1') {
     try {
@@ -2528,12 +2655,28 @@ function authStatus() {
         email,
         subscriptionType: 'Antigravity',
         orgName,
+        provider: 'google',
+        hasGeminiKey: Boolean(geminiKey),
       });
     } catch {}
   }
+  if (geminiKey) {
+    return Promise.resolve({
+      loggedIn: false,
+      authMethod: null,
+      email: null,
+      subscriptionType: null,
+      orgName: null,
+      provider: 'google',
+      hasGeminiKey: true,
+    });
+  }
   return new Promise((resolve) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
-    try { resolve(JSON.parse(stdout)); } catch {
-      resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null });
+    try {
+      const res = JSON.parse(stdout);
+      resolve({ ...res, provider: 'google', hasGeminiKey: false });
+    } catch {
+      resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null, provider: 'google', hasGeminiKey: false });
     }
   }));
 }
@@ -2764,6 +2907,21 @@ class Client {
       case 'term_detach': terminals.get(String(msg.id ?? ''))?.clients.delete(this); break;
       case 'term_close': terminalFor(msg.id).close(); break;
       case 'auth': this.send({ ev: 'auth', ref, auth: await authStatus() }); break;
+      case 'set_auth': {
+        const provider = msg.provider === 'gemini' ? 'gemini' : 'google';
+        const apiKey = typeof msg.apiKey === 'string' ? msg.apiKey.trim() : null;
+        if (provider === 'gemini') {
+          if (apiKey) {
+            saveGeminiApiKey(apiKey);
+          } else {
+            setAgyModelProvider('gemini');
+          }
+        } else {
+          setAgyModelProvider(null);
+        }
+        this.send({ ev: 'auth', ref, auth: await authStatus() });
+        break;
+      }
       case 'voice_start': {
         const id = String(msg.id ?? '');
         if (!id || this.voices.has(id)) throw new Error('Bad voice id');

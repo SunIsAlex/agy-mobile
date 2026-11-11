@@ -48,7 +48,7 @@ if (process.argv[2] === '-p' && process.argv[3]?.startsWith('/')) {
   } else if (cmd === '/models') {
     process.stdout.write(JSON.stringify({
       status: 'SUCCESS',
-      response: 'Available models: gemini-4-carbon, gemini-4-argon, gemini-3.8-flash',
+      response: 'Available models: gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, gemini-3.7-flash, gemini-3.1-pro',
     }) + '\n');
   }
   process.exit(0);

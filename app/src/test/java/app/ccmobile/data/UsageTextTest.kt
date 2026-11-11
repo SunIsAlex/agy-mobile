@@ -22,6 +22,8 @@ class UsageTextTest {
         assertEquals("Gemini 4 Carbon", UsageText.modelName("gemini-4-carbon"))
         assertEquals("Gemini 4 Argon", UsageText.modelName("gemini-4-argon"))
         assertEquals("Gemini 3.8 Flash", UsageText.modelName("gemini-3.8-flash"))
+        assertEquals("Gemini 3.7 Flash", UsageText.modelName("gemini-3.7-flash"))
+        assertEquals("Gemini 3.1 Pro", UsageText.modelName("gemini-3.1-pro"))
         assertEquals("GPT-OSS 120B", UsageText.modelName("gpt-oss-120b"))
         assertEquals("unknown", UsageText.modelName("unknown"))
     }

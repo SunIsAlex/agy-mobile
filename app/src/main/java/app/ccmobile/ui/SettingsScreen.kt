@@ -33,7 +33,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -104,6 +106,10 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
     var auth by remember { mutableStateOf<Result<AuthStatus>?>(null) }
     LaunchedEffect(conn) { auth = if (conn is ConnState.Connected) repository.authStatus() else null }
 
+    val scope = rememberCoroutineScope()
+    var geminiApiKeyInput by remember { mutableStateOf(settings.geminiApiKey) }
+    var isSavingAuth by remember { mutableStateOf(false) }
+
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         notify = granted
         settings.notify = granted
@@ -162,24 +168,82 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
 
             Section("AGY account") {
                 val status = auth?.getOrNull()
+                val isGemini = status?.provider == "gemini" || status?.subscriptionType == "Gemini API"
                 Text(
                     when {
                         conn !is ConnState.Connected -> "Connect to a bridge to see which account AGY uses."
                         auth == null -> "Checking…"
                         status == null -> auth?.exceptionOrNull()?.message ?: "Couldn't check the login."
-                        !status.loggedIn -> "Not signed in. Tasks fail until AGY on the bridge is logged in."
+                        !status.loggedIn -> "Not signed in. Connect your Google account or provide a Gemini API key."
+                        isGemini -> "Signed in with Gemini API" + (status.orgName?.let { " · $it" } ?: "")
                         else -> "Signed in" + (status.email?.let { " as $it" } ?: "") +
                             (status.subscriptionType?.let { " · ${it.replaceFirstChar(Char::uppercase)}" }
                                 ?: if (status.authMethod == "google") "" else " · ${status.authMethod}")
                     },
                     color = if (status?.loggedIn == false) C.Red else C.TextSoft, fontSize = 14.sp,
                 )
-                if (status?.loggedIn == true) SecondaryButton("Log in with another account", onLogin, modifier = Modifier.fillMaxWidth())
-                else PrimaryButton("Log in to AGY", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
-                Text(
-                    "Runs agy auth login on the bridge and opens the sign-in page in your browser.",
-                    color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
-                )
+
+                if (isGemini) {
+                    Field("Gemini API Key", geminiApiKeyInput, { geminiApiKeyInput = it }, secret = true)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SecondaryButton(
+                            if (isSavingAuth) "Saving…" else "Update key",
+                            {
+                                scope.launch {
+                                    isSavingAuth = true
+                                    auth = repository.setAuth("gemini", geminiApiKeyInput.trim())
+                                    isSavingAuth = false
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = !isSavingAuth && geminiApiKeyInput.isNotBlank() && conn is ConnState.Connected,
+                        )
+                        SecondaryButton(
+                            if (isSavingAuth) "Switching…" else "Use Google account",
+                            {
+                                scope.launch {
+                                    isSavingAuth = true
+                                    auth = repository.setAuth("google", null)
+                                    isSavingAuth = false
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = !isSavingAuth && conn is ConnState.Connected,
+                        )
+                    }
+                    Text(
+                        "Tasks run against Google's Gemini API directly with your API key. Rate limits and token quota are managed in Google AI Studio.",
+                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                    )
+                } else {
+                    if (status?.loggedIn == true) {
+                        SecondaryButton("Log in with another account", onLogin, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        PrimaryButton("Log in to AGY", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
+                    }
+                    Text(
+                        "Runs agy auth login on the bridge and opens the sign-in page in your browser.",
+                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                    )
+
+                    Field("Gemini API Key", geminiApiKeyInput, { geminiApiKeyInput = it }, secret = true)
+                    SecondaryButton(
+                        if (isSavingAuth) "Connecting…" else "Use Gemini API Key",
+                        {
+                            scope.launch {
+                                isSavingAuth = true
+                                auth = repository.setAuth("gemini", geminiApiKeyInput.trim())
+                                isSavingAuth = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isSavingAuth && geminiApiKeyInput.isNotBlank() && conn is ConnState.Connected,
+                    )
+                    Text(
+                        "Or connect using a Gemini API key from Google AI Studio without signing in.",
+                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                    )
+                }
             }
 
             Section("Default agent mode") {

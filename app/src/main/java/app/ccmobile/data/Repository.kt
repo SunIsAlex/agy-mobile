@@ -244,6 +244,20 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         return runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
     }
 
+    /** Sets the auth provider ("gemini" or "google") and optional API key on the bridge. */
+    suspend fun setAuth(provider: String, apiKey: String? = null): Result<AuthStatus> {
+        val reply = call("set_auth", quiet = true, "provider" to provider, "apiKey" to apiKey)
+            ?: return Result.failure(Exception("The bridge didn't answer."))
+        if (reply.str("ev") == "error") {
+            return Result.failure(Exception(reply.str("message") ?: "Failed to update authentication."))
+        }
+        val status = runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
+        if (status.isSuccess && !apiKey.isNullOrBlank()) {
+            settings.geminiApiKey = apiKey
+        }
+        return status
+    }
+
     fun termInput(id: String, base64: String) { termInputs.trySend(id to base64) }
     fun termResize(id: String, cols: Int, rows: Int) = fire("term_resize", "id" to id, "cols" to cols, "rows" to rows)
     fun termDetach(id: String) { scope.launch { send("term_detach", "id" to id) } }

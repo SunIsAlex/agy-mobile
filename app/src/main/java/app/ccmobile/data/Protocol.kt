@@ -138,6 +138,8 @@ data class AuthStatus(
     val email: String? = null,
     val orgName: String? = null,
     val subscriptionType: String? = null,
+    val provider: String? = null,
+    val hasGeminiKey: Boolean = false,
 )
 
 /** A sign-in page from `claude auth login`. local: it only finishes in a browser on the bridge's machine. */
