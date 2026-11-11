@@ -19,6 +19,7 @@ class UsageTextTest {
         assertEquals("Haiku 4.5", UsageText.modelName("claude-haiku-4-5-20251001"))
         assertEquals("Sonnet 5", UsageText.modelName("claude-sonnet-5"))
         assertEquals("Haiku 5.5", UsageText.modelName("claude-haiku-5-5"))
+        assertEquals("Gemini 4 Carbon", UsageText.modelName("gemini-4-carbon"))
         assertEquals("Gemini 4 Argon", UsageText.modelName("gemini-4-argon"))
         assertEquals("Gemini 3.8 Flash", UsageText.modelName("gemini-3.8-flash"))
         assertEquals("GPT-OSS 120B", UsageText.modelName("gpt-oss-120b"))
@@ -27,6 +28,7 @@ class UsageTextTest {
 
     @Test fun windowLabels() {
         assertEquals("Gemini" to "5-hour window", UsageText.windowLabel("gemini-5h"))
+        assertEquals("Gemini 4 Carbon" to "7-day WTU window", UsageText.windowLabel("gemini-carbon-wtu-weekly"))
         assertEquals("Gemini 4 Argon" to "7-day WTU window", UsageText.windowLabel("gemini-argon-wtu-weekly"))
         assertEquals("Claude & GPT" to "5-hour window", UsageText.windowLabel("3p-5h"))
     }
@@ -57,11 +59,13 @@ class UsageTextTest {
             LimitWindow("3p-5h", 0.0, 0L, disabled = true),
             LimitWindow("3p-weekly", 1.0, 3000L),
             LimitWindow("gemini-argon-wtu-weekly", 0.128, 4000L),
+            LimitWindow("gemini-carbon-wtu-weekly", 0.256, 5000L),
         )
         assertEquals("gemini-5h", UsageText.windowForModel("gemini-3.8-flash", windows)?.id)
+        assertEquals("gemini-carbon-wtu-weekly", UsageText.windowForModel("gemini-4-carbon", windows)?.id)
         assertEquals("gemini-argon-wtu-weekly", UsageText.windowForModel("gemini-4-argon", windows)?.id)
         assertEquals("3p-weekly", UsageText.windowForModel("claude-opus-5-5", windows)?.id)
         assertEquals("3p-weekly", UsageText.windowForModel("gpt-oss-120b", windows)?.id)
-        assertEquals("gemini-argon-wtu-weekly", UsageText.windowForModel(null, windows)?.id)
+        assertEquals("gemini-5h", UsageText.windowForModel(null, windows)?.id)
     }
 }

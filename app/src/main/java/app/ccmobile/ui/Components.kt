@@ -111,7 +111,18 @@ fun <T> Segmented(options: List<Pair<T, String>>, selected: T, onSelect: (T) -> 
                     .clickable(role = Role.Tab) { onSelect(value) },
                 contentAlignment = Alignment.Center,
             ) {
-                Text(label, color = if (on) C.Text else C.Muted, fontSize = 13.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
+                val fontSize = when {
+                    options.size > 6 -> 11.sp
+                    options.size > 4 -> 12.sp
+                    else -> 13.sp
+                }
+                Text(
+                    label,
+                    color = if (on) C.Text else C.Muted,
+                    fontSize = fontSize,
+                    fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                )
             }
         }
     }
@@ -232,6 +243,7 @@ fun effortDescription(effort: String): String = when (effort) {
 }
 val modelLabels = listOf(
     "" to "Default",
+    "gemini-4-carbon" to "Carbon",
     "gemini-4-argon" to "Argon",
     "gemini-3.8-flash" to "Flash",
     "claude-opus-5-5" to "Opus",

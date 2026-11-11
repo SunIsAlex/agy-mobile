@@ -483,7 +483,7 @@ class Session {
 
   /**
    * Resolves --model and --effort for agy:
-   * - Multi-effort models (gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5)
+   * - Multi-effort models (gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5)
    *   require --effort (low, medium, high) whenever --model is specified without an effort suffix;
    *   when effort is unset ("Default"), default to "high".
    * - Single-effort models like gpt-oss-120b only support "medium" (or no --effort flag).
@@ -1235,6 +1235,8 @@ class Session {
       const aliases = {
         default: null,
         auto: null,
+        carbon: 'gemini-4-carbon',
+        'gemini-4-carbon': 'gemini-4-carbon',
         argon: 'gemini-4-argon',
         'gemini-4-argon': 'gemini-4-argon',
         flash: 'gemini-3.8-flash',
@@ -1915,14 +1917,17 @@ function windowForModel(model, windows) {
   let matching;
   if (m.startsWith('claude-') || m.startsWith('gpt-')) {
     matching = windows.filter((w) => w.id.startsWith('3p-') || w.id === 'five_hour' || w.id.startsWith('seven_day'));
+  } else if (m.includes('carbon')) {
+    matching = windows.filter((w) => w.id.includes('carbon'));
+    if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
   } else if (m.includes('argon')) {
     matching = windows.filter((w) => w.id.includes('argon'));
     if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
   } else if (m.startsWith('gemini-')) {
-    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon'));
+    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon') && !w.id.includes('carbon'));
     if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
   } else {
-    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon'));
+    matching = windows.filter((w) => w.id.startsWith('gemini-') && !w.id.includes('argon') && !w.id.includes('carbon'));
     if (!matching.length) matching = windows.filter((w) => w.id.startsWith('gemini-'));
     if (!matching.length) matching = windows.filter((w) => !w.id.startsWith('3p-'));
   }

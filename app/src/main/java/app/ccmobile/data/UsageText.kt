@@ -20,9 +20,10 @@ object UsageText {
         }
     }
 
-    /** "claude-opus-5-5" → "Opus 5.5", "gemini-4-argon" → "Gemini 4 Argon", "gpt-oss-120b" → "GPT-OSS 120B". */
+    /** "claude-opus-5-5" → "Opus 5.5", "gemini-4-carbon" → "Gemini 4 Carbon", "gemini-4-argon" → "Gemini 4 Argon", "gpt-oss-120b" → "GPT-OSS 120B". */
     fun modelName(id: String): String {
         when (id) {
+            "gemini-4-carbon" -> return "Gemini 4 Carbon"
             "gemini-4-argon" -> return "Gemini 4 Argon"
             "gemini-3.8-flash" -> return "Gemini 3.8 Flash"
             "gpt-oss-120b" -> return "GPT-OSS 120B"
@@ -41,6 +42,7 @@ object UsageText {
     fun windowLabel(id: String): Pair<String, String> = when (id) {
         "gemini-5h" -> "Gemini" to "5-hour window"
         "gemini-weekly" -> "Gemini" to "7-day window"
+        "gemini-carbon-wtu-weekly" -> "Gemini 4 Carbon" to "7-day WTU window"
         "gemini-argon-wtu-weekly" -> "Gemini 4 Argon" to "7-day WTU window"
         "3p-5h" -> "Claude & GPT" to "5-hour window"
         "3p-weekly" -> "Claude & GPT" to "7-day window"
@@ -91,13 +93,16 @@ object UsageText {
         val matching = when {
             m.startsWith("claude-") || m.startsWith("gpt-") ->
                 windows.filter { it.id.startsWith("3p-") || it.id == "five_hour" || it.id.startsWith("seven_day") }
+            m.contains("carbon") ->
+                windows.filter { it.id.contains("carbon") }.ifEmpty { windows.filter { it.id.startsWith("gemini-") } }
             m.contains("argon") ->
                 windows.filter { it.id.contains("argon") }.ifEmpty { windows.filter { it.id.startsWith("gemini-") } }
             m.startsWith("gemini-") ->
-                windows.filter { it.id.startsWith("gemini-") && !it.id.contains("argon") }
+                windows.filter { it.id.startsWith("gemini-") && !it.id.contains("argon") && !it.id.contains("carbon") }
                     .ifEmpty { windows.filter { it.id.startsWith("gemini-") } }
             else ->
-                windows.filter { it.id.startsWith("gemini-") }
+                windows.filter { it.id.startsWith("gemini-") && !it.id.contains("argon") && !it.id.contains("carbon") }
+                    .ifEmpty { windows.filter { it.id.startsWith("gemini-") } }
                     .ifEmpty { windows.filter { !it.id.startsWith("3p-") } }
         }
         val pool = matching.ifEmpty { windows }

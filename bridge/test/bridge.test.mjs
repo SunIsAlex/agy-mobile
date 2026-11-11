@@ -1295,6 +1295,7 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     // 6. Test built-in slash command (/models) executed via one-shot print mode
     c.send({ op: 'send', sid: session.id, text: '/models' });
     const slashReply = await c.next((m) => m.ev === 'cli' && m.sid === session.id && m.msg.type === 'assistant' && /gemini-4-argon/.test(m.msg.message.content[0]?.text ?? ''));
+    assert.match(slashReply.msg.message.content[0].text, /gemini-4-carbon/);
     assert.match(slashReply.msg.message.content[0].text, /gemini-3\.8-flash/);
     await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle');
 
