@@ -46,6 +46,8 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.latex.renderer)
+    implementation(libs.latex.fonts.katex)
 
     testImplementation(libs.junit)
 }

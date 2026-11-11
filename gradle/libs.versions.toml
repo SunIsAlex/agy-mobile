@@ -8,6 +8,7 @@ coreKtx = "1.19.1"
 coroutines = "1.11.0"
 serialization = "1.11.0"
 junit = "4.13.2"
+latex = "1.7.2"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -21,6 +22,8 @@ compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview"
 compose-material3 = { module = "androidx.compose.material3:material3" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+latex-renderer = { module = "io.github.huarangmeng:latex-renderer-android", version.ref = "latex" }
+latex-fonts-katex = { module = "io.github.huarangmeng:latex-fonts-katex-android", version.ref = "latex" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]

@@ -280,15 +280,14 @@ private fun TranscriptItem(item: Item, onDiff: () -> Unit, loadImage: ImageLoade
     when (item) {
         is UserItem -> Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             if (item.text.isNotBlank()) {
-                SelectionContainer {
-                    Text(
-                        item.text, color = C.Text, fontSize = 15.sp, lineHeight = 21.sp,
-                        modifier = Modifier
-                            .widthIn(max = 320.dp)
-                            .clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
-                            .background(C.Surface2)
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                    )
+                Box(
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
+                        .background(C.Surface2)
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                ) {
+                    RichText(item.text, color = C.Text)
                 }
             }
             if (item.attachments.isNotEmpty()) SentAttachments(item.attachments)
