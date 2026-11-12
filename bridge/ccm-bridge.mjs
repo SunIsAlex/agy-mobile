@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VoiceStream } from './voice.mjs';
+import { startCarbonGateway } from './carbon-gateway.mjs';
 
 const VERSION = 1;
 const MAX_EVENTS = 4000;
@@ -537,11 +538,16 @@ class Session {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     execFileSync('mkfifo', ['-m', '600', path.join(dir, 'in')]);
     const geminiApiKey = getGeminiApiKey();
+    // AGY's own catalog omits Gemini 4 Carbon. For Carbon tasks, point it at the local catalog and
+    // use ADC, which is the sign-in AGY accepts Carbon for.
+    const carbonTask = String(this.model ?? '').includes('carbon');
     const env = {
       ...process.env,
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       AGY_SESSION_ID: this.id,
       CLAUDE_CODE_SESSION_ID: this.id,
+      ...(carbonTask && adcConfigured() ? { AGY_ADC_AUTH: '1' } : {}),
+      ...(carbonTask && carbonGatewayUrl ? { AGY_LLM_GATEWAY_URL: carbonGatewayUrl } : {}),
       ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
     };
     spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env }).unref();
@@ -608,11 +614,10 @@ class Session {
     const text = String(output ?? '');
     if (!/gemini-4-carbon/.test(text) || !/not recognized|effort is not supported/i.test(text)) return;
     this.carbonNoticeShown = true;
-    this.emitLocal({
-      type: 'bridge',
-      subtype: 'note',
-      message: 'Gemini 4 Carbon is not available to AGY with this sign-in. AGY lists it only for Application Default Credentials (ADC) sign-in, not a Gemini API key. Pick Argon or Flash, or sign in with ADC on this machine (gcloud auth application-default login, then AGY_ADC_AUTH=1) and try again.',
-    });
+    const message = adcConfigured()
+      ? 'Gemini 4 Carbon is not in AGY’s model list for this account, even with Application Default Credentials (ADC). AGY only includes Carbon for plans that have it. Argon and Flash work; a Gemini API key can call Carbon directly.'
+      : 'Gemini 4 Carbon is not available to AGY with this sign-in. AGY lists it only for Application Default Credentials (ADC) sign-in that includes Carbon, not a Gemini API key. Pick Argon or Flash, or sign in with ADC on this machine (gcloud auth application-default login, then AGY_ADC_AUTH=1) and try again.';
+    this.emitLocal({ type: 'bridge', subtype: 'note', message });
   }
 
   writeCli(obj) {
@@ -2594,6 +2599,16 @@ function isGeminiApiActive() {
   return !fs.existsSync(tokenPath) && Boolean(getGeminiApiKey());
 }
 
+/** True when Application Default Credentials are available for agy to sign in with. */
+function adcConfigured() {
+  if (process.env.AGY_ADC_AUTH === '1') return true;
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return true;
+  const dirs = [process.env.CLOUDSDK_CONFIG, path.join(os.homedir(), '.config', 'gcloud')].filter(Boolean);
+  return dirs.some((d) => {
+    try { return fs.existsSync(path.join(d, 'application_default_credentials.json')); } catch { return false; }
+  });
+}
+
 /** Updates settings.json in agyDataDir safely. */
 function updateAgySettings(updater) {
   try {
@@ -3043,6 +3058,8 @@ class Client {
   }
 }
 
+let carbonGatewayUrl = null;
+
 function broadcast(obj) { for (const c of clients) c.send(obj); }
 function sendToSubscribers(sid, obj) { for (const c of clients) if (c.subs.has(sid)) c.send(obj); }
 
@@ -3059,6 +3076,14 @@ setInterval(() => {
   }
 }, 15_000).unref();
 rootAvailable = await detectRoot();
+const carbonGateway = await startCarbonGateway({
+  getApiKey: getGeminiApiKey,
+  log: (msg) => console.error(msg),
+}).catch((e) => {
+  console.error(`carbon gateway failed: ${e.message}`);
+  return null;
+});
+if (carbonGateway) carbonGatewayUrl = carbonGateway.url;
 const server = net.createServer((socket) => new Client(socket));
 server.listen(opts.port, opts.host, () => {
   const { address, port } = server.address();

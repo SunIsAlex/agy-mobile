@@ -819,6 +819,12 @@ test('processes: listed with their task, paused, resumed, restarted and killed',
 
     c.send({ op: 'signal', ref: 23, pid: fresh.pid, signal: 'SIGKILL' });
     procs = (await c.next((m) => m.ev === 'processes' && m.ref === 23)).processes;
+    // Signal delivery and the kernel's exit are asynchronous; allow a moment for the process to
+    // become a zombie instead of requiring it to have happened before the reply was built.
+    for (let i = 0; i < 20 && find(fresh.pid) && find(fresh.pid).state !== 'Z'; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      procs = await list();
+    }
     assert.ok(!find(fresh.pid) || find(fresh.pid).state === 'Z');
 
     // A program that renames itself, as npm does, can't be restarted, and a refused restart leaves it running.
