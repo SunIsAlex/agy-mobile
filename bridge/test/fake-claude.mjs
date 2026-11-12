@@ -72,6 +72,11 @@ const canBypass = process.argv.includes('--allow-dangerously-skip-permissions') 
 
 if (isAgyStream) {
   const modelArg = process.argv.includes('--model') ? process.argv[process.argv.indexOf('--model') + 1] : null;
+  // The real CLI only knows Gemini 4 Carbon when signed in with Application Default Credentials.
+  if (modelArg === 'gemini-4-carbon') {
+    process.stderr.write('error: invalid model selection (--model "gemini-4-carbon" --effort ""): model gemini-4-carbon is not recognized as a known model or custom model in settings\n');
+    process.exit(1);
+  }
   if (modelArg && !modelArg.startsWith('gpt-oss') && !/-(low|medium|high)$/.test(modelArg) && !effort) {
     process.stderr.write(`error: invalid model selection (--model "${modelArg}" --effort ""): --model ${modelArg} requires --effort (available: low, medium, high)\n`);
     process.exit(1);

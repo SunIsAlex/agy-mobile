@@ -58,6 +58,11 @@ is used when Claude supports it, English otherwise (which also understands Chine
 Max, or the model's default; passed as `--effort`). In a running task, *Reasoning effort* in the menu
 changes it from the next reply without restarting Claude. The default for new tasks is in Settings.
 
+**Gemini 4 Carbon:** the model chip offers Carbon alongside Argon and Flash, and the usage screens and
+`/model` aliases know it. AGY only exposes Carbon when it signs in with Application Default Credentials
+(`gcloud auth application-default login`, with `AGY_ADC_AUTH=1`); with a Gemini API key AGY rejects it.
+The bridge then says so in the task instead of quietly running a different model.
+
 **Images Claude looked at** (screenshots, files it Read, video frames) show as thumbnails under the
 tool call; tap one for full screen, then swipe, pinch or double-tap to zoom. The bridge keeps them in
 `images/<session id>/` and sends each one when the app asks, not inline with the transcript. Images

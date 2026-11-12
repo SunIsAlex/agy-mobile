@@ -388,6 +388,7 @@ class Session {
     this.syncedTranscriptSteps = new Set(); // step_index synced from transcript while a background tool was running
     this.turnHadText = false;
     this.stuckToolDetectedAt = null;
+    this.carbonNoticeShown = false; // "Gemini 4 Carbon needs ADC" note, once per launch attempt
   }
 
   summary() {
@@ -506,6 +507,7 @@ class Session {
 
   ensureProcess() {
     if (this.link) return;
+    this.carbonNoticeShown = false;
     const args = ['-p=', '--input-format', 'stream-json', '--output-format', 'stream-json'];
     if (process.env.CCM_LEGACY_PROTO === '1') {
       args.push('--permission-mode', this.mode, '--allow-dangerously-skip-permissions');
@@ -590,9 +592,27 @@ class Session {
     if (this.status === 'limited') { this.setStatus('limited'); return; }
     if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
     else {
+      this.noteUnavailableCarbon(stderr);
       this.emitLocal({ type: 'bridge', subtype: 'error', message: `agy exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
       this.setStatus('error', 'agy exited unexpectedly');
     }
+  }
+
+  /**
+   * agy only knows Gemini 4 Carbon when it signs in with Application Default Credentials. With a
+   * Gemini API key it rejects the model, so say why instead of leaving the raw CLI error (or, worse,
+   * letting the task run as another model without the user noticing).
+   */
+  noteUnavailableCarbon(output) {
+    if (this.carbonNoticeShown) return;
+    const text = String(output ?? '');
+    if (!/gemini-4-carbon/.test(text) || !/not recognized|effort is not supported/i.test(text)) return;
+    this.carbonNoticeShown = true;
+    this.emitLocal({
+      type: 'bridge',
+      subtype: 'note',
+      message: 'Gemini 4 Carbon is not available to AGY with this sign-in. AGY lists it only for Application Default Credentials (ADC) sign-in, not a Gemini API key. Pick Argon or Flash, or sign in with ADC on this machine (gcloud auth application-default login, then AGY_ADC_AUTH=1) and try again.',
+    });
   }
 
   writeCli(obj) {
@@ -1043,6 +1063,7 @@ class Session {
       }
 
       const errText = isError ? rawErrorText : '';
+      if (isError) this.noteUnavailableCarbon(rawErrorText);
       const turnUsage = res.usage ? {
         input_tokens: res.usage.input_tokens ?? 0,
         output_tokens: res.usage.output_tokens ?? 0,

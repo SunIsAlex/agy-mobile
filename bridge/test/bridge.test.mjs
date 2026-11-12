@@ -1361,6 +1361,15 @@ test('AGY native stream-json protocol: init, step_update, result, usage limits, 
     const idleAfterUnblock = (await c.next((m) => m.ev === 'session' && m.session.id === session.id && m.session.status === 'idle')).session;
     assert.equal(idleAfterUnblock.status, 'idle');
 
+    // 10. Gemini 4 Carbon that AGY's sign-in cannot select gets an explanation, not a silent fallback
+    c.send({ op: 'start', ref: 15, cwd: repo, prompt: 'use carbon', model: 'gemini-4-carbon' });
+    const carbon = (await c.next((m) => m.ev === 'started' && m.ref === 15)).session;
+    const carbonNote = await c.next((m) => m.ev === 'cli' && m.sid === carbon.id && m.msg.type === 'bridge' && m.msg.subtype === 'note' && /Carbon/.test(m.msg.message));
+    assert.match(carbonNote.msg.message, /Application Default Credentials/);
+    const carbonErr = await c.next((m) => m.ev === 'cli' && m.sid === carbon.id && m.msg.type === 'bridge' && m.msg.subtype === 'error');
+    assert.match(carbonErr.msg.message, /agy exited/);
+    await c.next((m) => m.ev === 'session' && m.session.id === carbon.id && m.session.status === 'error');
+
     c.end();
   } finally {
     await stopAll(bridge, stateDir);
