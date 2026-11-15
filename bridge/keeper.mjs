@@ -33,7 +33,7 @@ function finish(code, signal) {
   });
 }
 
-const child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+const child = spawn(command, args, { cwd, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
 child.on('error', (e) => { err.write(`Could not start ${command}: ${e.message}\n`); finish(127, null); });
 // 'close' comes after stdout has ended, so `out` is complete when exit.json appears.
 child.on('close', (code, signal) => finish(code, signal));
@@ -42,10 +42,33 @@ fs.writeFileSync(file('keeper.json'), JSON.stringify({ pid: process.pid, claudeP
 // Opened read-write so the pipe never reads as ended when a bridge closes its end, and
 // non-blocking through a socket: a blocking read would hold a thread that keeps Node from exiting.
 const input = fs.openSync(file('in'), fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-new net.Socket({ fd: input, readable: true, writable: false }).pipe(child.stdin);
+const inputSocket = new net.Socket({ fd: input, readable: true, writable: false });
+inputSocket.pipe(child.stdin);
+inputSocket.on('error', () => {});
 child.stdin.on('error', () => {});
 child.stdout.pipe(out, { end: false });
 child.stderr.pipe(err);
 
+let shuttingDown = false;
+function stopChild() {
+  if (shuttingDown || done) return;
+  shuttingDown = true;
+  try { inputSocket.destroy(); } catch {}
+  try { child.stdin.end(); } catch {}
+  // Signal the child's whole process group so wrapper scripts (e.g. ~/.local/bin/agy bash -> agy.bin)
+  // terminate immediately instead of bash deferring SIGTERM while waiting on agy.bin.
+  if (child.pid) {
+    try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+  }
+  try { child.kill('SIGTERM'); } catch {}
+  setTimeout(() => {
+    if (done) return;
+    if (child.pid) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    }
+    try { child.kill('SIGKILL'); } catch {}
+  }, 3000).unref();
+}
+
 process.on('SIGHUP', () => {});
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => child.kill('SIGTERM'));
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, stopChild);

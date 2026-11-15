@@ -94,9 +94,9 @@ fun TasksScreen(
     var repoPath by rememberSaveable { mutableStateOf(settings.lastRepo) }
     val repo = repos.firstOrNull { it.path == repoPath } ?: repos.firstOrNull()
     var prompt by remember { mutableStateOf(settings.draft("")) }
-    var mode by rememberSaveable { mutableStateOf(settings.mode) }
-    var model by rememberSaveable { mutableStateOf(settings.model) }
-    var effort by rememberSaveable { mutableStateOf(settings.effort) }
+    var mode by rememberSaveable(settings.mode) { mutableStateOf(settings.mode) }
+    var model by rememberSaveable(settings.model) { mutableStateOf(settings.model) }
+    var effort by rememberSaveable(settings.effort) { mutableStateOf(settings.effort) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var starting by remember { mutableStateOf(false) }
     var resuming by remember { mutableStateOf<String?>(null) }
@@ -466,6 +466,9 @@ private fun TaskRow(s: SessionSummary, host: String, onClick: () -> Unit, onArch
                 Text(relativeTime(s.updatedAt), color = C.Faint, fontSize = 12.sp)
                 if (s.outputTokens > 0) {
                     Text("· ${UsageText.compact(s.outputTokens)} out", color = C.Faint, fontSize = 12.sp, fontFamily = Mono)
+                }
+                if (s.billing == "api") {
+                    Text("· API", color = C.ClayText, fontSize = 11.5.sp, fontFamily = Mono, fontWeight = FontWeight.Medium)
                 }
                 Spacer(Modifier.weight(1f))
                 s.ports.forEach { PortChip(it, host) }

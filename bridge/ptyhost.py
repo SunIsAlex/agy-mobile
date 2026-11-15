@@ -16,10 +16,23 @@ import signal
 import struct
 import sys
 import termios
+import time
 
 
 def set_size(fd, cols, rows):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def signal_group(pid, sig):
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
 
 
 def main():
@@ -34,6 +47,18 @@ def main():
             os._exit(127)
     set_size(master, cols, rows)
 
+    shutdown_at = None
+
+    def handle_term(_signum, _frame):
+        nonlocal shutdown_at
+        if shutdown_at is None:
+            shutdown_at = time.monotonic()
+        signal_group(pid, signal.SIGHUP)
+        signal_group(pid, signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGHUP, handle_term)
+
     watch = [0, master]
     try:
         os.fstat(3)
@@ -42,8 +67,12 @@ def main():
         pass
     ctrl = b""
     while True:
+        if shutdown_at is not None and time.monotonic() - shutdown_at >= 1.5:
+            signal_group(pid, signal.SIGKILL)
+            break
         try:
-            ready, _, _ = select.select(watch, [], [])
+            timeout = 0.2 if shutdown_at is not None else None
+            ready, _, _ = select.select(watch, [], [], timeout)
         except InterruptedError:
             continue
         if master in ready:
@@ -59,7 +88,7 @@ def main():
         if 0 in ready:
             data = os.read(0, 65536)
             if not data:
-                os.kill(pid, signal.SIGHUP)
+                signal_group(pid, signal.SIGHUP)
                 watch.remove(0)
             else:
                 os.write(master, data)

@@ -109,7 +109,7 @@ fun ToolImages(images: List<ImageRef>, load: ImageLoader, onOpen: (Int) -> Unit,
             } else {
                 BridgeImage(
                     image.ref, load, maxPx = 400, contentScale = ContentScale.Crop,
-                    contentDescription = "Image Claude looked at, ${i + 1} of ${images.size}. Opens full screen.",
+                    contentDescription = "Image AGY looked at, ${i + 1} of ${images.size}. Opens full screen.",
                     modifier = Modifier
                         .size(112.dp)
                         .clip(RoundedCornerShape(10.dp))

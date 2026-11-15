@@ -16,6 +16,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.nio.file.Files
 
 /** Runs the real bridge (with test/fake-claude.mjs standing in for the CLI) against [BridgeClient]. Skipped without node. */
@@ -41,17 +43,28 @@ class BridgeClientIntegrationTest {
             writeText("#!$sh\nexec \"$node\" \"${File(bridgeDir, "test/fake-claude.mjs")}\" \"$@\"\n")
             setExecutable(true)
         }
-        val port = 20000 + (Math.random() * 20000).toInt()
+        val port = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1")).use { it.localPort }
         val proc = ProcessBuilder(node, File(bridgeDir, "ccm-bridge.mjs").path, "--port", "$port", "--roots", File(tmp, "repos").path, "--state-dir", File(tmp, "state").path)
             .apply {
-                environment()["CCM_CLAUDE_BIN"] = fake.path
-                environment()["CCM_LEGACY_PROTO"] = "1"
+                val env = environment()
+                env.keys.removeAll(setOf("AGY_SESSION_ID", "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_SOURCE_METADATA", "GEMINI_API_KEY", "GOOGLE_API_KEY", "AGY_ADC_AUTH", "GOOGLE_APPLICATION_CREDENTIALS"))
+                env["CCM_CLAUDE_BIN"] = fake.path
+                env["CCM_LEGACY_PROTO"] = "1"
+                env["CCM_ROOT"] = "0"
+                env["CCM_AGY_DIR"] = File(tmp, "agy-data").path
+                env["CLAUDE_CONFIG_DIR"] = File(tmp, "claude-config").path
+                env["CLOUDSDK_CONFIG"] = File(tmp, "gcloud-config").path
             }
             .redirectErrorStream(true)
             .start()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
-            proc.inputStream.bufferedReader().readLine() // "listening on …"
+            val reader = proc.inputStream.bufferedReader()
+            while (true) {
+                val line = reader.readLine() ?: error("ccm-bridge exited before listening")
+                if (line.contains("ccm-bridge listening")) break
+            }
+            scope.launch { runCatching { reader.forEachLine { } } }
             val token = File(tmp, "state/token").readText().trim()
             val client = BridgeClient(scope)
             val events = mutableListOf<JsonObject>()

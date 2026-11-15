@@ -49,4 +49,23 @@ Binary files a/logo.png and b/logo.png differ
     fun emptyDiffHasNoFiles() {
         assertEquals(emptyList<FileDiff>(), DiffParser.parse(""))
     }
+
+    @Test
+    fun deletedFilePreservesOldPathInsteadOfDevNull() {
+        val raw = """
+diff --git a/sub b/dir/old.kt b/sub b/dir/old.kt
+deleted file mode 100644
+index abcdef1..0000000
+--- a/sub b/dir/old.kt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-line 1
+-line 2
+""".trimStart()
+        val file = DiffParser.parse(raw).single()
+        assertEquals("sub b/dir/old.kt", file.path)
+        assertEquals("deleted", file.status)
+        assertEquals(0, file.added)
+        assertEquals(2, file.removed)
+    }
 }

@@ -7,6 +7,7 @@
 
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -14,6 +15,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VoiceStream } from './voice.mjs';
 import { startCarbonGateway } from './carbon-gateway.mjs';
+
+dns.setDefaultResultOrder('ipv4first');
 
 const VERSION = 1;
 const MAX_EVENTS = 4000;
@@ -100,8 +103,9 @@ const keepersDir = path.join(stateDir, 'keepers');
   process.env.PATH = dirs.join(':');
 }
 const claudeBin = process.env.CCM_AGY_BIN ?? process.env.CCM_CLAUDE_BIN ?? 'agy';
-const agyDataDir = process.env.CCM_AGY_DIR ?? process.env.AGY_DATA_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli');
+const agyDataDir = process.env.CCM_AGY_DIR ?? process.env.AGY_DATA_DIR ?? process.env.ANTIGRAVITY_APP_DATA_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli');
 const claudeProjectsDir = path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects');
+const HYBRID_SPILLOVER_MODEL = 'gemini-4-hydrogen';
 // bypassPermissions is the app's "YOLO" mode (--dangerously-skip-permissions).
 const MODES = ['fast', 'acceptEdits', 'plan', 'default', 'auto', 'manual', 'dontAsk', 'bypassPermissions'];
 // Reasoning effort (--effort); null leaves it to the model's default.
@@ -171,6 +175,7 @@ class KeeperLink {
     this.partial = Buffer.alloc(0);
     this.closed = false;
     this.killRequested = false;
+    this.killSentAt = 0;
     this.since = Date.now();
     this.input = null;
     this.queued = []; // lines written before the keeper opened its pipe
@@ -203,10 +208,13 @@ class KeeperLink {
     return true;
   }
 
-  kill() {
-    const pid = this.info?.pid;
+  kill(signal = 'SIGTERM') {
+    const info = this.info;
+    const pid = info?.pid;
     if (!pid) { this.killRequested = true; return; } // not started yet; poll() kills it
-    try { process.kill(pid, 'SIGTERM'); } catch {}
+    if (!this.killSentAt) this.killSentAt = Date.now();
+    try { this.input?.end(); } catch {}
+    signalKeeperTree(info, signal);
   }
 
   /** Stops reading (the bridge is shutting down); the keeper and Claude keep running. */
@@ -227,12 +235,19 @@ class KeeperLink {
       this.read();
       if (this.closed) return;
       if (tick) this.onTick?.();
-      const pid = this.info?.pid;
-      if (pid && this.killRequested) { this.killRequested = false; try { process.kill(pid, 'SIGTERM'); } catch {} }
+      const info = this.info;
+      const pid = info?.pid;
+      if (pid && this.killRequested) { this.killRequested = false; this.kill('SIGTERM'); }
       if (exited) {
         let code = null, signal = null;
         try { ({ code, signal } = JSON.parse(fs.readFileSync(path.join(this.dir, 'exit.json'), 'utf8'))); } catch {}
         this.finish(code, signal);
+      } else if (tick && this.killSentAt > 0 && Date.now() - this.killSentAt >= 3500) {
+        signalKeeperTree(info, 'SIGKILL');
+        if (!pid || !alive(pid)) {
+          this.read();
+          this.finish(null, 'SIGKILL');
+        }
       } else if (tick && pid && !alive(pid) && !fs.existsSync(path.join(this.dir, 'exit.json'))) {
         this.read();
         this.finish(null, 'SIGKILL'); // the keeper itself was killed
@@ -301,6 +316,30 @@ function saveImage(sid, mediaType, data) {
     fs.writeFileSync(file, Buffer.from(data, 'base64'), { mode: 0o600 });
   }
   return ref;
+}
+
+/**
+ * When AGY reads an image file via `read_file` or `view_file`, returns tool_result content blocks
+ * including the image so `slimEvent` stores a thumbnail ref for the app; otherwise returns `outText`.
+ */
+function extractViewedImage(toolName, input, isErr, outText) {
+  if (isErr || (toolName !== 'read_file' && toolName !== 'view_file')) return outText;
+  const viewedPath = [input?.Path, input?.AbsolutePath, input?.TargetFile].find((p) => typeof p === 'string' && p);
+  if (!viewedPath) return outText;
+  const ext = path.extname(viewedPath).toLowerCase().slice(1);
+  const mime = IMAGE_MIME[ext === 'jpeg' ? 'jpg' : ext];
+  if (!mime) return outText;
+  try {
+    const stat = fs.statSync(viewedPath);
+    if (stat.isFile() && stat.size <= MAX_INLINE_IMAGE_BYTES) {
+      const data = fs.readFileSync(viewedPath).toString('base64');
+      return [
+        ...(outText ? [{ type: 'text', text: outText }] : []),
+        { type: 'image', source: { type: 'base64', media_type: mime, data } },
+      ];
+    }
+  } catch {}
+  return outText;
 }
 
 // Images and documents in transcripts (screenshots, video frames Claude Reads) are base64, often
@@ -388,13 +427,34 @@ class Session {
     this.emittedThinking = new Set(); // step_index where thinking was emitted
     this.syncedTranscriptSteps = new Set(); // step_index synced from transcript while a background tool was running
     this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = 0;
+    this.turnHadStepUsage = false;
+    this.turnProducedSideEffects = false;
+    this.lastTurnPrompt = null;
+    this.lastTurnLegacyContent = null;
+    this.activeBilling = null; // 'sub' | 'api'
+    this.effectiveModel = this.model;
+    this.hybridSpilloverUntil = null;
+    this.spilloverNotified = false;
     this.stuckToolDetectedAt = null;
     this.carbonNoticeShown = false; // "Gemini 4 Carbon needs ADC" note, once per launch attempt
+    this.hydrogenNoticeShown = false;
+    this.hydrogenSubUnsupported = false;
+    this.lastErrorResultAt = 0;
+    this.wakeupRecoveryActive = false;
+    this.wakeupRetryCount = 0;
+    this.wakeupRetryTimer = null;
+    this.wakeupRetryScheduledAt = 0;
+    this.wakeupStallTriggeredStep = -1;
   }
 
   summary() {
     return {
-      id: this.id, cwd: this.cwd, title: this.title, model: this.model, effort: this.effort, mode: this.mode,
+      id: this.id, cwd: this.cwd, title: this.title, model: this.model,
+      effectiveModel: this.effectiveModel ?? this.model,
+      billing: this.activeBilling ?? this.resolveSessionRouting().billing,
+      effort: this.effort, mode: this.mode,
       status: this.status, createdAt: this.createdAt, updatedAt: this.updatedAt,
       lastActivity: this.lastActivity, pending: this.pending.size, costUsd: this.costUsd,
       inputTokens: this.inputTokens, outputTokens: this.outputTokens, thinkingTokens: this.thinkingTokens,
@@ -405,18 +465,22 @@ class Session {
     };
   }
 
-  addUsage(u) {
+  addUsage(u, billing = 'sub', model = null) {
     if (!u || typeof u !== 'object') return false;
     const inp = Number(u.input_tokens) || 0;
     const out = Number(u.output_tokens) || 0;
     const think = Number(u.thinking_tokens) || 0;
     const cacheRead = Number(u.cache_read_input_tokens ?? u.cache_read_tokens) || 0;
     if (!inp && !out && !think && !cacheRead) return false;
+    const effectiveOut = out >= think ? out : out + think;
     this.inputTokens += inp;
-    this.outputTokens += out >= think ? out : out + think;
+    this.outputTokens += effectiveOut;
     this.thinkingTokens += think;
     this.cacheReadTokens += cacheRead;
     this.requests += 1;
+    if (process.env.CCM_LEGACY_PROTO !== '1' && billing === 'api') {
+      this.costUsd += estimateApiCostUsd(model ?? this.effectiveModel ?? this.currentModel ?? this.model, inp, effectiveOut, cacheRead);
+    }
     return true;
   }
 
@@ -429,6 +493,7 @@ class Session {
     const meta = {
       ...this.summary(),
       cliSessionId: this.cliSessionId,
+      hybridSpilloverUntil: this.hybridSpilloverUntil,
       started: this.started,
       cliSize: this.cliSize,
       pendingRequests: [...this.pending.values()],
@@ -438,15 +503,18 @@ class Session {
   }
 
   record(msg) {
+    const u = msg?.type === 'assistant' && msg.message?.model !== '<synthetic>' ? msg.message?.usage : null;
+    if (u && !msg.billing) {
+      msg = { ...msg, billing: this.activeBilling ?? (isGeminiApiActive() ? 'api' : 'sub') };
+    }
     const isEmptyAssistant = msg?.type === 'assistant' && Array.isArray(msg.message?.content) && msg.message.content.length === 0;
     if (!isEmptyAssistant) {
       this.events.push(msg);
       if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
     }
-    const u = msg?.type === 'assistant' && msg.message?.model !== '<synthetic>' ? msg.message?.usage : null;
     if (u) {
       try { fs.appendFileSync(this.logFile, JSON.stringify(msg) + '\n'); } catch {}
-      if (this.addUsage(u)) {
+      if (this.addUsage(u, msg.billing, msg.message?.model)) {
         this.persistMeta();
         broadcast({ ev: 'session', session: this.summary() });
         broadcast({ ev: 'usage_tick', sid: this.id, t: Date.now() });
@@ -463,6 +531,7 @@ class Session {
     this.persistMeta();
     broadcast({ ev: 'session', session: this.summary() });
     this.scheduleIdleExit();
+    syncTermuxWakeLock();
   }
 
   /** Stops agy's process once the task has been idle for IDLE_EXIT_MS, unless something still needs it. */
@@ -485,30 +554,116 @@ class Session {
 
   /**
    * Resolves --model and --effort for agy:
-   * - Multi-effort models (gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5)
-   *   require --effort (low, medium, high) whenever --model is specified without an effort suffix;
-   *   when effort is unset ("Default"), default to "high".
+   * - Multi-effort models (gemini-4-hydrogen, gemini-4-carbon, gemini-4-argon, gemini-3.8-flash,
+   *   claude-opus-5-5, claude-sonnet-5-5) require --effort whenever --model is specified without an
+   *   effort suffix; when effort is unset ("Default"), default to "high".
+   * - On Google Subscription ('sub'), gemini-4-hydrogen natively supports "xhigh"; on Gemini API ('api')
+   *   or other models, "xhigh"/"max" maps to "high".
    * - Single-effort models like gpt-oss-120b only support "medium" (or no --effort flag).
-   * - If model already has a -(low|medium|high) suffix, strip it when an explicit effort is chosen.
+   * - If model already has a -(low|medium|high|xhigh) suffix, strip it when an explicit effort is chosen.
    */
-  resolveAgyModelEffort(rawModel, rawEffort) {
-    const validEffort = rawEffort && ['low', 'medium', 'high'].includes(rawEffort) ? rawEffort : null;
-    if (!rawModel) return { model: null, effort: validEffort };
-    const suffixMatch = String(rawModel).match(/^(.*)-(low|medium|high)$/);
-    const baseModel = suffixMatch ? suffixMatch[1] : String(rawModel);
+  resolveAgyModelEffort(rawModel, rawEffort, billing = 'sub') {
+    const suffixMatch = rawModel ? String(rawModel).match(/^(.*)-(low|medium|high|xhigh)$/) : null;
+    const baseModel = suffixMatch ? suffixMatch[1] : (rawModel ? String(rawModel) : null);
     const suffixEffort = suffixMatch ? suffixMatch[2] : null;
+    const supportsXhigh = billing === 'sub' && baseModel === 'gemini-4-hydrogen';
+    const normalizeEffort = (eff) => {
+      if (!eff) return null;
+      if (eff === 'max' || eff === 'xhigh') return supportsXhigh ? 'xhigh' : 'high';
+      return ['low', 'medium', 'high'].includes(eff) ? eff : null;
+    };
+    const validEffort = normalizeEffort(rawEffort);
+    if (!baseModel) return { model: null, effort: validEffort };
     if (baseModel.startsWith('gpt-oss')) {
       return { model: baseModel, effort: null };
     }
     return {
       model: baseModel,
-      effort: validEffort ?? suffixEffort ?? 'high',
+      effort: validEffort ?? normalizeEffort(suffixEffort) ?? 'high',
     };
+  }
+
+  /**
+   * Decides whether the next agy process runs on Google Subscription ('sub', $0 marginal cost)
+   * or the Gemini API ('api'), and picks the effective model & effort (e.g. Gemini 4 Hydrogen on
+   * Hybrid spillover).
+   */
+  resolveSessionRouting() {
+    if (process.env.CCM_LEGACY_PROTO === '1') {
+      return { billing: 'sub', model: this.model, effort: this.effort, reason: 'legacy' };
+    }
+    const provider = getConfiguredProvider();
+    const apiKey = getGeminiApiKey();
+    const hasOAuth = hasGoogleOAuthToken();
+    const baseModel = this.model ? String(this.model).replace(/-(low|medium|high|xhigh)$/, '') : null;
+    const isHydrogen = baseModel === 'gemini-4-hydrogen';
+
+    if (provider === 'gemini' && apiKey) {
+      const apiModel = baseModel && (baseModel.startsWith('claude-') || baseModel.startsWith('gpt-'))
+        ? HYBRID_SPILLOVER_MODEL
+        : this.model;
+      return { billing: 'api', model: apiModel, effort: this.effort, reason: 'gemini_provider' };
+    }
+
+    if (provider === 'hybrid' && apiKey) {
+      if (!hasOAuth) {
+        const apiModel = baseModel && (baseModel.startsWith('claude-') || baseModel.startsWith('gpt-'))
+          ? HYBRID_SPILLOVER_MODEL
+          : (this.model || HYBRID_SPILLOVER_MODEL);
+        return { billing: 'api', model: apiModel, effort: this.effort ?? 'medium', reason: 'no_oauth' };
+      }
+      if (isHydrogen && this.hydrogenSubUnsupported) {
+        const cap = getDailyApiLimitUsd();
+        const spent = cap > 0 ? todayApiCostUsd() : 0;
+        if (!(cap > 0 && spent >= cap)) {
+          return { billing: 'api', model: this.model, effort: this.effort, reason: 'hydrogen_sub_unsupported' };
+        }
+        return { billing: 'sub', model: null, effort: this.effort, reason: 'api_cap_fallback_sub' };
+      }
+      const now = Date.now();
+      if (this.hybridSpilloverUntil && now >= this.hybridSpilloverUntil) {
+        this.hybridSpilloverUntil = null;
+      }
+      const targetSubModel = this.model ?? 'agy';
+      const quotaExhausted = Boolean(this.hybridSpilloverUntil && now < this.hybridSpilloverUntil) ||
+        isModelQuotaExhausted(targetSubModel, limits);
+      if (quotaExhausted) {
+        const cap = getDailyApiLimitUsd();
+        const spent = cap > 0 ? todayApiCostUsd() : 0;
+        if (!(cap > 0 && spent >= cap)) {
+          const spilloverModel = baseModel === 'gemini-4-carbon' ? this.model : HYBRID_SPILLOVER_MODEL;
+          const spilloverEffort = this.effort ?? 'medium';
+          return { billing: 'api', model: spilloverModel, effort: spilloverEffort, reason: 'hybrid_spillover' };
+        }
+        return { billing: 'sub', model: this.model, effort: this.effort, reason: 'api_cap_reached' };
+      }
+    }
+
+    return { billing: 'sub', model: this.model, effort: this.effort, reason: 'subscription' };
   }
 
   ensureProcess() {
     if (this.link) return;
     this.carbonNoticeShown = false;
+    this.hydrogenNoticeShown = false;
+    const route = this.resolveSessionRouting();
+    const prevBilling = this.activeBilling;
+    this.activeBilling = route.billing;
+    this.effectiveModel = route.model;
+    if (route.billing === 'sub') {
+      if (prevBilling === 'api' && this.spilloverNotified && route.reason === 'subscription') {
+        this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Subscription quota reset — switched back to Google subscription.' });
+      }
+      this.spilloverNotified = false;
+    } else if (route.reason === 'hybrid_spillover' && !this.spilloverNotified) {
+      this.spilloverNotified = true;
+      this.emitLocal({
+        type: 'bridge',
+        subtype: 'note',
+        message: 'Subscription quota full — running on Gemini API (Gemini 4 Hydrogen) until subscription quota resets.',
+      });
+    }
+
     const args = ['-p=', '--input-format', 'stream-json', '--output-format', 'stream-json'];
     if (process.env.CCM_LEGACY_PROTO === '1') {
       args.push('--permission-mode', this.mode, '--allow-dangerously-skip-permissions');
@@ -523,7 +678,7 @@ class Session {
       } else if (this.mode === 'bypassPermissions') {
         args.push('--dangerously-skip-permissions');
       }
-      const { model, effort } = this.resolveAgyModelEffort(this.model, this.effort);
+      const { model, effort } = this.resolveAgyModelEffort(route.model, route.effort, route.billing);
       if (model) args.push('--model', model);
       if (effort) args.push('--effort', effort);
       if (this.cliSessionId) args.push('--conversation', this.cliSessionId);
@@ -537,19 +692,28 @@ class Session {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     execFileSync('mkfifo', ['-m', '600', path.join(dir, 'in')]);
-    const geminiApiKey = getGeminiApiKey();
-    // AGY's own catalog omits Gemini 4 Carbon. For Carbon tasks, point it at the local catalog and
-    // use ADC, which is the sign-in AGY accepts Carbon for.
-    const carbonTask = String(this.model ?? '').includes('carbon');
+    const useApi = route.billing === 'api';
+    const geminiApiKey = useApi ? getGeminiApiKey() : null;
+    // AGY's built-in catalog omits Gemini 4 Hydrogen and Carbon. Point API sessions (and ADC Carbon
+    // sessions) at the local gateway so AGY resolves and routes them cleanly.
+    const carbonTask = String(route.model ?? '').includes('carbon');
+    const useGateway = Boolean(carbonGatewayUrl) && (useApi || carbonTask);
+    const noProxy = [process.env.NO_PROXY, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
     const env = {
       ...process.env,
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       AGY_SESSION_ID: this.id,
       CLAUDE_CODE_SESSION_ID: this.id,
-      ...(carbonTask && adcConfigured() ? { AGY_ADC_AUTH: '1' } : {}),
-      ...(carbonTask && carbonGatewayUrl ? { AGY_LLM_GATEWAY_URL: carbonGatewayUrl } : {}),
-      ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
+      ...(process.env.CCM_AGY_DIR ? { ANTIGRAVITY_APP_DATA_DIR: agyDataDir } : {}),
+      ...(!useApi && carbonTask && adcConfigured() ? { AGY_ADC_AUTH: '1' } : {}),
+      ...(useGateway ? { AGY_LLM_GATEWAY_URL: carbonGatewayUrl, NO_PROXY: noProxy, no_proxy: noProxy } : {}),
+      ...(useApi && carbonGatewayUrl ? { GOOGLE_GEMINI_BASE_URL: carbonGatewayUrl } : {}),
     };
+    if (!(!useApi && carbonTask && adcConfigured())) delete env.AGY_ADC_AUTH;
+    if (!useGateway) delete env.AGY_LLM_GATEWAY_URL;
+    if (!(useApi && carbonGatewayUrl)) delete env.GOOGLE_GEMINI_BASE_URL;
+    if (geminiApiKey) env.GEMINI_API_KEY = geminiApiKey;
+    else delete env.GEMINI_API_KEY;
     spawn(process.execPath, [keeperJs, dir, this.cwd, claudeBin, ...args], { detached: true, stdio: 'ignore', env }).unref();
     this.started = true;
     this.attach();
@@ -567,6 +731,28 @@ class Session {
     });
   }
 
+  /** Closes any in-flight tool_use items so they do not spin indefinitely after an interrupt, stop, or crash. */
+  closeRunningTools(reason, isError = true) {
+    if (!this.emittedTools.size) return;
+    const indices = [...this.emittedTools];
+    this.emittedTools.clear();
+    for (const idx of indices) {
+      this.emitLocal({
+        type: 'user',
+        uuid: `step-${idx}-result`,
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: `tool-${idx}`,
+            content: reason,
+            is_error: isError,
+          }],
+        },
+      });
+    }
+  }
+
   onProcessExit(code, signal, stderr) {
     this.link = null;
     this.stuckToolDetectedAt = null;
@@ -581,42 +767,276 @@ class Session {
       broadcast({ ev: 'session', session: this.summary() });
       return;
     }
-    if (this.interrupted) {
-      this.interrupted = false;
-      this.stepText.clear();
-      this.emittedTools.clear();
-      this.turnHadText = false;
-      this.setStatus('idle', 'Interrupted');
-      return;
-    }
     this.pending.clear();
     if (this.background.length) {
       this.emitLocal({ type: 'bridge', subtype: 'error', message: `Background work stopped with agy's process: ${this.background.map((t) => t.description).join(', ')}` });
       this.background = [];
     }
-    if (this.status === 'stopped') { this.setStatus('stopped'); return; }
-    if (this.status === 'limited') { this.setStatus('limited'); return; }
-    if (code === 0 || signal === 'SIGTERM') this.setStatus('idle');
-    else {
-      this.noteUnavailableCarbon(stderr);
-      this.emitLocal({ type: 'bridge', subtype: 'error', message: `agy exited (${code ?? signal}). ${stderr.trim().slice(-800)}` });
+    if (this.interrupted) {
+      this.interrupted = false;
+      this.cancelWakeupRetry();
+      this.stepText.clear();
+      this.closeRunningTools('Interrupted');
+      this.turnHadText = false;
+      this.endedWithAgentResponse = false;
+      this.turnStartedAt = 0;
+      this.turnHadStepUsage = false;
+      this.setStatus('idle', 'Interrupted');
+      return;
+    }
+    this.stepText.clear();
+    this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = 0;
+    this.turnHadStepUsage = false;
+    if (this.status === 'stopped') {
+      this.cancelWakeupRetry();
+      this.closeRunningTools('Stopped');
+      this.setStatus('stopped');
+      return;
+    }
+    if (this.status === 'limited') {
+      this.closeRunningTools('Usage limit reached');
+      this.setStatus('limited');
+      return;
+    }
+    if (this.wakeupRetryTimer) {
+      return;
+    }
+    const unhandledWakeup = this.findUnhandledTaskWakeup();
+    if (code === 0 || signal === 'SIGTERM' || code === 143 || (this.status === 'idle' && /stream input cancelled/i.test(String(stderr ?? '')))) {
+      if (unhandledWakeup && this.tryRecoverUnhandledWakeup(unhandledWakeup, '', false)) return;
+      this.closeRunningTools('Stopped');
+      this.setStatus('idle');
+    } else {
+      const stderrStr = String(stderr ?? '');
+      if (this.activeBilling === 'sub' && /rate.?limit|quota|429|resource_exhausted/i.test(stderrStr) && !/prepayment credits are depleted|AI Studio/i.test(stderrStr)) {
+        this.closeRunningTools('Usage limit reached');
+        if (this.tryHybridSpillover()) return;
+      }
+      if (this.tryHydrogenApiFallback(stderrStr)) return;
+      if (this.tryRecoverUnhandledWakeup(unhandledWakeup, stderrStr, true)) return;
+      this.closeRunningTools(`agy exited (${code ?? signal})`);
+      this.noteUnavailableCarbon(stderrStr);
+      this.emitLocal({ type: 'bridge', subtype: 'error', message: `agy exited (${code ?? signal}). ${stderrStr.trim().slice(-800)}` });
       this.setStatus('error', 'agy exited unexpectedly');
     }
   }
 
+  cancelWakeupRetry() {
+    if (this.wakeupRetryTimer) {
+      clearTimeout(this.wakeupRetryTimer);
+      this.wakeupRetryTimer = null;
+    }
+    this.wakeupRecoveryActive = false;
+    this.wakeupRetryCount = 0;
+    this.wakeupRetryScheduledAt = 0;
+  }
+
   /**
-   * agy only knows Gemini 4 Carbon when it signs in with Application Default Credentials. With a
-   * Gemini API key it rejects the model, so say why instead of leaving the raw CLI error (or, worse,
-   * letting the task run as another model without the user noticing).
+   * Inspects the tail of AGY's transcript.jsonl for a high-priority SYSTEM_MESSAGE wakeup
+   * (e.g. `Task id ".../task-N" finished with result:` or subagent/schedule notification)
+   * that has no subsequent PLANNER_RESPONSE, GENERIC, or USER_INPUT step.
+   */
+  findUnhandledTaskWakeup() {
+    if (process.env.CCM_LEGACY_PROTO === '1') return null;
+    const file = findCliTranscript(this.cliSessionId ?? this.id);
+    if (!file || !fs.existsSync(file)) return null;
+    try {
+      const stat = fs.statSync(file);
+      const readLen = Math.min(stat.size, 65536);
+      const buf = Buffer.alloc(readLen);
+      const fd = fs.openSync(file, 'r');
+      fs.readSync(fd, buf, 0, readLen, stat.size - readLen);
+      fs.closeSync(fd);
+      const entries = [];
+      for (const line of buf.toString('utf8').split('\n')) {
+        if (!line.includes('"step_index"')) continue;
+        try {
+          const r = JSON.parse(line);
+          if (typeof r.step_index === 'number') entries.push(r);
+        } catch {}
+      }
+      if (!entries.length) return null;
+      entries.sort((a, b) => a.step_index - b.step_index);
+      let wakeupIdx = -1;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const r = entries[i];
+        if (r.type === 'SYSTEM_MESSAGE' && typeof r.content === 'string' &&
+            (/Task id "[^"]*\/task-\d+" (?:finished with result:|was canceled)/i.test(r.content) ||
+             /priority=MESSAGE_PRIORITY_HIGH/i.test(r.content))) {
+          wakeupIdx = i;
+          break;
+        }
+      }
+      if (wakeupIdx < 0) return null;
+      const wakeup = entries[wakeupIdx];
+      let hasErrorAfter = false;
+      let lastErrorText = '';
+      for (let j = wakeupIdx + 1; j < entries.length; j++) {
+        const after = entries[j];
+        if (after.type === 'PLANNER_RESPONSE' || after.type === 'GENERIC' || after.type === 'USER_INPUT') {
+          return null;
+        }
+        if (after.type === 'ERROR_MESSAGE') {
+          hasErrorAfter = true;
+          lastErrorText = String(after.error || after.content || '');
+        }
+      }
+      const lastEntry = entries[entries.length - 1];
+      const lastTs = Date.parse(lastEntry.created_at || wakeup.created_at || '') || stat.mtimeMs;
+      return {
+        stepIndex: wakeup.step_index,
+        hasErrorAfter,
+        lastErrorText,
+        lastEntryAgeMs: Math.max(0, Date.now() - lastTs),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Automatically wakes or reconnects AGY when a background task finished (SYSTEM_MESSAGE written
+   * to transcript.jsonl) but AGY failed to process the wakeup due to Android Doze / stale HTTP/2
+   * sockets / transient network drops, or exited before handling the wakeup.
+   */
+  tryRecoverUnhandledWakeup(unhandled, errorText = '', isError = false) {
+    if (process.env.CCM_LEGACY_PROTO === '1') return false;
+    if (this.archived || this.interrupted || this.status === 'stopped') return false;
+    if (this.wakeupRetryTimer) return true;
+    const isTransientNet = Boolean(errorText) &&
+      /unexpected eof|client conn could not be established|timeout awaiting response headers|connection reset|connection refused|network is unreachable|no such host|dial tcp|tls handshake timeout|temporary failure|fetch failed|stream.*interrupted|broken pipe|\b(?:502|503|504)\b|unavailable|internal error/i.test(errorText);
+    if (!unhandled && !(this.wakeupRecoveryActive && isError && isTransientNet)) {
+      return false;
+    }
+    const maxRetries = Number(process.env.CCM_MAX_WAKEUP_RETRIES ?? 12);
+    if (this.wakeupRetryCount >= maxRetries) {
+      this.wakeupRecoveryActive = false;
+      return false;
+    }
+    this.wakeupRecoveryActive = true;
+    this.wakeupRetryCount += 1;
+    if (unhandled) this.wakeupStallTriggeredStep = unhandled.stepIndex;
+    const backoffTable = [2_000, 5_000, 12_000, 25_000, 45_000, 60_000];
+    const defaultDelay = (!isError && unhandled && !unhandled.hasErrorAfter)
+      ? 500
+      : backoffTable[Math.min(this.wakeupRetryCount - 1, backoffTable.length - 1)];
+    const delayMs = process.env.CCM_WAKEUP_RETRY_MS ? Number(process.env.CCM_WAKEUP_RETRY_MS) : defaultDelay;
+    if (this.wakeupRetryCount === 1) {
+      this.emitLocal({
+        type: 'bridge',
+        subtype: 'note',
+        message: isError || unhandled?.hasErrorAfter
+          ? 'Background task finished while network was reconnecting — waking AGY to continue…'
+          : 'Background task finished — waking AGY to continue…',
+      });
+    }
+    this.wakeupRetryScheduledAt = Date.now();
+    this.wakeupRetryTimer = setTimeout(() => this.runPendingWakeupRetry(), delayMs);
+    this.wakeupRetryTimer.unref?.();
+    this.setStatus('working', isError || unhandled?.hasErrorAfter
+      ? `Reconnecting AGY to continue background task (attempt ${this.wakeupRetryCount})…`
+      : 'Continuing after background task…');
+    return true;
+  }
+
+  runPendingWakeupRetry() {
+    if (this.wakeupRetryTimer) {
+      clearTimeout(this.wakeupRetryTimer);
+      this.wakeupRetryTimer = null;
+    }
+    this.wakeupRetryScheduledAt = 0;
+    if (this.archived || this.interrupted || this.status === 'stopped') {
+      this.wakeupRecoveryActive = false;
+      syncTermuxWakeLock();
+      return;
+    }
+    this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = Date.now();
+    this.turnHadStepUsage = false;
+    this.turnProducedSideEffects = false;
+    this.restartAfterTurn = false;
+    this.lastErrorResultAt = 0;
+    if (this.link) {
+      this.idleExit = true;
+      this.link.kill();
+    } else {
+      this.ensureProcess();
+    }
+    this.writeCli({
+      event: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Background task finished — review its output above and continue.' }],
+      },
+    });
+    this.setStatus('working', 'Thinking');
+  }
+
+  /**
+   * When a Google Subscription plan does not recognize gemini-4-hydrogen and Hybrid mode has a
+   * Gemini API key under the daily cap, automatically retries the turn on the Gemini API.
+   */
+  tryHydrogenApiFallback(output) {
+    if (process.env.CCM_LEGACY_PROTO === '1') return false;
+    if (this.activeBilling !== 'sub' || this.hydrogenSubUnsupported) return false;
+    const text = String(output ?? '');
+    if (!/gemini-4-hydrogen/i.test(text) || !/not recognized|effort is not supported/i.test(text)) return false;
+    if (getConfiguredProvider() !== 'hybrid' || !getGeminiApiKey()) return false;
+    const cap = getDailyApiLimitUsd();
+    const spent = cap > 0 ? todayApiCostUsd() : 0;
+    if (cap > 0 && spent >= cap) return false;
+    this.hydrogenSubUnsupported = true;
+    this.closeRunningTools('Retrying on Gemini API');
+    this.emitLocal({
+      type: 'bridge',
+      subtype: 'note',
+      message: 'This Google subscription plan does not include Gemini 4 Hydrogen — continuing on Gemini API.',
+    });
+    const retryPrompt = this.lastTurnPrompt || CONTINUE_PROMPT;
+    this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = Date.now();
+    this.turnHadStepUsage = false;
+    this.turnProducedSideEffects = false;
+    this.restartAfterTurn = false;
+    if (this.link) {
+      this.idleExit = true;
+      this.link.kill();
+    } else {
+      this.ensureProcess();
+    }
+    this.writeCli({
+      event: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: retryPrompt }] },
+    });
+    this.setStatus('working', 'Continuing on Gemini API (4 Hydrogen)…');
+    return true;
+  }
+
+  /**
+   * Explains when Gemini 4 Carbon or Gemini 4 Hydrogen needs ADC or a Gemini API key instead of
+   * leaving only a raw CLI rejection message.
    */
   noteUnavailableCarbon(output) {
-    if (this.carbonNoticeShown) return;
     const text = String(output ?? '');
+    if (!this.hydrogenNoticeShown && /gemini-4-hydrogen/.test(text) && /not recognized|effort is not supported/i.test(text)) {
+      this.hydrogenNoticeShown = true;
+      this.emitLocal({
+        type: 'bridge',
+        subtype: 'note',
+        message: 'Gemini 4 Hydrogen is not available on this Google subscription plan. Switch models or add a Gemini API key in Settings › AGY account (Hybrid or Gemini API mode).',
+      });
+      return;
+    }
+    if (this.carbonNoticeShown) return;
     if (!/gemini-4-carbon/.test(text) || !/not recognized|effort is not supported/i.test(text)) return;
     this.carbonNoticeShown = true;
     const message = adcConfigured()
-      ? 'Gemini 4 Carbon is not in AGY’s model list for this account, even with Application Default Credentials (ADC). AGY only includes Carbon for plans that have it. Argon and Flash work; a Gemini API key can call Carbon directly.'
-      : 'Gemini 4 Carbon is not available to AGY with this sign-in. AGY lists it only for Application Default Credentials (ADC) sign-in that includes Carbon, not a Gemini API key. Pick Argon or Flash, or sign in with ADC on this machine (gcloud auth application-default login, then AGY_ADC_AUTH=1) and try again.';
+      ? 'Gemini 4 Carbon is not in AGY’s model list for this account, even with Application Default Credentials (ADC). AGY only includes Carbon for plans that have it. Argon, Flash, and 4 Hydrogen (with a Gemini API key) work.'
+      : 'Gemini 4 Carbon is not available to AGY with this sign-in. AGY lists it only for Application Default Credentials (ADC) sign-in that includes Carbon, or via a Gemini API key. Pick 4 Hydrogen, Argon, or Flash, or sign in with ADC on this machine.';
     this.emitLocal({ type: 'bridge', subtype: 'note', message });
   }
 
@@ -660,12 +1080,28 @@ class Session {
    * but whose child process is still running and blocking the sequential stream-json emitter.
    */
   checkStuckTools() {
-    if (this.status !== 'working' || !this.link || this.emittedTools.size === 0) {
+    if (this.status !== 'working' || !this.link) {
       this.stuckToolDetectedAt = null;
       return;
     }
     const claudePid = this.link.info?.claudePid;
     if (!claudePid || !alive(claudePid)) return;
+
+    if (this.emittedTools.size === 0) {
+      this.stuckToolDetectedAt = null;
+      if (this.pending.size === 0 && !this.wakeupRetryTimer) {
+        const unhandled = this.findUnhandledTaskWakeup();
+        if (unhandled && unhandled.stepIndex !== this.wakeupStallTriggeredStep) {
+          const stallMs = process.env.CCM_UNHANDLED_WAKEUP_STALL_MS
+            ? Number(process.env.CCM_UNHANDLED_WAKEUP_STALL_MS)
+            : (unhandled.hasErrorAfter ? 45_000 : 90_000);
+          if (unhandled.lastEntryAgeMs >= stallMs) {
+            this.tryRecoverUnhandledWakeup(unhandled, unhandled.lastErrorText, unhandled.hasErrorAfter);
+          }
+        }
+      }
+      return;
+    }
 
     const file = findCliTranscript(this.cliSessionId ?? this.id);
     if (!file || !fs.existsSync(file)) return;
@@ -844,6 +1280,7 @@ class Session {
   /** Normalizes agy's stream-json events ({event: 'init' | 'step_update' | 'result'}) into bridge events. */
   onAgyMessage(msg, fromTranscriptSync = false) {
     if (msg.event === 'init') {
+      this.lastErrorResultAt = 0;
       if (msg.conversation_id && this.cliSessionId !== msg.conversation_id) {
         this.cliSessionId = msg.conversation_id;
         this.persistMeta();
@@ -864,12 +1301,20 @@ class Session {
     if (msg.event === 'step_update') {
       const su = msg.step_update;
       if (!su) return;
+      if (!this.turnStartedAt) this.turnStartedAt = Date.now();
       if (su.conversation_id && !this.cliSessionId) {
         this.cliSessionId = su.conversation_id;
         this.persistMeta();
       }
       const idx = su.step_index ?? 0;
       if (!fromTranscriptSync && this.syncedTranscriptSteps.has(idx)) return;
+      if (!fromTranscriptSync && (su.step_type === 'tool' || (su.step_type === 'agent_response' && (su.text_delta || su.state === 'DONE')))) {
+        this.lastErrorResultAt = 0;
+        if (this.wakeupRecoveryActive) {
+          this.wakeupRecoveryActive = false;
+          this.wakeupRetryCount = 0;
+        }
+      }
 
       if (su.step_type === 'agent_response') {
         if (typeof su.text_delta === 'string' && su.text_delta.length > 0) {
@@ -888,6 +1333,7 @@ class Session {
         if (su.state === 'DONE' || su.state === 'ERROR' || su.state === 'CANCELED') {
           const text = this.stepText.get(idx) ?? '';
           this.stepText.delete(idx);
+          this.endedWithAgentResponse = Boolean(su.state === 'DONE' && text.trim());
           const thinking = this.readStepThinking(idx);
           const content = [];
           if (thinking) content.push({ type: 'thinking', thinking });
@@ -900,7 +1346,11 @@ class Session {
             thinking_tokens: su.usage.thinking_tokens ?? 0,
           } : undefined;
           if (content.length > 0 || usage) {
-            if (text) this.turnHadText = true;
+            if (text) {
+              this.turnHadText = true;
+              this.turnProducedSideEffects = true;
+            }
+            if (usage) this.turnHadStepUsage = true;
             this.onCliMessage({
               type: 'assistant',
               uuid: `step-${idx}`,
@@ -921,6 +1371,7 @@ class Session {
       }
 
       if (su.step_type === 'tool') {
+        this.endedWithAgentResponse = false;
         const toolName = su.tool_info?.name || su.tool_name || (su.subagent_info ? 'invoke_subagent' : 'tool');
         const toolId = `tool-${idx}`;
         let input = su.tool_info?.parameters ?? {};
@@ -932,6 +1383,7 @@ class Session {
         }
         if (!this.emittedTools.has(idx)) {
           this.emittedTools.add(idx);
+          this.turnProducedSideEffects = true;
           const priorThinking = idx > 0 ? this.readStepThinking(idx - 1) : null;
           const content = [];
           if (priorThinking) content.push({ type: 'thinking', thinking: priorThinking });
@@ -955,23 +1407,8 @@ class Session {
           const outText = isErr
             ? (su.tool_info?.error?.message || su.tool_info?.output || 'Tool error')
             : (su.tool_info?.output ?? '');
-          let resultContent = outText;
-          // If view_file read an image on disk, attach the image block so slimEvent saves it for the app.
-          const viewedPath = !isErr && toolName === 'view_file' && typeof input?.AbsolutePath === 'string' ? input.AbsolutePath : null;
-          if (viewedPath) {
-            const ext = path.extname(viewedPath).toLowerCase().slice(1);
-            const mime = IMAGE_MIME[ext === 'jpg' ? 'jpeg' : ext];
-            try {
-              const stat = mime ? fs.statSync(viewedPath) : null;
-              if (stat && stat.isFile() && stat.size <= MAX_INLINE_IMAGE_BYTES) {
-                const data = fs.readFileSync(viewedPath).toString('base64');
-                resultContent = [
-                  ...(outText ? [{ type: 'text', text: outText }] : []),
-                  { type: 'image', source: { type: 'base64', media_type: mime, data } },
-                ];
-              }
-            } catch {}
-          }
+          // If read_file or view_file read an image on disk, attach the image block so slimEvent saves it for the app.
+          const resultContent = extractViewedImage(toolName, input, isErr, outText);
           const usage = su.usage ? {
             input_tokens: su.usage.input_tokens ?? 0,
             output_tokens: su.usage.output_tokens ?? 0,
@@ -980,6 +1417,7 @@ class Session {
             thinking_tokens: su.usage.thinking_tokens ?? 0,
           } : undefined;
           if (usage) {
+            this.turnHadStepUsage = true;
             this.record({
               type: 'assistant',
               uuid: `step-${idx}-usage`,
@@ -1027,6 +1465,7 @@ class Session {
       for (const [idx, text] of this.stepText.entries()) {
         if (text) {
           this.turnHadText = true;
+          if (text.trim()) this.endedWithAgentResponse = true;
           this.onCliMessage({
             type: 'assistant',
             uuid: `step-${idx}`,
@@ -1042,32 +1481,61 @@ class Session {
         }
       }
       this.stepText.clear();
-      this.emittedTools.clear();
 
-      const hadTurnResponse = this.turnHadText || Boolean(typeof res.response === 'string' && res.response.trim());
       let isError = res.status ? res.status !== 'SUCCESS' : !!res.error;
       const rawErrorText = String(res.error || (res.status === 'ERROR' ? res.response : '') || '');
-      const isRateLimit = isError && /rate.?limit|quota|429|resource_exhausted/i.test(rawErrorText);
-      const isStreamInterrupted = isError && /stream.*interrupted|interrupted.*stream/i.test(rawErrorText);
-      const activeModel = this.currentModel ?? this.model ?? 'agy';
-      const hasKnownLimits = Array.isArray(limits?.windows) && limits.windows.length > 0;
-      const modelExhausted = hasKnownLimits ? isModelQuotaExhausted(activeModel, limits) : true;
-
-      // If the turn produced a complete response, stale error details from earlier turns (e.g. model switches)
-      // or post-response stream interruptions must not fail the turn or mark it as rate-limited.
-      if (hadTurnResponse && isError) {
-        if (isRateLimit || isStreamInterrupted || !res.status || res.status === 'SUCCESS') {
-          isError = false;
-        }
+      if (isError && /stream input cancelled/i.test(rawErrorText) && (this.idleExit || this.status === 'idle' || this.status === 'stopped' || this.interrupted)) {
+        this.turnHadText = false;
+        this.endedWithAgentResponse = false;
+        this.turnHadStepUsage = false;
+        this.turnStartedAt = 0;
+        return;
       }
+      // When AGY's autonomous background-task wakeup fails, AGY emits an ERROR result for the failed
+      // wakeup sub-turn followed milliseconds later by a bogus outer SUCCESS result echoing stale text
+      // from before the background task. Suppress any trailing SUCCESS result while recovery is pending
+      // or immediately after an ERROR result.
+      if (!isError && (this.wakeupRetryTimer || (this.lastErrorResultAt > 0 && Date.now() - this.lastErrorResultAt < 10_000))) {
+        return;
+      }
+      const isRateLimit = isError && /rate.?limit|quota|429|resource_exhausted/i.test(rawErrorText) &&
+        !/prepayment credits are depleted|AI Studio/i.test(rawErrorText);
+      const isStreamInterrupted = isError && /stream.*interrupted|interrupted.*stream/i.test(rawErrorText);
+      const hasDistinctResponse = typeof res.response === 'string' &&
+        res.response.trim().length > 0 &&
+        res.response.trim() !== rawErrorText.trim();
+      const unhandledWakeup = !this.interrupted && this.status !== 'stopped' ? this.findUnhandledTaskWakeup() : null;
+      const finalResponseDelivered = !unhandledWakeup &&
+        (this.endedWithAgentResponse || (!this.turnProducedSideEffects && hasDistinctResponse)) &&
+        this.emittedTools.size === 0;
 
-      // If no response was produced but this is a rate-limit error, only treat as rate-limited if the
-      // active model's quota window is actually exhausted in limits.json.
-      if (isError && isRateLimit && hasKnownLimits && !modelExhausted) {
+      // If the turn delivered its final assistant response (with no running or failed post-tool turn),
+      // transient mid-turn retry errors (e.g. "API error (attempt 1): ..."), stale quota messages,
+      // or post-response stream interruptions must not mark the completed turn as failed.
+      if (finalResponseDelivered && isError) {
         isError = false;
       }
 
+      if (isError && isRateLimit) {
+        const durMatch = /resets?\s+in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?/i.exec(rawErrorText);
+        if (durMatch && (durMatch[1] || durMatch[2] || durMatch[3])) {
+          const ms = (Number(durMatch[1] || 0) * 3600 + Number(durMatch[2] || 0) * 60 + Number(durMatch[3] || 0)) * 1000;
+          if (ms > 0) this.rejectedResetAt = Date.now() + Math.round(ms);
+        }
+      }
+
       const errText = isError ? rawErrorText : '';
+      if (isError && this.tryHydrogenApiFallback(rawErrorText)) return;
+      if (!isRateLimit && this.tryRecoverUnhandledWakeup(unhandledWakeup, rawErrorText, isError)) {
+        if (isError) this.lastErrorResultAt = Date.now();
+        this.turnHadText = false;
+        this.endedWithAgentResponse = false;
+        this.turnHadStepUsage = false;
+        this.turnStartedAt = 0;
+        return;
+      }
+      if (isError) this.lastErrorResultAt = Date.now();
+      this.closeRunningTools(isError ? (errText || 'Stopped') : '', isError);
       if (isError) this.noteUnavailableCarbon(rawErrorText);
       const turnUsage = res.usage ? {
         input_tokens: res.usage.input_tokens ?? 0,
@@ -1087,11 +1555,18 @@ class Session {
             model: this.currentModel ?? this.model ?? 'agy',
             role: 'assistant',
             content: [{ type: 'text', text: res.response }],
-            ...(turnUsage ? { usage: turnUsage } : {}),
+            ...(!this.turnHadStepUsage && turnUsage ? { usage: turnUsage } : {}),
           },
         });
       }
       this.turnHadText = false;
+      this.endedWithAgentResponse = false;
+      this.turnHadStepUsage = false;
+
+      const cliDurationMs = Math.round((res.duration_seconds ?? 0) * 1000);
+      const wallDurationMs = this.turnStartedAt > 0 ? Math.max(0, Date.now() - this.turnStartedAt) : 0;
+      const durationMs = wallDurationMs > 0 && cliDurationMs > wallDurationMs + 5_000 ? wallDurationMs : cliDurationMs;
+      this.turnStartedAt = 0;
 
       if (Array.isArray(res.denied_actions) && res.denied_actions.length) {
         const names = res.denied_actions.map((d) => d.display_name || d.action).join(', ');
@@ -1112,7 +1587,7 @@ class Session {
         subtype: isError ? 'error' : 'success',
         is_error: isError,
         result: isError ? (errText || 'Error') : (res.response ?? ''),
-        duration_ms: Math.round((res.duration_seconds ?? 0) * 1000),
+        duration_ms: durationMs,
         num_turns: res.num_turns ?? 1,
         total_cost_usd: 0,
         ...(turnUsage ? { usage: turnUsage } : {}),
@@ -1144,6 +1619,11 @@ class Session {
     if (msg.type === 'system' && msg.subtype === 'init') {
       msg = { type: 'system', subtype: 'init', model: msg.model, cwd: msg.cwd, permissionMode: msg.permissionMode, session_id: msg.session_id };
     }
+    if (msg.type === 'result' && this.limitHit && this.tryHybridSpillover()) {
+      this.limitHit = false;
+      this.rejectedResetAt = null;
+      return;
+    }
 
     msg = slimEvent(msg, this.id);
     this.record(msg);
@@ -1166,6 +1646,7 @@ class Session {
       }
       const tool = msg.message?.content?.find((c) => c.type === 'tool_use');
       const text = msg.message?.content?.find((c) => c.type === 'text');
+      if (tool || text) this.turnProducedSideEffects = true;
       if (this.status !== 'needs_approval' && (tool || text)) {
         this.setStatus('working', tool ? `${tool.name}: ${describeInput(tool.input)}` : text.text.slice(0, 120));
       }
@@ -1177,6 +1658,11 @@ class Session {
       this.clearResume();
       this.rejectedResetAt = null;
       this.limitRetryMs = 0;
+      if (!msg.is_error) {
+        this.lastTurnPrompt = null;
+        this.lastTurnLegacyContent = null;
+      }
+      this.turnProducedSideEffects = false;
       const waiting = this.background.length ? `In the background: ${this.background[0].description}` : 'Waiting for you';
       this.setStatus(msg.is_error ? 'error' : 'idle', msg.is_error ? (msg.result ?? 'Error') : waiting);
       if (this.restartAfterTurn && this.link) {
@@ -1198,15 +1684,27 @@ class Session {
   runSlashCommand(cmd) {
     const args = ['-p', cmd, '--output-format', 'json'];
     if (this.cliSessionId) args.push('--conversation', this.cliSessionId);
-    const geminiApiKey = getGeminiApiKey();
-    execFile(claudeBin, args, {
+    const isUsageCmd = /^\/(usage|quota|credits)(\s|$)/i.test(cmd.trim());
+    const isModelsCmd = /^\/models(\s|$)/i.test(cmd.trim());
+    const useApi = !isUsageCmd && isGeminiApiActive();
+    const geminiApiKey = useApi ? getGeminiApiKey() : null;
+    const noProxy = [process.env.NO_PROXY, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
+    const env = {
+      ...process.env,
+      AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+      ...(process.env.CCM_AGY_DIR ? { ANTIGRAVITY_APP_DATA_DIR: agyDataDir } : {}),
+      ...(useApi && carbonGatewayUrl ? { AGY_LLM_GATEWAY_URL: carbonGatewayUrl, GOOGLE_GEMINI_BASE_URL: carbonGatewayUrl, NO_PROXY: noProxy, no_proxy: noProxy } : {}),
+    };
+    if (!(useApi && carbonGatewayUrl)) {
+      delete env.AGY_LLM_GATEWAY_URL;
+      delete env.GOOGLE_GEMINI_BASE_URL;
+    }
+    if (geminiApiKey) env.GEMINI_API_KEY = geminiApiKey;
+    else delete env.GEMINI_API_KEY;
+    const slashProc = execFile(claudeBin, args, {
       cwd: this.cwd,
       timeout: 30_000,
-      env: {
-        ...process.env,
-        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
-        ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
-      },
+      env,
     }, (err, stdout, stderr) => {
       let reply = '';
       let isError = false;
@@ -1225,6 +1723,12 @@ class Session {
       } catch {
         isError = !!err;
         reply = (stdout || stderr || err?.message || 'Command failed').trim();
+      }
+      if (!isError && isModelsCmd && reply && carbonGatewayUrl) {
+        const extra = [];
+        if (getGeminiApiKey() && !/gemini-4-hydrogen/i.test(reply)) extra.push('gemini-4-hydrogen (Gemini API)');
+        if ((adcConfigured() || getGeminiApiKey()) && !/gemini-4-carbon/i.test(reply)) extra.push('gemini-4-carbon');
+        if (extra.length) reply = `${reply}\nBridge gateway models: ${extra.join(', ')}`;
       }
       if (reply) {
         this.onCliMessage({
@@ -1250,10 +1754,13 @@ class Session {
         total_cost_usd: 0,
       });
     });
+    try { slashProc.stdin?.end(); } catch {}
   }
 
   sendUser(text, attachments = []) {
     this.clearResume();
+    this.cancelWakeupRetry();
+    this.lastErrorResultAt = 0;
     const saved = this.saveAttachments(attachments);
     const trimmed = String(text ?? '').trim();
     const modelCmd = !saved.length && trimmed.match(/^\/model(?:\s+(.*))?$/i);
@@ -1268,6 +1775,9 @@ class Session {
       const aliases = {
         default: null,
         auto: null,
+        hydrogen: 'gemini-4-hydrogen',
+        '4-hydrogen': 'gemini-4-hydrogen',
+        'gemini-4-hydrogen': 'gemini-4-hydrogen',
         carbon: 'gemini-4-carbon',
         'gemini-4-carbon': 'gemini-4-carbon',
         argon: 'gemini-4-argon',
@@ -1338,12 +1848,31 @@ class Session {
       return;
     }
 
+    if (this.link && !this.idleExit) {
+      const desired = this.resolveSessionRouting();
+      if (this.activeBilling && desired.billing !== this.activeBilling) {
+        this.idleExit = true;
+        this.link.kill();
+      }
+    }
+    // If earlier prompts in this task failed before AGY ever created a conversation (e.g. model/auth error
+    // on turn 1 before switching models), include them as context so AGY still sees the original request.
+    let priorUnansweredPrompts = [];
+    if (process.env.CCM_LEGACY_PROTO !== '1' && !this.cliSessionId && !this.events.some((e) => e.type === 'assistant')) {
+      priorUnansweredPrompts = this.events
+        .filter((e) => e.type === 'user' && e.local && typeof e.message?.content === 'string' && e.message.content.trim())
+        .map((e) => e.message.content.trim());
+    }
     this.ensureProcess();
     let promptText = text;
+    if (priorUnansweredPrompts.length) {
+      const earlier = priorUnansweredPrompts.map((p) => `- ${p}`).join('\n');
+      promptText = `[Earlier messages in this task before the session started:\n${earlier}\n]\n\n${text}`;
+    }
     let legacyContent = text;
     if (saved.length) {
       const list = saved.map((a) => `- ${a.path} (${a.mime}, ${formatBytes(a.size)})`).join('\n');
-      promptText = `${text || 'See the attached files.'}\n\nAttached files, saved on this machine (use view_file to read or view them):\n${list}`;
+      promptText = `${text || 'See the attached files.'}\n\nAttached files, saved on this machine (use read_file to read or view them):\n${list}`;
       legacyContent = [
         { type: 'text', text: promptText },
         ...saved.filter((a) => a.inline).map((a) => ({ type: 'image', source: { type: 'base64', media_type: a.mime, data: a.data } })),
@@ -1355,6 +1884,12 @@ class Session {
       ...(saved.length ? { attachments: saved.map(({ name, mime, size, path: p }) => ({ name, mime, size, path: p })) } : {}),
     });
     this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = Date.now();
+    this.turnHadStepUsage = false;
+    this.turnProducedSideEffects = false;
+    this.lastTurnPrompt = promptText;
+    this.lastTurnLegacyContent = legacyContent;
     if (process.env.CCM_LEGACY_PROTO === '1') {
       this.writeCli({ type: 'user', message: { role: 'user', content: legacyContent } });
     } else {
@@ -1453,6 +1988,7 @@ class Session {
   setModel(model) {
     this.model = model || null;
     this.currentModel = this.model;
+    this.effectiveModel = this.model;
     if (process.env.CCM_LEGACY_PROTO !== '1') {
       this.restartProcessForNextTurn();
     }
@@ -1472,6 +2008,7 @@ class Session {
   }
 
   interrupt() {
+    this.cancelWakeupRetry();
     if (process.env.CCM_LEGACY_PROTO === '1') {
       this.writeCli({ type: 'control_request', request_id: `int-${randomUUID()}`, request: { subtype: 'interrupt' } });
       return;
@@ -1504,8 +2041,64 @@ class Session {
     this.costUsd = this.costBase + total;
   }
 
+  /**
+   * When Hybrid mode is active and a Google Subscription turn hits a usage/rate limit,
+   * automatically switches the session to Gemini API (Gemini 4 Hydrogen) and continues
+   * without losing the user's turn — unless the daily API budget cap has been reached.
+   */
+  tryHybridSpillover() {
+    if (process.env.CCM_LEGACY_PROTO === '1') return false;
+    if (getConfiguredProvider() !== 'hybrid' || this.activeBilling !== 'sub') return false;
+    const apiKey = getGeminiApiKey();
+    if (!apiKey) return false;
+    const cap = getDailyApiLimitUsd();
+    const spent = cap > 0 ? todayApiCostUsd() : 0;
+    if (cap > 0 && spent >= cap) {
+      this.emitLocal({
+        type: 'bridge',
+        subtype: 'note',
+        message: `Daily Gemini API cap ($${cap.toFixed(2)}) reached ($${spent.toFixed(2)} used today) — waiting for Google subscription quota reset.`,
+      });
+      return false;
+    }
+    const now = Date.now();
+    const activeModel = this.currentModel ?? this.model ?? 'agy';
+    const modelWin = windowForModel(activeModel, limits?.windows);
+    const winResetAt = modelWin?.resetsAt > now ? modelWin.resetsAt : null;
+    const resetAt = this.rejectedResetAt > now ? this.rejectedResetAt : winResetAt;
+    this.hybridSpilloverUntil = resetAt ? resetAt + LIMIT_GRACE_MS : now + 30 * 60_000;
+    this.spilloverNotified = true;
+    this.emitLocal({
+      type: 'bridge',
+      subtype: 'note',
+      message: 'Subscription limit reached — continuing on Gemini API (Gemini 4 Hydrogen) until subscription quota resets.',
+    });
+
+    const useContinue = Boolean(this.turnProducedSideEffects && this.cliSessionId);
+    const retryPrompt = useContinue ? 'Continue where you left off.' : (this.lastTurnPrompt || CONTINUE_PROMPT);
+    this.turnHadText = false;
+    this.endedWithAgentResponse = false;
+    this.turnStartedAt = Date.now();
+    this.turnHadStepUsage = false;
+    this.turnProducedSideEffects = false;
+    this.restartAfterTurn = false;
+    if (this.link) {
+      this.idleExit = true;
+      this.link.kill();
+    } else {
+      this.ensureProcess();
+    }
+    this.writeCli({
+      event: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: retryPrompt }] },
+    });
+    this.setStatus('working', 'Continuing on Gemini API (4 Hydrogen)…');
+    return true;
+  }
+
   /** The turn ended because a usage limit was reached: wait for it to reset. */
   onLimited() {
+    if (this.tryHybridSpillover()) return;
     const now = Date.now();
     const activeModel = this.currentModel ?? this.model ?? 'agy';
     const modelWin = windowForModel(activeModel, limits?.windows);
@@ -1539,9 +2132,19 @@ class Session {
 
   stop() {
     this.clearResume();
+    this.cancelWakeupRetry();
+    this.afterExit.length = 0;
+    this.idleExit = false;
+    this.restartAfterTurn = false;
+    this.pending.clear();
     this.status = 'stopped';
-    if (this.link) this.link.kill();
-    else this.setStatus('stopped');
+    if (this.link) {
+      this.persistMeta();
+      broadcast({ ev: 'session', session: this.summary() });
+      this.link.kill();
+    } else {
+      this.setStatus('stopped');
+    }
   }
 
   /**
@@ -1590,12 +2193,22 @@ class Session {
     const file = findCliTranscript(this.cliSessionId ?? this.id);
     if (!file) return;
     const { size, mtimeMs } = fs.statSync(file);
-    if (size === this.cliSize) return;
+    const prevSize = this.cliSize ?? 0;
+    if (size === prevSize) return;
     this.cliSize = size;
     const known = new Set(this.events.map((e) => e.uuid).filter(Boolean));
-    const records = readJsonl(file).map(cliRecordToEvent).filter(Boolean);
+    const opts = { sessionId: this.cliSessionId ?? this.id, cwd: this.cwd, model: this.currentModel ?? this.model };
+    const records = cliRecordsToEvents(readJsonl(file), opts);
     const last = records.findLastIndex((r) => known.has(r.uuid));
-    const fresh = (last < 0 ? records : records.slice(last + 1)).filter((e) => !known.has(e.uuid));
+    let fresh;
+    if (last >= 0) {
+      fresh = records.slice(last + 1).filter((e) => !known.has(e.uuid));
+    } else if (prevSize > 0 && size > prevSize) {
+      const tailText = fs.readFileSync(file).subarray(prevSize).toString('utf8');
+      fresh = cliRecordsToEvents(readJsonl(file, tailText), opts).filter((e) => !known.has(e.uuid));
+    } else {
+      fresh = records.filter((e) => !known.has(e.uuid));
+    }
     if (fresh.length) {
       this.emitLocal({ type: 'bridge', subtype: 'note', message: 'Continued in AGY CLI outside this app' });
       for (const e of fresh) this.emitLocal(e);
@@ -1718,8 +2331,9 @@ function cliRecordToEvent(r) {
         parent_tool_use_id: null,
       };
     }
-    if (r.type === 'ERROR_MESSAGE' && r.content) {
-      return { type: 'result', subtype: 'error', is_error: true, result: r.content, uuid };
+    const errMsg = r.error || r.content;
+    if (r.type === 'ERROR_MESSAGE' && errMsg) {
+      return { type: 'result', subtype: 'error', is_error: true, result: String(errMsg), uuid };
     }
     return null;
   }
@@ -1738,6 +2352,121 @@ function cliRecordToEvent(r) {
     else if (/^<(local-command-\w+|bash-std\w+)>/.test(content)) return null;
   }
   return { type: r.type, message: { ...r.message, content }, uuid: r.uuid, parent_tool_use_id: null };
+}
+
+/**
+ * Converts a sequence of transcript records (AGY `transcript.jsonl` or legacy `.claude/projects/*.jsonl`)
+ * into normalized events, pairing AGY `GENERIC` step outputs with the preceding `PLANNER_RESPONSE`'s `tool_calls`.
+ */
+function cliRecordsToEvents(records, { sessionId = 'cli', cwd = '', model = null } = {}) {
+  const events = [];
+  const pendingTools = [];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (typeof r.step_index === 'number' && typeof r.type === 'string') {
+      const uuid = `step-${r.step_index}`;
+      if (r.type === 'ERROR_MESSAGE') {
+        let recoveredInTurn = false;
+        for (let j = i + 1; j < records.length; j++) {
+          const next = records[j];
+          if (next?.type === 'USER_INPUT') break;
+          if (next?.type === 'PLANNER_RESPONSE' || next?.type === 'GENERIC') {
+            recoveredInTurn = true;
+            break;
+          }
+        }
+        if (recoveredInTurn) continue;
+      }
+      if (r.type === 'GENERIC') {
+        const tool = pendingTools.shift();
+        if (!tool) continue;
+        const isErr = r.status === 'ERROR' || r.status === 'CANCELED';
+        const outText = typeof r.content === 'string' ? r.content : '';
+        const content = extractViewedImage(tool.name, tool.input, isErr, outText);
+        events.push({
+          type: 'user',
+          uuid,
+          timestamp: r.created_at,
+          parent_tool_use_id: null,
+          message: {
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: tool.id,
+              content,
+              is_error: isErr,
+            }],
+          },
+        });
+        continue;
+      }
+      if (pendingTools.length && (r.type === 'USER_INPUT' || r.type === 'PLANNER_RESPONSE' || r.type === 'ERROR_MESSAGE')) {
+        for (const unclosed of pendingTools.splice(0)) {
+          events.push({
+            type: 'user',
+            uuid: `${unclosed.id}-unclosed`,
+            timestamp: r.created_at,
+            parent_tool_use_id: null,
+            message: {
+              role: 'user',
+              content: [{
+                type: 'tool_result',
+                tool_use_id: unclosed.id,
+                content: 'Interrupted',
+                is_error: true,
+              }],
+            },
+          });
+        }
+      }
+      if (r.type === 'PLANNER_RESPONSE') {
+        const blocks = [];
+        if (typeof r.thinking === 'string' && r.thinking.trim()) {
+          blocks.push({ type: 'thinking', thinking: r.thinking.trim() });
+        }
+        if (typeof r.content === 'string' && r.content.trim()) {
+          blocks.push({ type: 'text', text: r.content });
+        }
+        if (Array.isArray(r.tool_calls)) {
+          r.tool_calls.forEach((tc, idx) => {
+            if (tc?.name) {
+              const id = tc.id || `step-${r.step_index}-tool-${idx}`;
+              const input = parseAgyToolArgs(tc.args);
+              pendingTools.push({ id, name: tc.name, input });
+              blocks.push({ type: 'tool_use', id, name: tc.name, input });
+            }
+          });
+        }
+        const hasTokens = typeof r.input_tokens === 'number' || typeof r.output_tokens === 'number' || typeof r.cache_read_tokens === 'number';
+        const usage = hasTokens ? {
+          input_tokens: r.input_tokens ?? 0,
+          output_tokens: r.output_tokens ?? 0,
+          cache_read_input_tokens: r.cache_read_tokens ?? 0,
+          cache_creation_input_tokens: 0,
+          thinking_tokens: r.thinking_tokens ?? 0,
+        } : undefined;
+        if (!blocks.length && !usage) continue;
+        events.push({
+          type: 'assistant',
+          uuid,
+          timestamp: r.created_at,
+          cwd,
+          parent_tool_use_id: null,
+          message: {
+            id: `${sessionId}-step-${r.step_index}`,
+            model: model ?? 'agy',
+            role: 'assistant',
+            content: blocks,
+            ...(usage ? { usage } : {}),
+          },
+        });
+        continue;
+      }
+    }
+    const ev = cliRecordToEvent(r);
+    if (ev) events.push(ev);
+  }
+  return events;
 }
 
 function promptText(event) {
@@ -1936,10 +2665,16 @@ function importCliSession(id) {
   s.updatedAt = info.updatedAt;
   s.lastActivity = 'Resumed from AGY CLI';
   s.cliSize = fs.statSync(file).size;
-  const events = readJsonl(file).map(cliRecordToEvent).filter(Boolean).map((e) => slimEvent(e, id));
+  const rawEvents = cliRecordsToEvents(readJsonl(file), { sessionId: id, cwd: info.cwd, model: info.model }).map((e) => slimEvent(e, id));
+  for (const e of rawEvents) {
+    if (e.type === 'assistant' && e.message?.model !== '<synthetic>' && e.message?.usage) {
+      s.addUsage(e.message.usage);
+    }
+  }
+  const events = rawEvents.filter((e) => !(e.type === 'assistant' && Array.isArray(e.message?.content) && e.message.content.length === 0));
   events.push({ type: 'bridge', subtype: 'note', message: 'Resumed from AGY CLI. New messages continue this session.' });
   s.events = events.slice(-MAX_EVENTS);
-  fs.writeFileSync(s.logFile, s.events.map((e) => JSON.stringify(e) + '\n').join(''));
+  fs.writeFileSync(s.logFile, [...rawEvents, events.at(-1)].map((e) => JSON.stringify(e) + '\n').join(''));
   sessions.set(id, s);
   s.persistMeta();
   return s;
@@ -1978,11 +2713,52 @@ function windowForModel(model, windows) {
   return candidates.reduce((max, w) => (!max || (w.utilization ?? 0) > (max.utilization ?? 0) ? w : max), null);
 }
 
-/** Returns true only if the model's active quota window is exhausted (utilization >= 1). */
+/** Returns true only if the model's active quota window is currently exhausted (utilization >= 1 and not yet past resetsAt). */
 function isModelQuotaExhausted(model, limitsObj) {
   if (!limitsObj?.windows) return false;
   const win = windowForModel(model, limitsObj.windows);
-  return win ? (!win.disabled && (win.utilization ?? 0) >= 1) : false;
+  if (!win || win.disabled) return false;
+  if (win.resetsAt > 0 && win.resetsAt <= Date.now()) return false;
+  return (win.utilization ?? 0) >= 1;
+}
+
+/** Keeps Hybrid sessions synced when live quota windows report a reset or updated reset timestamp. */
+function syncHybridSessionsWithLimits() {
+  if (getConfiguredProvider() !== 'hybrid' || !limits?.windows?.length) return;
+  const now = Date.now();
+  for (const s of sessions.values()) {
+    const targetModel = s.model ?? 'agy';
+    const win = windowForModel(targetModel, limits.windows);
+    if (!win) continue;
+    const exhausted = !win.disabled && !(win.resetsAt > 0 && win.resetsAt <= now) && (win.utilization ?? 0) >= 1;
+    if (exhausted && win.resetsAt > now) {
+      s.hybridSpilloverUntil = win.resetsAt + LIMIT_GRACE_MS;
+    } else if (!exhausted && s.hybridSpilloverUntil) {
+      s.hybridSpilloverUntil = null;
+      if (s.activeBilling === 'api') s.restartProcessForNextTurn();
+    }
+  }
+}
+
+/** Estimates Gemini API cost in USD from token counts for API-billed turns. */
+function estimateApiCostUsd(model, inputTokens, outputTokens, cacheReadTokens = 0) {
+  const m = String(model ?? '').toLowerCase();
+  let inPerM = 0.30;
+  let cachePerM = 0.03;
+  let outPerM = 2.50;
+  if (m.includes('carbon')) {
+    inPerM = 2.00;
+    cachePerM = 0.20;
+    outPerM = 12.00;
+  } else if (m.includes('argon') || m.includes('pro')) {
+    inPerM = 1.25;
+    cachePerM = 0.125;
+    outPerM = 10.00;
+  }
+  const uncachedIn = Math.max(0, (Number(inputTokens) || 0));
+  const cachedIn = Math.max(0, (Number(cacheReadTokens) || 0));
+  const out = Math.max(0, (Number(outputTokens) || 0));
+  return (uncachedIn * inPerM + cachedIn * cachePerM + out * outPerM) / 1_000_000;
 }
 
 /** When a rejected rate_limit_event's limit resets (ms), or null if it doesn't say. */
@@ -2003,6 +2779,7 @@ function onRateLimit(info) {
   if (!windows.length) return;
   limits = { status: info.status ?? 'allowed', windows, updatedAt: Date.now() };
   try { fs.writeFileSync(limitsFile, JSON.stringify(limits)); } catch {}
+  syncHybridSessionsWithLimits();
   broadcast({ ev: 'limits', limits });
 }
 
@@ -2037,6 +2814,7 @@ function parseAgyLimitsOutput(parsed) {
   if (!windows.length) return false;
   limits = { status: anyExhausted ? 'rejected' : 'allowed', windows, updatedAt: Date.now() };
   try { fs.writeFileSync(limitsFile, JSON.stringify(limits)); } catch {}
+  syncHybridSessionsWithLimits();
   broadcast({ ev: 'limits', limits });
   return true;
 }
@@ -2093,15 +2871,23 @@ function refreshAgyLimits(force = false) {
   limitsRefreshPromise = (async () => {
     try {
       if (await fetchDirectAgyQuota()) return limits;
-      const geminiApiKey = getGeminiApiKey();
+      const geminiApiKey = isGeminiApiActive() ? getGeminiApiKey() : null;
+      const env = {
+        ...process.env,
+        AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
+        ...(process.env.CCM_AGY_DIR ? { ANTIGRAVITY_APP_DATA_DIR: agyDataDir } : {}),
+      };
+      delete env.AGY_ADC_AUTH;
+      if (geminiApiKey) env.GEMINI_API_KEY = geminiApiKey;
+      else {
+        delete env.GEMINI_API_KEY;
+        delete env.AGY_LLM_GATEWAY_URL;
+        delete env.GOOGLE_GEMINI_BASE_URL;
+      }
       await new Promise((resolve) => {
         execFile(claudeBin, ['-p', '/usage', '--output-format', 'json'], {
           timeout: 15_000,
-          env: {
-            ...process.env,
-            AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
-            ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
-          },
+          env,
         }, (err, stdout) => {
           if (!err && stdout) {
             try { parseAgyLimitsOutput(JSON.parse(stdout)); } catch {}
@@ -2129,6 +2915,19 @@ function transcriptFiles(dir = claudeProjectsDir, depth = 0, out = []) {
         if (e.isFile() && e.name.endsWith('.jsonl')) out.push(path.join(sessionsDir, e.name));
       }
     } catch {}
+    // Also include untracked AGY CLI brain transcripts started outside this app
+    const trackedCliIds = new Set();
+    for (const s of sessions.values()) {
+      trackedCliIds.add(s.id);
+      if (s.cliSessionId) trackedCliIds.add(s.cliSessionId);
+    }
+    try {
+      for (const id of fs.readdirSync(path.join(agyDataDir, 'brain'))) {
+        if (trackedCliIds.has(id)) continue;
+        const f = path.join(agyDataDir, 'brain', id, '.system_generated', 'logs', 'transcript.jsonl');
+        if (fs.existsSync(f)) out.push(f);
+      }
+    } catch {}
   }
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
@@ -2146,24 +2945,53 @@ function usageRecords(file, stat) {
   const records = [];
   let text = '';
   try { text = fs.readFileSync(file, 'utf8'); } catch {}
+  const brainMatch = file.match(/[/\\]brain[/\\]([\w-]+)[/\\]\.system_generated[/\\]logs[/\\]transcript\.jsonl$/);
+  const brainId = brainMatch ? brainMatch[1] : null;
+  const brainCwd = brainId ? (getAgyConversationMeta().get(brainId)?.cwd ?? '') : '';
   for (const line of text.split('\n')) {
-    if (!line.includes('"usage"')) continue;
+    if (!line.includes('"usage"') && !line.includes('"output_tokens"')) continue;
     let r;
     try { r = JSON.parse(line); } catch { continue; }
+    if (brainId && typeof r.step_index === 'number' && r.type === 'PLANNER_RESPONSE') {
+      const inp = r.input_tokens ?? 0;
+      const outTok = r.output_tokens ?? 0;
+      const thinkTok = r.thinking_tokens ?? 0;
+      const cacheRead = r.cache_read_tokens ?? 0;
+      if (!inp && !outTok && !thinkTok && !cacheRead) continue;
+      records.push({
+        id: `${brainId}-step-${r.step_index}`,
+        t: Date.parse(r.created_at) || stat.mtimeMs || 0,
+        model: 'agy',
+        cwd: brainCwd,
+        input: inp,
+        output: outTok >= thinkTok ? outTok : outTok + thinkTok,
+        thinking: thinkTok,
+        cacheRead,
+        cacheWrite: 0,
+      });
+      continue;
+    }
     const u = r.message?.usage;
     if (r.type !== 'assistant' || !u || r.message.model === '<synthetic>') continue;
     const outTok = u.output_tokens ?? 0;
     const thinkTok = u.thinking_tokens ?? 0;
+    const inp = u.input_tokens ?? 0;
+    const effectiveOut = outTok >= thinkTok ? outTok : outTok + thinkTok;
+    const cacheRead = u.cache_read_input_tokens ?? u.cache_read_tokens ?? 0;
+    const billing = r.billing === 'api' ? 'api' : 'sub';
+    const modelName = r.message.model ?? 'unknown';
     records.push({
       id: r.message.id ?? r.requestId ?? r.uuid,
       t: Date.parse(r.timestamp) || stat.mtimeMs || 0,
-      model: r.message.model ?? 'unknown',
+      model: modelName,
       cwd: r.cwd ?? '',
-      input: u.input_tokens ?? 0,
-      output: outTok >= thinkTok ? outTok : outTok + thinkTok,
+      billing,
+      input: inp,
+      output: effectiveOut,
       thinking: thinkTok,
-      cacheRead: u.cache_read_input_tokens ?? u.cache_read_tokens ?? 0,
+      cacheRead,
       cacheWrite: u.cache_creation_input_tokens ?? 0,
+      apiCostUsd: billing === 'api' ? estimateApiCostUsd(modelName, inp, effectiveOut, cacheRead) : 0,
     });
   }
   usageCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, records });
@@ -2178,7 +3006,12 @@ function usageSummary(days, tzOffsetMin) {
   const today = Date.now();
   const byDay = new Map();
   for (let i = days - 1; i >= 0; i--) {
-    byDay.set(dayOf(today - i * 86_400_000), { date: dayOf(today - i * 86_400_000), input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0, requests: 0 });
+    const date = dayOf(today - i * 86_400_000);
+    byDay.set(date, {
+      date,
+      input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0, requests: 0,
+      apiInput: 0, apiOutput: 0, apiRequests: 0, apiCostUsd: 0,
+    });
   }
   const since = Date.parse(byDay.keys().next().value + 'T00:00:00Z') - offset;
   const byModel = new Map();
@@ -2196,6 +3029,12 @@ function usageSummary(days, tzOffsetMin) {
       if (!d) continue;
       sessionFiles.add(file);
       d.input += r.input; d.output += r.output; d.thinking += r.thinking ?? 0; d.cacheRead += r.cacheRead; d.cacheWrite += r.cacheWrite; d.requests++;
+      if (r.billing === 'api') {
+        d.apiInput += r.input + r.cacheRead + r.cacheWrite;
+        d.apiOutput += r.output;
+        d.apiRequests += 1;
+        d.apiCostUsd += r.apiCostUsd ?? 0;
+      }
       for (const [map, key] of [[byModel, r.model], [byProject, r.cwd]]) {
         const e = map.get(key) ?? { key, output: 0, input: 0, requests: 0 };
         e.output += r.output; e.input += r.input + r.cacheRead + r.cacheWrite; e.requests++;
@@ -2203,19 +3042,33 @@ function usageSummary(days, tzOffsetMin) {
       }
     }
   }
+  const dayList = [...byDay.values()].map((d) => ({ ...d, apiCostUsd: Math.round(d.apiCostUsd * 10000) / 10000 }));
   const ranked = (map) => [...map.values()].sort((a, b) => b.output - a.output);
-  return { days: [...byDay.values()], models: ranked(byModel), projects: ranked(byProject), sessions: sessionFiles.size };
+  return {
+    days: dayList,
+    models: ranked(byModel),
+    projects: ranked(byProject),
+    sessions: sessionFiles.size,
+    dailyApiLimitUsd: getDailyApiLimitUsd(),
+    todayApiCostUsd: dayList.at(-1)?.apiCostUsd ?? 0,
+  };
+}
+
+/** Today's estimated paid Gemini API spend in local calendar day (USD). */
+function todayApiCostUsd() {
+  return usageSummary(1, -new Date().getTimezoneOffset()).todayApiCostUsd ?? 0;
 }
 
 function describeInput(input) {
   if (!input || typeof input !== 'object') return '';
   const v = input.CommandLine ?? input.command
-    ?? input.TargetFile ?? input.AbsolutePath ?? input.file_path
+    ?? input.Path ?? input.TargetFile ?? input.AbsolutePath ?? input.file_path
     ?? input.DirectoryPath ?? input.SearchPath ?? input.SearchDirectory ?? input.path
     ?? input.Query ?? input.Pattern ?? input.pattern
     ?? input.Url ?? input.url
     ?? input.query
-    ?? input.toolSummary ?? input.toolAction ?? input.description;
+    ?? input.toolSummary ?? input.toolAction ?? input.description
+    ?? input.Role ?? input.Prompt ?? input.Recipient ?? input.Action ?? input.action;
   return typeof v === 'string' ? v.slice(0, 160) : '';
 }
 
@@ -2235,18 +3088,23 @@ function loadSessions() {
       s.requests = meta.requests ?? 0;
       s.started = !!meta.started;
       s.cliSize = meta.cliSize;
+      s.activeBilling = meta.billing ?? null;
+      s.effectiveModel = meta.effectiveModel ?? s.model;
+      s.hybridSpilloverUntil = meta.hybridSpilloverUntil ?? null;
       try {
         const allLines = fs.readFileSync(s.logFile, 'utf8').split('\n').filter(Boolean);
         const parsedAll = allLines.map((l) => slimEvent(JSON.parse(l), s.id));
-        if (parsedAll.some((e) => e.type === 'result' && e.total_cost_usd > 0)) {
+        const hasResultCost = parsedAll.some((e) => e.type === 'result' && e.total_cost_usd > 0);
+        if (hasResultCost) {
           s.costUsd = 0;
           for (const e of parsedAll) if (e.type === 'result') s.addCost(e.total_cost_usd);
         }
         if (parsedAll.some((e) => e.type === 'assistant' && e.message?.usage)) {
           s.inputTokens = 0; s.outputTokens = 0; s.thinkingTokens = 0; s.cacheReadTokens = 0; s.requests = 0;
+          if (!hasResultCost) s.costUsd = 0;
           for (const e of parsedAll) {
             if (e.type === 'assistant' && e.message?.model !== '<synthetic>' && e.message?.usage) {
-              s.addUsage(e.message.usage);
+              s.addUsage(e.message.usage, hasResultCost ? 'sub' : (e.billing ?? 'sub'), e.message?.model);
             }
           }
         }
@@ -2255,16 +3113,56 @@ function loadSessions() {
         s.events = parsedAll
           .filter((e) => !(e.type === 'assistant' && Array.isArray(e.message?.content) && e.message.content.length === 0))
           .slice(-MAX_EVENTS);
+        if (s.status === 'error' && s.events.length >= 2) {
+          const lastEv = s.events.at(-1);
+          const prevEv = s.events.at(-2);
+          const prevHadText = prevEv?.type === 'assistant' && Array.isArray(prevEv.message?.content) &&
+            prevEv.message.content.some((b) => b?.type === 'text' && String(b.text ?? '').trim());
+          if (lastEv?.type === 'result' && lastEv.is_error && prevHadText &&
+              /API error \(attempt \d+\):|stream.*interrupted|Individual quota reached/i.test(String(lastEv.result ?? ''))) {
+            s.status = 'idle';
+            s.lastActivity = 'Waiting for you';
+          }
+        }
       } catch {}
       sessions.set(s.id, s);
       // agy still running under a keeper from before the restart (or finished meanwhile):
       // restore what was in flight and carry on reading its output.
       if (fs.existsSync(path.join(s.keeperDir, 'keeper.json'))) {
-        s.status = meta.status ?? 'idle';
+        let restoredStatus = meta.status ?? 'idle';
+        const lastEv = s.events.at(-1);
+        if (restoredStatus === 'working' && lastEv?.type === 'user' && lastEv.local &&
+            Date.now() - (meta.updatedAt ?? 0) >= 10_000 && keeperHasNoActiveTurn(s.keeperDir, s.cliSessionId ?? s.id)) {
+          restoredStatus = 'idle';
+          s.lastActivity = 'Waiting for you';
+          const note = slimEvent({
+            type: 'bridge',
+            subtype: 'note',
+            message: 'Previous message did not reach AGY because the prior session process failed to restart — send again to continue.',
+          }, s.id);
+          s.events.push(note);
+          try { fs.appendFileSync(s.logFile, JSON.stringify(note) + '\n'); } catch {}
+        }
+        s.status = restoredStatus;
         s.pending = new Map((meta.pendingRequests ?? []).map((r) => [r.request_id, r]));
         s.background = meta.backgroundTasks ?? [];
-        s.attach();
-        s.scheduleIdleExit();
+        const desired = restoredStatus === 'idle' && !s.hybridSpilloverUntil ? s.resolveSessionRouting() : null;
+        if (desired && s.activeBilling && s.activeBilling !== desired.billing) {
+          s.activeBilling = desired.billing;
+          s.effectiveModel = desired.model;
+          s.persistMeta();
+        } else {
+          if (restoredStatus !== meta.status) s.persistMeta();
+          s.attach();
+          s.scheduleIdleExit();
+        }
+      } else if (s.status === 'idle' && !s.hybridSpilloverUntil) {
+        const desired = s.resolveSessionRouting();
+        if (s.activeBilling && s.activeBilling !== desired.billing) {
+          s.activeBilling = desired.billing;
+          s.effectiveModel = desired.model;
+          s.persistMeta();
+        }
       }
     } catch {}
   }
@@ -2274,7 +3172,7 @@ function loadSessions() {
   for (const id of dirs) {
     if (sessions.get(id)?.link) continue;
     const dir = path.join(keepersDir, id);
-    try { process.kill(JSON.parse(fs.readFileSync(path.join(dir, 'keeper.json'), 'utf8')).pid, 'SIGTERM'); } catch {}
+    try { signalKeeperTree(JSON.parse(fs.readFileSync(path.join(dir, 'keeper.json'), 'utf8')), 'SIGTERM'); } catch {}
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -2293,7 +3191,105 @@ function procStat(pid) {
   const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
   const close = s.lastIndexOf(')');
   const f = s.slice(close + 2).split(' ');
-  return { state: f[0], ppid: Number(f[1]), ticks: Number(f[11]) + Number(f[12]), start: Number(f[19]) };
+  return { state: f[0], ppid: Number(f[1]), pgid: Number(f[2]), ticks: Number(f[11]) + Number(f[12]), start: Number(f[19]) };
+}
+
+function isAgyRuntimeArgs(args) {
+  if (!Array.isArray(args)) return false;
+  if (args.includes('--input-format') && args.includes('stream-json')) return true;
+  return args.some((a) => /(?:^|\/)(?:agy\.bin|termux-http-proxy|dns-proxy)$/.test(a));
+}
+
+/**
+ * Signals a keeper and its non-detached CLI runtime tree (e.g. bash wrapper + agy.bin + proxy)
+ * without touching user commands detached into their own process group via setsid/nohup.
+ */
+function signalKeeperTree(info, signal = 'SIGTERM') {
+  const keeperPid = info?.pid;
+  const claudePid = info?.claudePid;
+  let selfPgid = 0;
+  try { selfPgid = procStat(process.pid).pgid; } catch {}
+  const signalGroupIfSafe = (pid) => {
+    if (!pid) return;
+    try {
+      const pgid = procStat(pid).pgid;
+      if (pgid > 1 && pgid !== selfPgid) process.kill(-pgid, signal);
+    } catch {}
+  };
+  signalGroupIfSafe(keeperPid);
+  signalGroupIfSafe(claudePid);
+  if (claudePid) {
+    let claudePgid = 0;
+    try { claudePgid = procStat(claudePid).pgid; } catch {}
+    try {
+      for (const entry of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        const p = Number(entry);
+        if (p === process.pid) continue;
+        try {
+          const st = procStat(p);
+          if (st.ppid === claudePid || (claudePgid > 1 && claudePgid !== selfPgid && st.pgid === claudePgid)) {
+            process.kill(p, signal);
+          }
+        } catch {}
+      }
+    } catch {}
+    try { process.kill(claudePid, signal); } catch {}
+  }
+  if (keeperPid) {
+    try { process.kill(keeperPid, signal); } catch {}
+  }
+}
+
+/**
+ * Returns true when a running keeper's output is fully read, already finished its previous turn
+ * (empty or last JSON line is a result event), and AGY's transcript does not have an unanswered USER_INPUT.
+ */
+function keeperHasNoActiveTurn(keeperDir, convId) {
+  try {
+    if (fs.existsSync(path.join(keeperDir, 'exit.json'))) return false;
+    const outFile = path.join(keeperDir, 'out');
+    if (fs.existsSync(outFile)) {
+      const stat = fs.statSync(outFile);
+      const readOff = Number(readText(path.join(keeperDir, 'read'))) || 0;
+      if (readOff < stat.size || Date.now() - stat.mtimeMs < 10_000) return false;
+      if (stat.size > 0) {
+        const readLen = Math.min(stat.size, 32768);
+        const buf = Buffer.alloc(readLen);
+        const fd = fs.openSync(outFile, 'r');
+        fs.readSync(fd, buf, 0, readLen, stat.size - readLen);
+        fs.closeSync(fd);
+        const lastLine = buf.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean).at(-1);
+        if (lastLine) {
+          const parsed = JSON.parse(lastLine);
+          if (parsed.event !== 'result' && parsed.type !== 'result') return false;
+        }
+      }
+    }
+    const transcript = findCliTranscript(convId);
+    if (transcript && fs.existsSync(transcript)) {
+      const tStat = fs.statSync(transcript);
+      if (Date.now() - tStat.mtimeMs < 10_000) return false;
+      if (tStat.size > 0) {
+        const readLen = Math.min(tStat.size, 32768);
+        const buf = Buffer.alloc(readLen);
+        const fd = fs.openSync(transcript, 'r');
+        fs.readSync(fd, buf, 0, readLen, tStat.size - readLen);
+        fs.closeSync(fd);
+        const lines = buf.toString('utf8').split('\n').filter((l) => l.includes('"type"'));
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const r = JSON.parse(lines[i]);
+            if (r.type === 'USER_INPUT') return false;
+            if (r.type === 'PLANNER_RESPONSE') return r.status === 'DONE' || r.status === 'ERROR';
+          } catch {}
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // /proc/uptime is off limits, so boot time comes from our own start time in clock ticks.
@@ -2370,12 +3366,19 @@ function listProcesses() {
   const byPid = new Map(list.map((p) => [p.pid, p]));
   for (const p of list) {
     if (p.role) continue;
+    const parent = byPid.get(p.ppid);
+    if (parent?.role === 'claude' && isAgyRuntimeArgs(p.args)) {
+      p.role = 'claude';
+      p.sid = parent.sid;
+    }
+  }
+  for (const p of list) {
+    if (p.role) continue;
     for (let q = byPid.get(p.ppid), n = 0; q && n < 50; q = byPid.get(q.ppid), n++) {
       if (q.role === 'claude') { p.role = 'job'; p.sid = q.sid; break; }
     }
     if (!p.role && p.envSid && sessions.has(p.envSid)) { p.role = 'job'; p.sid = p.envSid; p.detached = true; }
     p.role ??= 'other';
-    delete p.envSid;
   }
   for (const p of list) {
     delete p.envSid;
@@ -2471,11 +3474,23 @@ function chrootShell() {
   return [process.env.CCM_SU ?? 'su', '-c', `sh ${path.join(path.dirname(ptyPy), '..', 'chroot', 'ccm-chroot')} shell`];
 }
 
-// Sign-in pages opened with $BROWSER pass the link to the bridge instead, which sends it to the app to open.
+// Sign-in pages opened with $BROWSER / xdg-open pass the link to the bridge instead, which sends it to the app to open.
+const shBin = ['/bin/sh', '/system/bin/sh'].find((p) => fs.existsSync(p));
 const openUrlSh = path.join(stateDir, 'open-url.sh');
-fs.writeFileSync(openUrlSh, `#!${['/bin/sh', '/system/bin/sh'].find((p) => fs.existsSync(p))}
+fs.writeFileSync(openUrlSh, `#!${shBin}
 printf '%s\\n' "$1" > "$CCM_OPEN_URL.tmp" && mv "$CCM_OPEN_URL.tmp" "$CCM_OPEN_URL"
 `, { mode: 0o755 });
+
+/** True only when the OAuth URL redirects back to a loopback server on the bridge machine (no manual code paste). */
+function isLocalRedirectUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const redirectUri = parsed.searchParams.get('redirect_uri') || '';
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(redirectUri);
+  } catch {
+    return false;
+  }
+}
 
 class Terminal {
   /** kind 'shell' is the Debian terminal; 'login' runs `agy` interactive login where this bridge runs AGY. */
@@ -2486,20 +3501,75 @@ class Terminal {
     this.size = 0;
     this.clients = new Set();
     this.links = []; // sign-in pages for the app to open, as {url, local}
-    const geminiApiKey = getGeminiApiKey();
+    this.loginHomeDir = null;
+    this.loginAgyDir = null;
+    this.loginTokenSeenAt = 0;
+    this.loginCompleted = false;
+    this.oauthMethodSelected = false;
+    this.loginPlainTail = '';
+    this.loginRawTail = '';
+    const geminiApiKey = kind !== 'login' && isGeminiApiActive() ? getGeminiApiKey() : null;
+    const noProxy = [process.env.NO_PROXY, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
     const env = {
       ...process.env,
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
-      ...(geminiApiKey ? { GEMINI_API_KEY: geminiApiKey } : {}),
+      ...(process.env.CCM_AGY_DIR ? { ANTIGRAVITY_APP_DATA_DIR: agyDataDir } : {}),
     };
+    if (geminiApiKey) {
+      env.GEMINI_API_KEY = geminiApiKey;
+      if (carbonGatewayUrl) {
+        env.AGY_LLM_GATEWAY_URL = carbonGatewayUrl;
+        env.GOOGLE_GEMINI_BASE_URL = carbonGatewayUrl;
+        env.NO_PROXY = noProxy;
+        env.no_proxy = noProxy;
+      }
+    } else {
+      delete env.GEMINI_API_KEY;
+    }
     let command = chrootShell;
     if (kind === 'login') {
-      command = () => process.env.CCM_LEGACY_PROTO === '1' ? [claudeBin, 'auth', 'login'] : [claudeBin];
+      const legacyLogin = process.env.CCM_LEGACY_PROTO === '1';
+      command = () => legacyLogin ? [claudeBin, 'auth', 'login'] : [claudeBin];
       this.urlFile = path.join(stateDir, `login-${this.id}.url`);
-      Object.assign(env, { BROWSER: openUrlSh, CCM_OPEN_URL: this.urlFile });
-      this.urlCheck = setInterval(() => this.checkLink(), 250);
+      for (const k of [
+        'GEMINI_API_KEY', 'AGY_ADC_AUTH', 'GOOGLE_APPLICATION_CREDENTIALS',
+        'AGY_LLM_GATEWAY_URL', 'GOOGLE_GEMINI_BASE_URL',
+        'ANTIGRAVITY_LS_ADDRESS', 'ANTIGRAVITY_CSRF_TOKEN', 'ANTIGRAVITY_AGENT',
+        'AGY_SESSION_ID', 'ANTIGRAVITY_CONVERSATION_ID', 'ANTIGRAVITY_SOURCE_METADATA',
+      ]) {
+        delete env[k];
+      }
+      if (!legacyLogin) {
+        // Run AGY login in an isolated staging HOME so an existing antigravity-oauth-token neither
+        // skips OAuth into an idle chat TUI nor gets wiped if the user cancels before finishing.
+        this.loginHomeDir = path.join(stateDir, `login-home-${this.id}`);
+        this.loginAgyDir = path.join(this.loginHomeDir, '.gemini', 'antigravity-cli');
+        const loginBinDir = path.join(this.loginHomeDir, 'bin');
+        fs.mkdirSync(this.loginAgyDir, { recursive: true, mode: 0o700 });
+        fs.mkdirSync(loginBinDir, { recursive: true, mode: 0o700 });
+        for (const opener of ['xdg-open', 'termux-open-url']) {
+          fs.writeFileSync(path.join(loginBinDir, opener), `#!${shBin}\nexec "${openUrlSh}" "$@"\n`, { mode: 0o755 });
+        }
+        const proxyTokenFile = process.env.TERMUX_PROXY_TOKEN_FILE || path.join(os.homedir(), '.config', 'termux-http-proxy', 'token');
+        const envPass = [process.env.AGY_ENV_PASS, 'BROWSER', 'CCM_OPEN_URL', 'DISPLAY', 'TERMUX_PROXY_TOKEN_FILE'].filter(Boolean).join(' ');
+        Object.assign(env, {
+          HOME: this.loginHomeDir,
+          ANTIGRAVITY_APP_DATA_DIR: this.loginAgyDir,
+          CCM_AGY_DIR: this.loginAgyDir,
+          TERMUX_PROXY_TOKEN_FILE: proxyTokenFile,
+          DISPLAY: process.env.DISPLAY || ':0',
+          BROWSER: openUrlSh,
+          CCM_OPEN_URL: this.urlFile,
+          PATH: `${loginBinDir}:${env.PATH ?? ''}`,
+          AGY_ENV_PASS: envPass,
+        });
+      } else {
+        const envPass = [process.env.AGY_ENV_PASS, 'BROWSER', 'CCM_OPEN_URL'].filter(Boolean).join(' ');
+        Object.assign(env, { BROWSER: openUrlSh, CCM_OPEN_URL: this.urlFile, AGY_ENV_PASS: envPass });
+      }
+      this.urlCheck = setInterval(() => this.checkLink(), 100);
     }
     this.proc = spawn('python3', [ptyPy, String(cols), String(rows), ...command()], {
       cwd: os.homedir(), env, stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
@@ -2510,23 +3580,79 @@ class Terminal {
     this.proc.on('error', (e) => this.output(Buffer.from(`\r\nCan't start the terminal: ${e.message}\r\n`)));
     this.proc.on('close', (code) => {
       clearInterval(this.urlCheck);
+      clearTimeout(this.selectTimer);
+      this.promoteLoginToken(true);
       if (this.urlFile) fs.rm(this.urlFile, { force: true }, () => {});
+      if (this.loginHomeDir) fs.rm(this.loginHomeDir, { recursive: true, force: true }, () => {});
       terminals.delete(this.id);
-      for (const c of this.clients) c.send({ ev: 'term_exit', id: this.id, code });
+      const exitCode = this.loginCompleted ? 0 : code;
+      for (const c of this.clients) c.send({ ev: 'term_exit', id: this.id, code: exitCode });
     });
     terminals.set(this.id, this);
   }
 
-  /** The page $BROWSER was asked to open. */
+  /** Promotes a newly written staging OAuth token into agyDataDir and finishes the login terminal. */
+  promoteLoginToken(closing = false) {
+    if (!this.loginAgyDir || this.loginCompleted) return false;
+    const stagedPath = path.join(this.loginAgyDir, 'antigravity-oauth-token');
+    if (!fs.existsSync(stagedPath)) return false;
+    let raw, parsed;
+    try {
+      raw = fs.readFileSync(stagedPath, 'utf8');
+      parsed = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+    const valid = Boolean(
+      parsed?.token?.access_token || parsed?.token?.refresh_token ||
+      parsed?.access_token || parsed?.refresh_token
+    );
+    if (!valid) return false;
+    if (!closing) {
+      if (!this.loginTokenSeenAt) {
+        this.loginTokenSeenAt = Date.now();
+        return false; // wait one poll cycle so follow-up metadata writes settle
+      }
+      if (Date.now() - this.loginTokenSeenAt < 300) return false;
+    }
+    try {
+      fs.mkdirSync(agyDataDir, { recursive: true, mode: 0o700 });
+      const destPath = path.join(agyDataDir, 'antigravity-oauth-token');
+      const tmpPath = `${destPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmpPath, raw.endsWith('\n') ? raw : raw + '\n', { mode: 0o600 });
+      fs.renameSync(tmpPath, destPath);
+    } catch {
+      return false;
+    }
+    this.loginCompleted = true;
+    for (const sess of sessions.values()) {
+      sess.hydrogenSubUnsupported = false;
+      sess.restartProcessForNextTurn();
+      if (sess.status === 'idle' && !sess.spilloverNotified && !sess.hybridSpilloverUntil) {
+        const desired = sess.resolveSessionRouting();
+        sess.activeBilling = desired.billing;
+        sess.effectiveModel = desired.model;
+        sess.persistMeta();
+        broadcast({ ev: 'session', session: sess.summary() });
+      }
+    }
+    refreshAgyLimits(true).catch(() => {});
+    if (!closing) this.close();
+    return true;
+  }
+
+  /** The page $BROWSER / xdg-open was asked to open, plus login token completion check. */
   checkLink() {
+    this.promoteLoginToken(false);
     let url;
     try { url = fs.readFileSync(this.urlFile, 'utf8').trim(); } catch { return; }
     fs.rmSync(this.urlFile, { force: true });
-    if (/^https:\/\//.test(url)) this.link(url, true);
+    if (/^https:\/\//.test(url)) this.link(url, isLocalRedirectUrl(url));
   }
 
   /** local: the sign-in only finishes in a browser on this machine; otherwise it shows a code to paste. */
   link(url, local) {
+    if (url.includes('accounts.google.com/') && url.includes('oauth') && !url.includes('state=')) return;
     if (this.links.some((l) => l.url === url)) return;
     this.links.push({ url, local });
     for (const c of this.clients) c.send({ ev: 'term_link', id: this.id, url, local });
@@ -2535,8 +3661,25 @@ class Terminal {
   output(data) {
     if (this.kind === 'login') {
       const str = data.toString();
-      for (const m of str.matchAll(/\x1b\]8;;(https:\/\/[^\x07\x1b]+)/g)) this.link(m[1], false);
-      for (const m of str.matchAll(/(https:\/\/accounts\.google\.com\/[^\s\x1b"']+)/g)) this.link(m[1], true);
+      this.loginRawTail = (this.loginRawTail + str).slice(-8192);
+      for (const m of this.loginRawTail.matchAll(/\x1b\]8;[^;\x07\x1b]*;(https:\/\/[^\x07\x1b]+)(?:\x07|\x1b\\)/g)) {
+        this.link(m[1], isLocalRedirectUrl(m[1]));
+      }
+      for (const m of str.matchAll(/(https:\/\/accounts\.google\.com\/[^\s\x00-\x1f"']+)/g)) {
+        if (m[1].includes('client_id=') && m[1].includes('state=')) {
+          this.link(m[1], isLocalRedirectUrl(m[1]));
+        }
+      }
+      if (!this.oauthMethodSelected) {
+        const plain = str.replace(/\x1b\][^\x07]*\x07|\x1b\[[0-9;?]*[a-zA-Z>]/g, '');
+        this.loginPlainTail = (this.loginPlainTail + plain).slice(-1024);
+        if (this.loginPlainTail.includes('Select login method')) {
+          this.oauthMethodSelected = true;
+          this.selectTimer = setTimeout(() => {
+            try { this.proc.stdin.write('\r'); } catch {}
+          }, 80);
+        }
+      }
     }
     this.chunks.push(data);
     this.size += data.length;
@@ -2550,7 +3693,7 @@ class Terminal {
   resize(cols, rows) {
     if (cols > 0 && rows > 0) this.proc.stdio[3].write(`${Math.min(cols, 1000)} ${Math.min(rows, 1000)}\n`);
   }
-  close() { this.proc.kill('SIGTERM'); } // the shell gets SIGHUP when the terminal closes
+  close() { this.proc.kill('SIGTERM'); } // ptyhost signals the terminal process group
 }
 
 function terminalFor(id) {
@@ -2559,14 +3702,75 @@ function terminalFor(id) {
   return term;
 }
 
+/**
+ * Keeps the Gemini API key isolated in `stateDir/gemini-api-key` and clears `gemini-api-key`,
+ * `geminiApiKey`, and `modelProvider` from `agyDataDir`. Otherwise `~/.local/bin/agy` auto-exports
+ * `GEMINI_API_KEY` on Google Subscription turns, and `"modelProvider": "gemini"` causes `agy.bin`
+ * to skip `AGY_LLM_GATEWAY_URL` (breaking Gemini 4 Hydrogen / Carbon resolution).
+ */
+function isolateAgyApiKeyFiles() {
+  if (process.env.CCM_LEGACY_PROTO === '1') return;
+  const stateKeyFile = path.join(stateDir, 'gemini-api-key');
+  const agyKeyFile = path.join(agyDataDir, 'gemini-api-key');
+  const settingsFile = path.join(agyDataDir, 'settings.json');
+  const providerFile = path.join(stateDir, 'auth-provider');
+
+  let migratedKey = null;
+  if (!fs.existsSync(stateKeyFile)) {
+    if (fs.existsSync(agyKeyFile)) {
+      try {
+        const k = fs.readFileSync(agyKeyFile, 'utf8').trim();
+        if (k) migratedKey = k;
+      } catch {}
+    }
+    if (!migratedKey && fs.existsSync(settingsFile)) {
+      try {
+        const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+        if (typeof s?.geminiApiKey === 'string' && s.geminiApiKey.trim()) {
+          migratedKey = s.geminiApiKey.trim();
+        }
+      } catch {}
+    }
+    if (migratedKey) {
+      try {
+        fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(stateKeyFile, migratedKey + '\n', { mode: 0o600 });
+      } catch {}
+    }
+  }
+
+  if (fs.existsSync(agyKeyFile)) {
+    try { fs.rmSync(agyKeyFile, { force: true }); } catch {}
+  }
+
+  if (fs.existsSync(settingsFile)) {
+    try {
+      const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      if (s && typeof s === 'object') {
+        if (!fs.existsSync(providerFile) && s.modelProvider === 'gemini') {
+          try {
+            fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+            fs.writeFileSync(providerFile, 'gemini\n', { mode: 0o600 });
+          } catch {}
+        }
+        if ('geminiApiKey' in s || 'modelProvider' in s) {
+          delete s.geminiApiKey;
+          delete s.modelProvider;
+          fs.writeFileSync(settingsFile, JSON.stringify(s, null, 2) + '\n', { mode: 0o600 });
+        }
+      }
+    } catch {}
+  }
+}
+
 /** Reads the stored or configured Gemini API key if present. */
 function getGeminiApiKey() {
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) {
     return process.env.GEMINI_API_KEY.trim();
   }
   const candidates = [
-    path.join(agyDataDir, 'gemini-api-key'),
     path.join(stateDir, 'gemini-api-key'),
+    path.join(agyDataDir, 'gemini-api-key'),
   ];
   for (const f of candidates) {
     if (fs.existsSync(f)) {
@@ -2586,115 +3790,184 @@ function getGeminiApiKey() {
   return null;
 }
 
-/** Checks whether AGY is configured to use the Gemini API directly. */
-function isGeminiApiActive() {
+function maskGeminiKey(key) {
+  if (!key) return null;
+  return key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : 'Key configured';
+}
+
+function readGoogleOAuthInfo() {
+  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
+  if (!fs.existsSync(tokenPath) || process.env.CCM_LEGACY_PROTO === '1') return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
+    const tok = data?.token && typeof data.token === 'object' ? data.token : data;
+    const loggedIn = Boolean(tok?.access_token || tok?.refresh_token);
+    let email = typeof data?.id_token_email === 'string' && data.id_token_email.trim()
+      ? data.id_token_email.trim()
+      : (typeof data?.email === 'string' && data.email.trim() ? data.email.trim() : null);
+    let orgName = null;
+    const rawIdToken = typeof data?.id_token === 'string' ? data.id_token : (typeof tok?.id_token === 'string' ? tok.id_token : null);
+    if (rawIdToken) {
+      const parts = rawIdToken.split('.');
+      if (parts.length >= 2) {
+        const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        email = email ?? claims.email ?? null;
+        orgName = claims.hd ?? claims.name ?? null;
+      }
+    }
+    return { loggedIn, authMethod: data?.auth_method || 'google-oauth', email, orgName };
+  } catch {
+    return null;
+  }
+}
+
+/** True when a valid Google OAuth token file is present for AGY subscription turns. */
+function hasGoogleOAuthToken() {
+  return Boolean(readGoogleOAuthInfo()?.loggedIn);
+}
+
+/** Returns the configured AGY billing provider: 'google' | 'hybrid' | 'gemini'. */
+function getConfiguredProvider() {
+  if (process.env.CCM_LEGACY_PROTO === '1') return 'google';
+  const providerFile = path.join(stateDir, 'auth-provider');
+  if (fs.existsSync(providerFile)) {
+    try {
+      const p = fs.readFileSync(providerFile, 'utf8').trim();
+      if (p === 'google' || p === 'hybrid' || p === 'gemini') return p;
+    } catch {}
+  }
   const settingsFile = path.join(agyDataDir, 'settings.json');
   if (fs.existsSync(settingsFile)) {
     try {
       const s = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
-      if (s.modelProvider === 'gemini') return true;
+      if (s.modelProvider === 'gemini') return 'gemini';
+      if (s.modelProvider && s.modelProvider !== 'gemini') return 'google';
     } catch {}
   }
-  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
-  return !fs.existsSync(tokenPath) && Boolean(getGeminiApiKey());
+  return !hasGoogleOAuthToken() && Boolean(getGeminiApiKey()) ? 'gemini' : 'google';
+}
+
+/** Checks whether AGY is configured to use the Gemini API exclusively. */
+function isGeminiApiActive() {
+  return getConfiguredProvider() === 'gemini' && Boolean(getGeminiApiKey());
+}
+
+/** Daily Gemini API budget cap in USD for Hybrid spillover (0 = unlimited). */
+function getDailyApiLimitUsd() {
+  const f = path.join(stateDir, 'daily-api-limit');
+  if (!fs.existsSync(f)) return 0;
+  try {
+    const n = Number(fs.readFileSync(f, 'utf8').trim());
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function setDailyApiLimitUsd(usd) {
+  const f = path.join(stateDir, 'daily-api-limit');
+  try {
+    const n = Number(usd);
+    if (!Number.isFinite(n) || n <= 0) {
+      fs.rmSync(f, { force: true });
+    } else {
+      fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(f, (Math.round(n * 100) / 100).toFixed(2) + '\n', { mode: 0o600 });
+    }
+  } catch {}
 }
 
 /** True when Application Default Credentials are available for agy to sign in with. */
 function adcConfigured() {
   if (process.env.AGY_ADC_AUTH === '1') return true;
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return true;
-  const dirs = [process.env.CLOUDSDK_CONFIG, path.join(os.homedir(), '.config', 'gcloud')].filter(Boolean);
-  return dirs.some((d) => {
-    try { return fs.existsSync(path.join(d, 'application_default_credentials.json')); } catch { return false; }
-  });
+  const gcloudDir = process.env.CLOUDSDK_CONFIG || path.join(os.homedir(), '.config', 'gcloud');
+  try { return fs.existsSync(path.join(gcloudDir, 'application_default_credentials.json')); } catch { return false; }
 }
 
-/** Updates settings.json in agyDataDir safely. */
-function updateAgySettings(updater) {
-  try {
-    fs.mkdirSync(agyDataDir, { recursive: true, mode: 0o700 });
-    const p = path.join(agyDataDir, 'settings.json');
-    let current = {};
-    if (fs.existsSync(p)) {
-      try { current = JSON.parse(fs.readFileSync(p, 'utf8')); } catch {}
-    }
-    updater(current);
-    fs.writeFileSync(p, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 });
-  } catch {}
-}
-
-/** Saves the Gemini API key across known config locations. */
+/** Saves the Gemini API key in stateDir (isolated from agyDataDir so Subscription turns stay pure). */
 function saveGeminiApiKey(apiKey) {
   const key = String(apiKey ?? '').trim();
   if (!key) return;
-  process.env.GEMINI_API_KEY = key;
-  for (const d of [agyDataDir, stateDir]) {
-    try {
-      fs.mkdirSync(d, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(d, 'gemini-api-key'), key + '\n', { mode: 0o600 });
-    } catch {}
-  }
-  updateAgySettings((s) => {
-    s.geminiApiKey = key;
-    s.modelProvider = 'gemini';
-  });
+  try {
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(stateDir, 'gemini-api-key'), key + '\n', { mode: 0o600 });
+  } catch {}
+  isolateAgyApiKeyFiles();
 }
 
-/** Sets model provider ('gemini' or null/'google'). */
+/** Sets model provider ('google' | 'hybrid' | 'gemini'). */
 function setAgyModelProvider(provider) {
-  if (provider === 'gemini') {
-    updateAgySettings((s) => {
-      s.modelProvider = 'gemini';
-    });
-  } else {
-    updateAgySettings((s) => {
-      delete s.modelProvider;
-    });
-  }
+  const normalized = provider === 'gemini' ? 'gemini' : (provider === 'hybrid' ? 'hybrid' : 'google');
+  try {
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(stateDir, 'auth-provider'), normalized + '\n', { mode: 0o600 });
+  } catch {}
+  isolateAgyApiKeyFiles();
 }
 
 /** Who AGY is signed in as here: reads ~/.gemini/antigravity-cli/antigravity-oauth-token, Gemini API key, or falls back to `auth status --json`. */
 function authStatus() {
+  if (process.env.CCM_LEGACY_PROTO === '1') {
+    return new Promise((resolve) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
+      try {
+        const res = JSON.parse(stdout);
+        resolve({ ...res, provider: 'google', hasGeminiKey: false, maskedGeminiKey: null, dailyApiLimitUsd: 0, todayApiUsd: 0 });
+      } catch {
+        resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null, provider: 'google', hasGeminiKey: false, maskedGeminiKey: null, dailyApiLimitUsd: 0, todayApiUsd: 0 });
+      }
+    }));
+  }
   const geminiKey = getGeminiApiKey();
-  const geminiActive = isGeminiApiActive();
-  if (geminiActive && geminiKey) {
-    const masked = geminiKey.length > 8 ? `${geminiKey.slice(0, 4)}...${geminiKey.slice(-4)}` : 'Key configured';
+  const maskedGeminiKey = maskGeminiKey(geminiKey);
+  const provider = getConfiguredProvider();
+  const dailyApiLimitUsd = getDailyApiLimitUsd();
+  const todayApiUsd = todayApiCostUsd();
+  const oauth = readGoogleOAuthInfo();
+
+  if (provider === 'gemini' && geminiKey) {
     return Promise.resolve({
       loggedIn: true,
       authMethod: 'gemini-api-key',
       email: null,
       subscriptionType: 'Gemini API',
-      orgName: masked,
+      orgName: maskedGeminiKey,
       provider: 'gemini',
       hasGeminiKey: true,
+      maskedGeminiKey,
+      dailyApiLimitUsd,
+      todayApiUsd,
     });
   }
 
-  const tokenPath = path.join(agyDataDir, 'antigravity-oauth-token');
-  if (fs.existsSync(tokenPath) && process.env.CCM_LEGACY_PROTO !== '1') {
-    try {
-      const data = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
-      const loggedIn = Boolean(data?.token?.access_token || data?.token?.refresh_token);
-      let email = null;
-      let orgName = null;
-      if (typeof data?.id_token === 'string') {
-        const parts = data.id_token.split('.');
-        if (parts.length >= 2) {
-          const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-          email = claims.email ?? null;
-          orgName = claims.hd ?? claims.name ?? null;
-        }
-      }
-      return Promise.resolve({
-        loggedIn,
-        authMethod: data?.auth_method || 'google-oauth',
-        email,
-        subscriptionType: 'Antigravity',
-        orgName,
-        provider: 'google',
-        hasGeminiKey: Boolean(geminiKey),
-      });
-    } catch {}
+  if (provider === 'hybrid') {
+    return Promise.resolve({
+      loggedIn: Boolean(oauth?.loggedIn || geminiKey),
+      authMethod: oauth?.loggedIn ? 'hybrid' : (geminiKey ? 'gemini-api-key' : null),
+      email: oauth?.email ?? null,
+      subscriptionType: 'Hybrid (Sub + API)',
+      orgName: oauth?.orgName ?? maskedGeminiKey,
+      provider: 'hybrid',
+      hasGeminiKey: Boolean(geminiKey),
+      maskedGeminiKey,
+      dailyApiLimitUsd,
+      todayApiUsd,
+    });
+  }
+
+  if (oauth) {
+    return Promise.resolve({
+      loggedIn: oauth.loggedIn,
+      authMethod: oauth.authMethod,
+      email: oauth.email,
+      subscriptionType: 'Antigravity',
+      orgName: oauth.orgName,
+      provider: 'google',
+      hasGeminiKey: Boolean(geminiKey),
+      maskedGeminiKey,
+      dailyApiLimitUsd,
+      todayApiUsd,
+    });
   }
   if (geminiKey) {
     return Promise.resolve({
@@ -2705,14 +3978,17 @@ function authStatus() {
       orgName: null,
       provider: 'google',
       hasGeminiKey: true,
+      maskedGeminiKey,
+      dailyApiLimitUsd,
+      todayApiUsd,
     });
   }
   return new Promise((resolve) => execFile(claudeBin, ['auth', 'status', '--json'], { timeout: 15_000 }, (err, stdout) => {
     try {
       const res = JSON.parse(stdout);
-      resolve({ ...res, provider: 'google', hasGeminiKey: false });
+      resolve({ ...res, provider: 'google', hasGeminiKey: false, maskedGeminiKey: null, dailyApiLimitUsd, todayApiUsd });
     } catch {
-      resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null, provider: 'google', hasGeminiKey: false });
+      resolve({ loggedIn: false, authMethod: null, email: null, subscriptionType: null, orgName: null, provider: 'google', hasGeminiKey: false, maskedGeminiKey: null, dailyApiLimitUsd, todayApiUsd });
     }
   }));
 }
@@ -2944,16 +4220,27 @@ class Client {
       case 'term_close': terminalFor(msg.id).close(); break;
       case 'auth': this.send({ ev: 'auth', ref, auth: await authStatus() }); break;
       case 'set_auth': {
-        const provider = msg.provider === 'gemini' ? 'gemini' : 'google';
+        const provider = msg.provider === 'gemini' ? 'gemini' : (msg.provider === 'hybrid' ? 'hybrid' : 'google');
         const apiKey = typeof msg.apiKey === 'string' ? msg.apiKey.trim() : null;
-        if (provider === 'gemini') {
-          if (apiKey) {
-            saveGeminiApiKey(apiKey);
-          } else {
-            setAgyModelProvider('gemini');
+        if (apiKey) saveGeminiApiKey(apiKey);
+        if (msg.dailyApiLimitUsd !== undefined && msg.dailyApiLimitUsd !== null) {
+          setDailyApiLimitUsd(Number(msg.dailyApiLimitUsd));
+        }
+        if ((provider === 'gemini' || provider === 'hybrid') && !getGeminiApiKey()) {
+          throw new Error('Enter a Gemini API key first.');
+        }
+        setAgyModelProvider(provider);
+        for (const sess of sessions.values()) {
+          sess.hydrogenSubUnsupported = false;
+          if (provider !== 'hybrid') sess.hybridSpilloverUntil = null;
+          sess.restartProcessForNextTurn();
+          if (sess.status === 'idle' && !sess.spilloverNotified && !sess.hybridSpilloverUntil) {
+            const desired = sess.resolveSessionRouting();
+            sess.activeBilling = desired.billing;
+            sess.effectiveModel = desired.model;
+            sess.persistMeta();
+            broadcast({ ev: 'session', session: sess.summary() });
           }
-        } else {
-          setAgyModelProvider(null);
         }
         this.send({ ev: 'auth', ref, auth: await authStatus() });
         break;
@@ -3023,7 +4310,7 @@ class Client {
       case 'cwd': await s.moveTo(msg.cwd); this.send({ ev: 'session', ref, session: s.summary() }); break;
       case 'auto_continue': s.setAutoContinue(!!msg.on); break;
       // From the app's alarm at a task's resumeAt, which wakes the phone: check now.
-      case 'tick': resumeDue(); this.send({ ev: 'tock', ref }); break;
+      case 'tick': resumeDue(true); this.send({ ev: 'tock', ref }); break;
       case 'permission':
         if (!s.answer(msg.requestId, msg.decision === 'allow' ? 'allow' : 'deny', !!msg.always, msg.message, msg.answers)) {
           this.send({ ev: 'error', ref, message: 'That request was already answered.' });
@@ -3060,13 +4347,42 @@ class Client {
 
 let carbonGatewayUrl = null;
 
+let termuxWakeLockHeld = null;
+const termuxWakeLockBin = '/data/data/com.termux/files/usr/bin/termux-wake-lock';
+const termuxWakeUnlockBin = '/data/data/com.termux/files/usr/bin/termux-wake-unlock';
+
+/**
+ * Holds Termux's wake-lock while any session is actively working, running background tasks, or
+ * waiting to retry a background-task wakeup so Android Doze does not suspend Termux's network UID.
+ */
+function syncTermuxWakeLock() {
+  if (process.env.FAKE_AGY_STREAM === '1' || process.env.CCM_DISABLE_WAKELOCK === '1') return;
+  const shouldHold = [...sessions.values()].some(
+    (s) => s.status === 'working' || s.background.length > 0 || s.wakeupRetryTimer !== null,
+  );
+  if (shouldHold === termuxWakeLockHeld) return;
+  const bin = shouldHold ? termuxWakeLockBin : termuxWakeUnlockBin;
+  if (!fs.existsSync(bin)) return;
+  termuxWakeLockHeld = shouldHold;
+  execFile(bin, [], { timeout: 5_000 }, () => {});
+}
+
 function broadcast(obj) { for (const c of clients) c.send(obj); }
 function sendToSubscribers(sid, obj) { for (const c of clients) if (c.subs.has(sid)) c.send(obj); }
 
 // ---------- main ----------
 
+isolateAgyApiKeyFiles();
 loadSessions();
-function resumeDue() { for (const s of sessions.values()) s.resumeIfDue(); }
+syncTermuxWakeLock();
+function resumeDue(fromTick = false) {
+  for (const s of sessions.values()) {
+    s.resumeIfDue();
+    if (fromTick && s.wakeupRetryTimer && Date.now() - s.wakeupRetryScheduledAt >= 1_500) {
+      s.runPendingWakeupRetry();
+    }
+  }
+}
 resumeDue();
 setInterval(resumeDue, RESUME_CHECK_MS);
 setInterval(updatePorts, PORTS_CHECK_MS);
@@ -3076,15 +4392,31 @@ setInterval(() => {
   }
 }, 15_000).unref();
 rootAvailable = await detectRoot();
+const gatewayPortFile = path.join(stateDir, 'gateway-port');
+let savedGatewayPort = 0;
+try {
+  const n = Number(fs.readFileSync(gatewayPortFile, 'utf8').trim());
+  if (Number.isInteger(n) && n > 0 && n < 65536) savedGatewayPort = n;
+} catch {}
 const carbonGateway = await startCarbonGateway({
   getApiKey: getGeminiApiKey,
+  port: savedGatewayPort,
   log: (msg) => console.error(msg),
 }).catch((e) => {
   console.error(`carbon gateway failed: ${e.message}`);
   return null;
 });
-if (carbonGateway) carbonGatewayUrl = carbonGateway.url;
+if (carbonGateway) {
+  carbonGatewayUrl = carbonGateway.url;
+  try { fs.writeFileSync(gatewayPortFile, String(carbonGateway.port) + '\n', { mode: 0o600 }); } catch {}
+}
 const server = net.createServer((socket) => new Client(socket));
+server.on('error', (err) => {
+  console.error(`ccm-bridge failed to listen on ${opts.host}:${opts.port}: ${err.message}`);
+  try { if (Number(fs.readFileSync(pidFile, 'utf8')) === process.pid) fs.rmSync(pidFile); } catch {}
+  carbonGateway?.close();
+  process.exit(1);
+});
 server.listen(opts.port, opts.host, () => {
   const { address, port } = server.address();
   const loopback = address === '127.0.0.1' || address === '::1';
@@ -3102,8 +4434,13 @@ server.listen(opts.port, opts.host, () => {
 
 function shutdown() {
   try { if (Number(fs.readFileSync(pidFile, 'utf8')) === process.pid) fs.rmSync(pidFile); } catch {}
+  const anyWorking = [...sessions.values()].some((s) => s.status === 'working' || s.background.length > 0);
+  if (!anyWorking && termuxWakeLockHeld && fs.existsSync(termuxWakeUnlockBin)) {
+    try { execFileSync(termuxWakeUnlockBin, [], { timeout: 2_000 }); } catch {}
+  }
   // AGY processes keep running under their keepers; the next bridge reattaches to them.
   for (const s of sessions.values()) if (s.link) { s.link.close(); s.persistMeta(); }
+  carbonGateway?.close();
   server.close();
   process.exit(0);
 }

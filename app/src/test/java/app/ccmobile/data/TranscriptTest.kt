@@ -170,4 +170,64 @@ class TranscriptTest {
         assertEquals("Stream interrupted", end.text)
         assertTrue(end.error)
     }
+
+    @Test
+    fun agyReadEditWriteToolsAndRunningToolSettledOnResult() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"r1","name":"read_file","input":{"Path":"/w/app/Config.kt","StartLine":10,"EndLine":30}},
+            {"type":"tool_use","id":"e1","name":"edit_file","input":{"Path":"/w/app/Config.kt","Target":"old","Replacement":"new1\nnew2"}},
+            {"type":"tool_use","id":"w1","name":"write_file","input":{"Path":"/w/app/New.kt","Content":"a\nb\nc"}},
+            {"type":"tool_use","id":"hang","name":"run_command","input":{"CommandLine":"sleep 30"}}
+        ]}}"""))
+        t.apply(msg("""{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"r1","content":"ok","is_error":false},
+            {"type":"tool_result","tool_use_id":"e1","content":"ok","is_error":false},
+            {"type":"tool_result","tool_use_id":"w1","content":"ok","is_error":false}
+        ]}}"""))
+
+        val beforeEnd = t.snapshot().filterIsInstance<ToolItem>()
+        assertEquals("app/Config.kt", beforeEnd[0].summary)
+        assertEquals(ToolState.Done, beforeEnd[0].state)
+        assertEquals(2 to 1, beforeEnd[1].delta)
+        assertEquals(3 to 0, beforeEnd[2].delta)
+        assertEquals(ToolState.Running, beforeEnd[3].state)
+        assertEquals("/w/app/Config.kt\n− old\n+ new1\n+ new2", ToolText.detail("edit_file", msg("""{"Path":"/w/app/Config.kt","Target":"old","Replacement":"new1\nnew2"}""")))
+        assertEquals("/w/app/New.kt\na\nb\nc", ToolText.detail("write_file", msg("""{"Path":"/w/app/New.kt","Content":"a\nb\nc"}""")))
+
+        // Error result settles any lingering Running tool as Failed
+        t.apply(msg("""{"type":"result","subtype":"error","is_error":true,"result":"Interrupted"}"""))
+        val afterEnd = t.snapshot().filterIsInstance<ToolItem>()
+        assertEquals(ToolState.Failed, afterEnd[3].state)
+    }
+
+    @Test
+    fun recoveredAttemptErrorAfterAssistantReplyRendersAsDone() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"user","message":{"role":"user","content":"Use 4 hydrogen, it's better. Then implement."},"local":true}"""))
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"text","text":"Verification complete: 26/26 passing."}],"usage":{"input_tokens":12000,"cache_read_input_tokens":200000,"output_tokens":2255}}}"""))
+        t.apply(msg("""{"type":"result","subtype":"error","is_error":true,"duration_ms":60246486,"result":"API error (attempt 1): doRequest: error sending request: Post \"https://generativelanguage.googleapis.com/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers"}"""))
+
+        val end = t.snapshot().last() as TurnEndItem
+        assertEquals(false, end.error)
+        assertEquals("Done · 2.26k out · 212k in", end.text)
+    }
+
+    @Test
+    fun unrecoveredPostToolTimeoutAndNetworkErrorsAreHumanized() {
+        val t = Transcript("s", "Task")
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"text","text":"Checking git status..."}]}}"""))
+        t.apply(msg("""{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"run_command","input":{"CommandLine":"git status --short"}}]}}"""))
+        t.apply(msg("""{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"","is_error":false}]}}"""))
+        t.apply(msg("""{"type":"result","subtype":"error","is_error":true,"duration_ms":60000,"result":"API error (attempt 3): doRequest: error sending request: Post \"https://generativelanguage.googleapis.com/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers"}"""))
+
+        val timeoutEnd = t.snapshot().last() as TurnEndItem
+        assertTrue(timeoutEnd.error)
+        assertEquals("Stopped: Timed out waiting for model response", timeoutEnd.text)
+
+        t.apply(msg("""{"type":"result","subtype":"error","is_error":true,"result":"API error (attempt 2): doRequest: error sending request: Post \"https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse\": unexpected EOF"}"""))
+        val netEnd = t.snapshot().last() as TurnEndItem
+        assertTrue(netEnd.error)
+        assertEquals("Stopped: Network error reaching model API (unexpected EOF)", netEnd.text)
+    }
 }

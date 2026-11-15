@@ -108,10 +108,10 @@ fun DiffScreen(repository: Repository, sid: String, onBack: () -> Unit) {
 
         HorizontalDivider(color = C.Surface2)
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (busy) Text("Claude is still working; changes may keep moving.", color = C.Muted, fontSize = 12.sp)
+            if (busy) Text("AGY is still working; changes may keep moving.", color = C.Muted, fontSize = 12.sp)
             if (comments.isNotEmpty()) {
                 PrimaryButton(
-                    "Send ${comments.size} comment${if (comments.size == 1) "" else "s"} to Claude",
+                    "Send ${comments.size} comment${if (comments.size == 1) "" else "s"} to AGY",
                     onClick = {
                         sendToClaude(
                             "Review comments on your changes:\n" +

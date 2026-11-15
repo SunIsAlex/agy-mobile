@@ -121,9 +121,16 @@ fun PredictiveNavHost(
                 }
             }
         }
+        nav.resetHandler = { root ->
+            activeJob?.cancel()
+            transitionState = null
+            nav.stack.clear()
+            nav.stack.add(root)
+        }
         onDispose {
             nav.pushHandler = null
             nav.popHandler = null
+            nav.resetHandler = null
         }
     }
 

@@ -56,6 +56,7 @@ class Nav : ViewModel() {
     val stack = mutableStateListOf<Screen>(Screen.Tasks)
     var pushHandler: ((Screen) -> Unit)? = null
     var popHandler: (() -> Unit)? = null
+    var resetHandler: ((Screen) -> Unit)? = null
 
     fun push(screen: Screen) {
         if (stack.lastOrNull() != screen) {
@@ -66,6 +67,13 @@ class Nav : ViewModel() {
     fun pop() {
         if (stack.size > 1) {
             popHandler?.invoke() ?: stack.removeAt(stack.lastIndex)
+        }
+    }
+
+    fun reset(root: Screen) {
+        resetHandler?.invoke(root) ?: run {
+            stack.clear()
+            stack.add(root)
         }
     }
 
@@ -122,8 +130,7 @@ class MainActivity : ComponentActivity() {
                                 repository.pair(req.host, req.port, req.token)
                                 pairRequest = null
                                 startNotifications()
-                                nav.stack.clear()
-                                nav.stack.add(Screen.Tasks)
+                                nav.reset(Screen.Tasks)
                             }) { Text("Connect") }
                         },
                         dismissButton = { TextButton(onClick = { pairRequest = null }) { Text("Cancel") } },
@@ -175,8 +182,7 @@ class MainActivity : ComponentActivity() {
                 // Started from the Start button a moment ago: connect without asking again.
                 repository.pair(host, port, token)
                 startNotifications()
-                nav.stack.clear()
-                nav.stack.add(Screen.Tasks)
+                nav.reset(Screen.Tasks)
             } else {
                 pairRequest = PairRequest(host, port, token)
             }

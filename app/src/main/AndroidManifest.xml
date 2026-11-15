@@ -57,7 +57,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps a connection to a local Claude Code bridge so long-running tasks can ask for approval" />
+                android:value="Keeps a connection to a local AGY bridge so long-running tasks can send updates and notifications" />
         </service>
 
         <receiver

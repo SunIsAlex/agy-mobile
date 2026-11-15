@@ -42,9 +42,12 @@ object BridgeLauncher {
      * Without [pair] it starts the bridge only, so nothing opens on screen.
      */
     private fun script(kind: BridgeKind, pair: Boolean): String = when (kind) {
-        BridgeKind.Termux -> "mkdir -p ~/.local/state/ccm-bridge && " +
-            "(setsid nohup ${if (pair) kind.command else kind.command.removeSuffix(" --pair")} >> ~/.local/state/ccm-bridge/bridge.log 2>&1 < /dev/null &) && " +
-            "sleep 3 && tail -n 3 ~/.local/state/ccm-bridge/bridge.log"
+        BridgeKind.Termux -> {
+            val cmd = if (pair) kind.command else kind.command.removeSuffix(" --pair")
+            "mkdir -p ~/.local/state/ccm-bridge && " +
+                "(setsid nohup sh -c '$cmd' >> ~/.local/state/ccm-bridge/bridge.log 2>&1 < /dev/null &) && " +
+                "sleep 3 && tail -n 3 ~/.local/state/ccm-bridge/bridge.log"
+        }
         BridgeKind.Chroot -> if (pair) kind.command else kind.command.substringBefore(" && ")
     }
 

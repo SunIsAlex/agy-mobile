@@ -19,6 +19,9 @@ data class SessionSummary(
     val cwd: String,
     val title: String,
     val model: String? = null,
+    val effectiveModel: String? = null,
+    /** Active billing source for this session: "sub" (Google subscription) or "api" (Gemini API). */
+    val billing: String? = null,
     /** Reasoning effort (low…max), or null for the model's default. */
     val effort: String? = null,
     val mode: String = "default",
@@ -86,6 +89,10 @@ data class DayUsage(
     val cacheRead: Long = 0,
     val cacheWrite: Long = 0,
     val requests: Int = 0,
+    val apiInput: Long = 0,
+    val apiOutput: Long = 0,
+    val apiRequests: Int = 0,
+    val apiCostUsd: Double = 0.0,
 ) {
     /** Everything Claude read: fresh input plus cache reads and writes. */
     val read: Long get() = input + cacheRead + cacheWrite
@@ -102,6 +109,8 @@ data class Usage(
     val models: List<UsageShare> = emptyList(),
     val projects: List<UsageShare> = emptyList(),
     val sessions: Int = 0,
+    val dailyApiLimitUsd: Double = 0.0,
+    val todayApiCostUsd: Double = 0.0,
 )
 
 /** A process running as the bridge's user (see listProcesses() in ccm-bridge.mjs). */
@@ -140,6 +149,9 @@ data class AuthStatus(
     val subscriptionType: String? = null,
     val provider: String? = null,
     val hasGeminiKey: Boolean = false,
+    val maskedGeminiKey: String? = null,
+    val dailyApiLimitUsd: Double = 0.0,
+    val todayApiUsd: Double = 0.0,
 )
 
 /** A sign-in page from `claude auth login`. local: it only finishes in a browser on the bridge's machine. */
@@ -219,8 +231,9 @@ object ToolText {
         val raw = when (name) {
             "Bash", "run_command" -> input.str("CommandLine") ?: input.str("command") ?: input.str("toolSummary")
             "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+            "read_file", "write_file", "edit_file",
             "view_file", "write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file" ->
-                (input.str("TargetFile") ?: input.str("AbsolutePath") ?: input.str("file_path") ?: input.str("notebook_path"))?.let(::shortPath)
+                (input.str("Path") ?: input.str("TargetFile") ?: input.str("AbsolutePath") ?: input.str("file_path") ?: input.str("notebook_path"))?.let(::shortPath)
             "Grep", "Glob", "grep_search", "find_by_name" ->
                 (input.str("Query") ?: input.str("Pattern") ?: input.str("pattern"))?.let { "\"$it\"" }
             "LS", "list_dir" -> (input.str("DirectoryPath") ?: input.str("path"))?.let(::shortPath)
@@ -228,7 +241,11 @@ object ToolText {
             "WebSearch", "search_web" -> input.str("query")
             "Task", "Agent", "invoke_subagent", "browser_subagent", "define_subagent", "manage_subagents" ->
                 input.arr("Subagents")?.firstOrNull()?.let { (it as? JsonObject)?.let { s -> s.str("Role") ?: s.str("TypeName") ?: s.str("role") ?: s.str("type_name") } }
-                    ?: input.str("TaskName") ?: input.str("toolSummary") ?: input.str("description") ?: input.str("Action")
+                    ?: input.str("Role") ?: input.str("TaskName") ?: input.str("Name") ?: input.str("toolSummary") ?: input.str("description") ?: input.str("Action")
+            "manage_task" -> listOfNotNull(input.str("Action"), input.str("TaskId")).joinToString(" ").ifBlank { null }
+            "schedule" -> input.str("Prompt") ?: input.str("CronExpression")
+            "swarm" -> listOfNotNull(input.str("action"), input.str("name") ?: input.str("title")).joinToString(" ").ifBlank { null }
+            "send_message" -> input.str("Recipient")
             "ask_question", "AskUserQuestion" ->
                 input.arr("questions")?.firstOrNull()?.let { (it as? JsonObject)?.str("question") } ?: input.str("toolSummary")
             "ExitPlanMode" -> "Plan ready for review"
@@ -241,10 +258,10 @@ object ToolText {
     fun detail(name: String, input: JsonObject): String = when (name) {
         "Bash", "run_command" -> (input.str("CommandLine") ?: input.str("command")).orEmpty()
         "ExitPlanMode" -> input.str("plan").orEmpty()
-        "Edit", "replace_file_content" -> buildString {
-            append((input.str("TargetFile") ?: input.str("file_path")).orEmpty())
-            (input.str("TargetContent") ?: input.str("old_string"))?.lines()?.forEach { append("\n− ").append(it) }
-            (input.str("ReplacementContent") ?: input.str("new_string"))?.lines()?.forEach { append("\n+ ").append(it) }
+        "Edit", "edit_file", "replace_file_content" -> buildString {
+            append((input.str("Path") ?: input.str("TargetFile") ?: input.str("file_path")).orEmpty())
+            (input.str("Target") ?: input.str("TargetContent") ?: input.str("old_string"))?.lines()?.forEach { append("\n− ").append(it) }
+            (input.str("Replacement") ?: input.str("ReplacementContent") ?: input.str("new_string"))?.lines()?.forEach { append("\n+ ").append(it) }
         }
         "multi_replace_file_content" -> buildString {
             append(input.str("TargetFile").orEmpty())
@@ -254,22 +271,22 @@ object ToolText {
                 c.str("ReplacementContent")?.lines()?.forEach { append("\n+ ").append(it) }
             }
         }
-        "Write", "write_to_file" -> (input.str("TargetFile") ?: input.str("file_path")).orEmpty() + "\n" +
-            (input.str("CodeContent") ?: input.str("content")).orEmpty().take(4000)
+        "Write", "write_file", "write_to_file" -> (input.str("Path") ?: input.str("TargetFile") ?: input.str("file_path")).orEmpty() + "\n" +
+            (input.str("Content") ?: input.str("CodeContent") ?: input.str("content")).orEmpty().take(4000)
         else -> prettyJson.encodeToString(JsonObject.serializer(), input)
     }
 
     /** Lines added and removed by an Edit or Write call, for the "+18 −4" badge. */
     fun lineDelta(name: String, input: JsonObject): Pair<Int, Int>? = when (name) {
-        "Edit", "replace_file_content" ->
-            lineCount(input.str("ReplacementContent") ?: input.str("new_string")) to
-                lineCount(input.str("TargetContent") ?: input.str("old_string"))
+        "Edit", "edit_file", "replace_file_content" ->
+            lineCount(input.str("Replacement") ?: input.str("ReplacementContent") ?: input.str("new_string")) to
+                lineCount(input.str("Target") ?: input.str("TargetContent") ?: input.str("old_string"))
         "multi_replace_file_content" -> {
             val chunks = input.arr("ReplacementChunks").orEmpty().mapNotNull { it as? JsonObject }
             if (chunks.isEmpty()) null
             else chunks.sumOf { lineCount(it.str("ReplacementContent")) } to chunks.sumOf { lineCount(it.str("TargetContent")) }
         }
-        "Write", "write_to_file" -> lineCount(input.str("CodeContent") ?: input.str("content")) to 0
+        "Write", "write_file", "write_to_file" -> lineCount(input.str("Content") ?: input.str("CodeContent") ?: input.str("content")) to 0
         else -> null
     }
 

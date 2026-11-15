@@ -43,10 +43,13 @@ object DiffParser {
                 !inHunk && line.startsWith("deleted file mode") -> status = "deleted"
                 !inHunk && line.startsWith("rename to ") -> { status = "renamed"; path = line.removePrefix("rename to ") }
                 !inHunk && line.startsWith("Binary files") -> status = "binary"
-                !inHunk && line.startsWith("+++ ") -> line.removePrefix("+++ ").takeIf { it != "/dev/null" }?.let { path = it.removePrefix("b/") }
                 !inHunk && line.startsWith("--- ") -> {
                     val old = line.removePrefix("--- ")
-                    if (old != "/dev/null" && path == null) path = old.removePrefix("a/")
+                    if (old != "/dev/null") path = old.removePrefix("a/")
+                }
+                !inHunk && line.startsWith("+++ ") -> {
+                    val next = line.removePrefix("+++ ")
+                    if (next != "/dev/null") path = next.removePrefix("b/")
                 }
                 line.startsWith("@@") -> {
                     val m = hunkHeader.find(line)

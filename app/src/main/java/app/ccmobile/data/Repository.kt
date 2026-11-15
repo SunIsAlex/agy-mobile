@@ -17,13 +17,31 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import java.util.Base64
 import java.util.TimeZone
-import android.util.Base64
-import android.util.LruCache
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+private class ByteLruCache(private val maxBytes: Int) {
+    private val map = LinkedHashMap<String, ByteArray>(16, 0.75f, true)
+    private var totalBytes = 0
+
+    @Synchronized
+    fun get(key: String): ByteArray? = map[key]
+
+    @Synchronized
+    fun put(key: String, value: ByteArray) {
+        map.put(key, value)?.let { totalBytes -= it.size }
+        totalBytes += value.size
+        val iter = map.entries.iterator()
+        while (totalBytes > maxBytes && iter.hasNext()) {
+            totalBytes -= iter.next().value.size
+            iter.remove()
+        }
+    }
+}
 
 data class DiffState(
     val loading: Boolean = false,
@@ -87,9 +105,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
 
     private val transcripts = HashMap<String, Transcript>()
     // Images are about a megabyte each; keep the recent ones so scrolling back doesn't refetch.
-    private val imageCache = object : LruCache<String, ByteArray>(32 * 1024 * 1024) {
-        override fun sizeOf(key: String, value: ByteArray) = value.size
-    }
+    private val imageCache = ByteLruCache(32 * 1024 * 1024)
     private val open = mutableSetOf<String>()
     // Picked but unsent attachments, by task id like Settings.draft; memory only, as they can be megabytes.
     private val draftAttachments = HashMap<String, SnapshotStateList<PendingAttachment>>()
@@ -104,10 +120,19 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         scope.launch(start = CoroutineStart.UNDISPATCHED) { client.events.collect(::onEvent) }
         scope.launch {
             client.state.collect { state ->
-                if (state is ConnState.Connected) {
-                    send("sessions") // also sent unasked on connect; asking again can't hurt
-                    send("repos")
-                    open.forEach { send("subscribe", "sid" to it) }
+                when (state) {
+                    is ConnState.Connected -> {
+                        send("sessions") // also sent unasked on connect; asking again can't hurt
+                        send("repos")
+                        open.forEach { send("subscribe", "sid" to it) }
+                    }
+                    is ConnState.Failed, ConnState.Idle -> {
+                        val pending = waiting.values.toList()
+                        waiting.clear()
+                        quietRefs.clear()
+                        pending.forEach { it.complete(null) }
+                    }
+                    ConnState.Connecting -> {}
                 }
             }
         }
@@ -190,7 +215,7 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         imageCache.get(ref)?.let { return it }
         val reply = call("image", quiet = true, "sid" to sid, "image" to ref) ?: return null
         val data = reply.str("data") ?: return null
-        val bytes = withContext(Dispatchers.Default) { Base64.decode(data, Base64.DEFAULT) }
+        val bytes = withContext(Dispatchers.Default) { Base64.getMimeDecoder().decode(data) }
         imageCache.put(ref, bytes)
         return bytes
     }
@@ -239,21 +264,29 @@ class Repository(private val scope: CoroutineScope, val settings: Settings) {
         val reply = call("auth", quiet = true) ?: return Result.failure(Exception("The bridge didn't answer."))
         if (reply.str("ev") == "error") {
             val message = reply.str("message")
-            return Result.failure(Exception(if (message?.startsWith("Unknown op") == true) OUTDATED_BRIDGE else message ?: "Couldn't check the Claude login."))
+            return Result.failure(Exception(if (message?.startsWith("Unknown op") == true) OUTDATED_BRIDGE else message ?: "Couldn't check the AGY login."))
         }
         return runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
     }
 
-    /** Sets the auth provider ("gemini" or "google") and optional API key on the bridge. */
-    suspend fun setAuth(provider: String, apiKey: String? = null): Result<AuthStatus> {
-        val reply = call("set_auth", quiet = true, "provider" to provider, "apiKey" to apiKey)
-            ?: return Result.failure(Exception("The bridge didn't answer."))
+    /** Sets the auth provider ("google", "hybrid", or "gemini"), optional API key, and optional daily API cap (USD) on the bridge. */
+    suspend fun setAuth(provider: String, apiKey: String? = null, dailyApiLimitUsd: Double? = null): Result<AuthStatus> {
+        val reply = call(
+            "set_auth",
+            quiet = true,
+            "provider" to provider,
+            "apiKey" to apiKey,
+            "dailyApiLimitUsd" to dailyApiLimitUsd,
+        ) ?: return Result.failure(Exception("The bridge didn't answer."))
         if (reply.str("ev") == "error") {
             return Result.failure(Exception(reply.str("message") ?: "Failed to update authentication."))
         }
         val status = runCatching { json.decodeFromJsonElement(AuthStatus.serializer(), reply.obj("auth")!!) }
-        if (status.isSuccess && !apiKey.isNullOrBlank()) {
-            settings.geminiApiKey = apiKey
+        if (status.isSuccess) {
+            if (!apiKey.isNullOrBlank()) settings.geminiApiKey = apiKey
+            if (dailyApiLimitUsd != null) {
+                settings.dailyApiLimitUsd = if (dailyApiLimitUsd > 0) String.format(java.util.Locale.US, "%.2f", dailyApiLimitUsd) else ""
+            }
         }
         return status
     }

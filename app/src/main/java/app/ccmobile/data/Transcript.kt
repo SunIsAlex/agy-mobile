@@ -70,7 +70,17 @@ class Transcript(private val sid: String, private val title: String) {
             }
             "result" -> {
                 dropLive()
-                val error = msg.bool("is_error") == true
+                val raw = (msg.str("result") ?: msg.str("subtype") ?: "error").trim()
+                val hasRunningTool = items.any { it is ToolItem && it.state == ToolState.Running }
+                val endedWithAssistant = items.lastOrNull() is AssistantItem && !hasRunningTool
+                val recoveredTransientError = endedWithAssistant && isTransientTurnError(raw)
+                val error = (msg.bool("is_error") == true) && !recoveredTransientError
+                for (i in items.indices) {
+                    val item = items[i]
+                    if (item is ToolItem && item.state == ToolState.Running) {
+                        items[i] = item.copy(state = if (error) ToolState.Failed else ToolState.Done)
+                    }
+                }
                 val seconds = (msg.num("duration_ms") ?: 0.0) / 1000
                 // total_cost_usd is the session's running total; show what this turn added.
                 val total = msg.num("total_cost_usd") ?: 0.0
@@ -88,15 +98,11 @@ class Transcript(private val sid: String, private val title: String) {
                     inTokens.takeIf { it > 0 }?.let { "${UsageText.compact(it)} in" },
                 ).joinToString(" · ").takeIf { it.isNotEmpty() }
                 val text = if (error) {
-                    val raw = (msg.str("result") ?: msg.str("subtype") ?: "error").trim()
-                    when {
-                        raw.contains("stream was interrupted", ignoreCase = true) || raw.contains("interrupted", ignoreCase = true) -> "Stream interrupted"
-                        else -> "Stopped: $raw"
-                    }
+                    formatTurnError(raw)
                 } else {
                     listOfNotNull(
                         "Done",
-                        if (seconds > 0) "%.0fs".format(seconds) else null,
+                        if (seconds > 0 && seconds < 3600) "%.0fs".format(seconds) else null,
                         cost.takeIf { it >= 0.005 }?.let { "$%.2f".format(it) } ?: tokenSummary,
                     ).joinToString(" · ")
                 }
@@ -220,5 +226,40 @@ class Transcript(private val sid: String, private val title: String) {
     companion object {
         const val LIVE_KEY = "live"
         private const val MAX_OUTPUT = 4000
+        private val GO_HTTP_PREFIX = Regex(
+            """^(?:API error \(attempt \d+\):\s*)?doRequest:\s*error sending request:\s*[A-Za-z]+\s+"[^"]+":\s*""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val ATTEMPT_PREFIX = Regex("""^API error \(attempt \d+\):\s*""", RegexOption.IGNORE_CASE)
+
+        internal fun isTransientTurnError(raw: String): Boolean =
+            ATTEMPT_PREFIX.containsMatchIn(raw) ||
+                raw.contains("stream was interrupted", ignoreCase = true) ||
+                raw.contains("Individual quota reached", ignoreCase = true)
+
+        internal fun formatTurnError(raw: String): String {
+            if (raw.contains("stream was interrupted", ignoreCase = true) ||
+                raw.equals("interrupted", ignoreCase = true)
+            ) {
+                return "Stream interrupted"
+            }
+            if (raw.contains("timeout awaiting response headers", ignoreCase = true) ||
+                raw.contains("context deadline exceeded", ignoreCase = true) ||
+                raw.contains("Client.Timeout", ignoreCase = true) ||
+                raw.contains("header timeout", ignoreCase = true)
+            ) {
+                return "Stopped: Timed out waiting for model response"
+            }
+            if (GO_HTTP_PREFIX.containsMatchIn(raw)) {
+                val detail = raw.replace(GO_HTTP_PREFIX, "").trim()
+                return if (detail.isNotEmpty()) {
+                    "Stopped: Network error reaching model API ($detail)"
+                } else {
+                    "Stopped: Network error reaching model API"
+                }
+            }
+            val cleaned = raw.replace(ATTEMPT_PREFIX, "").trim().ifEmpty { "error" }
+            return "Stopped: $cleaned"
+        }
     }
 }

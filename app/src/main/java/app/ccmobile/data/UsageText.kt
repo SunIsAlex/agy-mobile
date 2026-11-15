@@ -20,9 +20,17 @@ object UsageText {
         }
     }
 
-    /** "claude-opus-5-5" → "Opus 5.5", "gemini-4-carbon" → "Gemini 4 Carbon", "gemini-4-argon" → "Gemini 4 Argon", "gpt-oss-120b" → "GPT-OSS 120B". */
+    /** Formats USD spend cleanly, showing "<$0.01" for sub-cent non-zero API usage. */
+    fun formatUsd(usd: Double): String = when {
+        usd <= 0.0 -> "$0.00"
+        usd < 0.01 -> "<$0.01"
+        else -> String.format(Locale.US, "$%.2f", usd)
+    }
+
+    /** "claude-opus-5-5" → "Opus 5.5", "gemini-4-hydrogen" → "Gemini 4 Hydrogen", "gemini-4-carbon" → "Gemini 4 Carbon", "gemini-4-argon" → "Gemini 4 Argon". */
     fun modelName(id: String): String {
         when (id) {
+            "gemini-4-hydrogen" -> return "Gemini 4 Hydrogen"
             "gemini-4-carbon" -> return "Gemini 4 Carbon"
             "gemini-4-argon" -> return "Gemini 4 Argon"
             "gemini-3.8-flash" -> return "Gemini 3.8 Flash"

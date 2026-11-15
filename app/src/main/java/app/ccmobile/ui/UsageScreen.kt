@@ -90,6 +90,7 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
         if (connected) auth = repository.authStatus().getOrNull()
     }
     val isGemini = auth?.provider == "gemini" || auth?.subscriptionType == "Gemini API"
+    val isHybrid = auth?.provider == "hybrid"
 
     LaunchedEffect(range, connected, reload) {
         if (!connected) return@LaunchedEffect
@@ -175,7 +176,7 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
                 )
             }
 
-            UsageSection("Plan limits") { LimitsCard(limits, now, isGemini) }
+            UsageSection("Plan limits") { LimitsCard(limits, now, isGemini, isHybrid) }
 
             if (liveSessions.isNotEmpty()) {
                 UsageSection(if (anyActive) "Live task usage" else "Recent task usage") {
@@ -189,7 +190,7 @@ fun UsageScreen(repository: Repository, onBack: () -> Unit) {
                 if (u == null) {
                     Text(if (connected) "Loading…" else "Connect to the bridge to see activity.", color = C.Muted, fontSize = 13.sp)
                 } else {
-                    Totals(u)
+                    Totals(u, isHybrid)
                     DailyChart(u.days)
                 }
             }
@@ -207,7 +208,9 @@ private fun LiveSessionsCard(sessions: List<SessionSummary>, limits: Limits?) {
     UsageCard {
         sessions.forEachIndexed { i, s ->
             if (i > 0) HorizontalDivider(color = C.Border)
-            val modelLabel = s.model?.let(UsageText::modelName) ?: "Default model"
+            val effectiveId = s.effectiveModel?.takeIf { it.isNotBlank() } ?: s.model
+            val modelLabel = (effectiveId?.let(UsageText::modelName) ?: "Default model") +
+                if (s.billing == "api") " (API)" else ""
             val win = limits?.windows?.let { UsageText.windowForModel(s.model, it) }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -236,10 +239,11 @@ private fun LiveSessionsCard(sessions: List<SessionSummary>, limits: Limits?) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val details = buildList {
                         add(modelLabel)
+                        if (s.costUsd > 0) add("${UsageText.formatUsd(s.costUsd)} API")
                         if (s.readTokens > 0) add("${UsageText.compact(s.readTokens)} in")
                         if (s.thinkingTokens > 0) add("${UsageText.compact(s.thinkingTokens)} think")
                         if (s.requests > 0) add("${s.requests} req")
-                        if (win != null) add("${UsageText.percent(win.utilization)} quota")
+                        if (win != null && s.billing != "api") add("${UsageText.percent(win.utilization)} quota")
                     }.joinToString(" · ")
                     Text(
                         details,
@@ -286,16 +290,19 @@ private fun levelOf(utilization: Double) = when {
 }
 
 @Composable
-private fun LimitsCard(limits: Limits?, now: Long, isGemini: Boolean = false) {
+private fun LimitsCard(limits: Limits?, now: Long, isGemini: Boolean = false, isHybrid: Boolean = false) {
     UsageCard {
         if (limits == null || limits.windows.isEmpty()) {
-            if (isGemini) {
-                Text(
+            when {
+                isGemini -> Text(
                     "Using Gemini API key. API rate limits and token quotas are managed in Google AI Studio / Google Cloud Console.",
                     color = C.TextSoft, fontSize = 13.sp, lineHeight = 18.sp,
                 )
-            } else {
-                Text("Limits show up after AGY's next reply, or tap Refresh above.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
+                isHybrid -> Text(
+                    "Hybrid mode active (Sub + API). Subscription limits show up after AGY's next reply, and any rate-limited turns spill over to Gemini 4 Hydrogen on the Gemini API.",
+                    color = C.TextSoft, fontSize = 13.sp, lineHeight = 18.sp,
+                )
+                else -> Text("Limits show up after AGY's next reply, or tap Refresh above.", color = C.Muted, fontSize = 13.sp, lineHeight = 18.sp)
             }
             return@UsageCard
         }
@@ -304,7 +311,10 @@ private fun LimitsCard(limits: Limits?, now: Long, isGemini: Boolean = false) {
             LimitRow(w, now)
         }
         Text(
-            "Updated ${UsageText.ago(now - limits.updatedAt)} · Counts all your Antigravity quota usage.",
+            buildString {
+                append("Updated ${UsageText.ago(now - limits.updatedAt)} · Counts your Antigravity subscription quota.")
+                if (isHybrid) append(" Hybrid mode automatically spills over to Gemini 4 Hydrogen (API) when a window hits 100%.")
+            },
             color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
         )
     }
@@ -401,17 +411,33 @@ fun resetTime(epochMs: Long, now: Long = System.currentTimeMillis()): String {
 // ---- activity ----
 
 @Composable
-private fun Totals(u: Usage) {
+private fun Totals(u: Usage, isHybrid: Boolean = false) {
     val totalOut = u.days.sumOf { it.output }
     val totalRead = u.days.sumOf { it.read }
     val totalReq = u.days.sumOf { it.requests }.toLong()
     val totalThinking = u.days.sumOf { it.thinking }
     val totalCacheRead = u.days.sumOf { it.cacheRead }
+    val apiOut = u.days.sumOf { it.apiOutput }
+    val apiReq = u.days.sumOf { it.apiRequests }
+    val apiCost = u.days.sumOf { it.apiCostUsd }
+    val subOut = (totalOut - apiOut).coerceAtLeast(0L)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             StatTile("Tokens out", UsageText.compact(totalOut), Modifier.weight(1f))
             StatTile("Tokens in", UsageText.compact(totalRead), Modifier.weight(1f))
             StatTile("Requests", UsageText.compact(totalReq), Modifier.weight(1f))
+        }
+        if (isHybrid || apiCost > 0.0 || apiReq > 0 || u.dailyApiLimitUsd > 0.0) {
+            val todayCapLabel = if (u.dailyApiLimitUsd > 0.0) {
+                "${UsageText.formatUsd(u.todayApiCostUsd)} / $${String.format(Locale.US, "%.2f", u.dailyApiLimitUsd)}"
+            } else {
+                UsageText.formatUsd(u.todayApiCostUsd)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatTile("Sub out ($0)", UsageText.compact(subOut), Modifier.weight(1f))
+                StatTile("Paid API", UsageText.formatUsd(apiCost), Modifier.weight(1f))
+                StatTile("Today API", todayCapLabel, Modifier.weight(1f))
+            }
         }
         val extra = buildList {
             if (totalThinking > 0) add("${UsageText.compact(totalThinking)} thinking")
@@ -419,6 +445,7 @@ private fun Totals(u: Usage) {
                 val pct = Math.round(totalCacheRead.toDouble() / totalRead * 100)
                 add("${UsageText.compact(totalCacheRead)} cached ($pct%)")
             }
+            if (apiReq > 0) add("$apiReq API ${if (apiReq == 1) "req" else "reqs"}")
             if (u.sessions > 0) add("${u.sessions} ${if (u.sessions == 1) "session" else "sessions"}")
         }.joinToString(" · ")
         if (extra.isNotEmpty()) {

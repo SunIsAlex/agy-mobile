@@ -88,41 +88,46 @@ fun Chip(text: String, onClick: () -> Unit, @DrawableRes icon: Int? = null, warn
     }
 }
 
-/** Segmented control: one row of mutually exclusive options. */
+/** Segmented control: mutually exclusive options, wrapping cleanly into rows when there are more than 4. */
 @Composable
 fun <T> Segmented(options: List<Pair<T, String>>, selected: T, onSelect: (T) -> Unit, modifier: Modifier = Modifier) {
-    Row(
+    val rows = if (options.size > 4) options.chunked(4) else listOf(options)
+    Column(
         modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
             .background(C.Surface)
             .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        options.forEach { (value, label) ->
-            val on = value == selected
-            Box(
-                Modifier
-                    .weight(1f)
-                    .height(40.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(if (on) C.Surface3 else Color.Transparent)
-                    .semantics { this.selected = on }
-                    .clickable(role = Role.Tab) { onSelect(value) },
-                contentAlignment = Alignment.Center,
+        rows.forEach { row ->
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                val fontSize = when {
-                    options.size > 6 -> 11.sp
-                    options.size > 4 -> 12.sp
-                    else -> 13.sp
+                row.forEach { (value, label) ->
+                    val on = value == selected
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (on) C.Surface3 else Color.Transparent)
+                            .padding(horizontal = 4.dp)
+                            .semantics { this.selected = on }
+                            .clickable(role = Role.Tab) { onSelect(value) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            label,
+                            color = if (on) C.Text else C.Muted,
+                            fontSize = 13.sp,
+                            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
-                Text(
-                    label,
-                    color = if (on) C.Text else C.Muted,
-                    fontSize = fontSize,
-                    fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1,
-                )
             }
         }
     }
@@ -243,6 +248,7 @@ fun effortDescription(effort: String): String = when (effort) {
 }
 val modelLabels = listOf(
     "" to "Default",
+    "gemini-4-hydrogen" to "4 Hydrogen",
     "gemini-4-carbon" to "Carbon",
     "gemini-4-argon" to "Argon",
     "gemini-3.8-flash" to "Flash",
@@ -251,5 +257,8 @@ val modelLabels = listOf(
     "gpt-oss-120b" to "GPT-OSS",
 )
 
-fun modelLabel(model: String?): String = modelLabels.firstOrNull { it.first == model.orEmpty() }?.second ?: model.orEmpty()
+fun modelLabel(model: String?): String {
+    val base = model.orEmpty().replace(Regex("-(low|medium|high)$"), "")
+    return modelLabels.firstOrNull { it.first == base }?.second ?: model.orEmpty()
+}
 

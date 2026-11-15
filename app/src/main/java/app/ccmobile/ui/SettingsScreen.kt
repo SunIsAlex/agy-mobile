@@ -47,6 +47,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ccmobile.R
 import app.ccmobile.data.AuthStatus
@@ -54,6 +56,7 @@ import app.ccmobile.data.BridgeKind
 import app.ccmobile.data.BridgeLauncher
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.Repository
+import app.ccmobile.data.UsageText
 import app.ccmobile.notify.BridgeService
 import app.ccmobile.notify.Notifier
 
@@ -102,13 +105,25 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
         else if (starting != null) { kotlinx.coroutines.delay(45_000); starting = null }
     }
     var notify by remember { mutableStateOf(settings.notify && Notifier.canPost(context)) }
-    // Who AGY on the connected bridge is signed in as; checked again after logging in.
+    // Who AGY on the connected bridge is signed in as; checked again after logging in or returning from browser.
     var auth by remember { mutableStateOf<Result<AuthStatus>?>(null) }
-    LaunchedEffect(conn) { auth = if (conn is ConnState.Connected) repository.authStatus() else null }
-
     val scope = rememberCoroutineScope()
+    LaunchedEffect(conn) { auth = if (conn is ConnState.Connected) repository.authStatus() else null }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        if (conn is ConnState.Connected) scope.launch { auth = repository.authStatus() }
+    }
+
     var geminiApiKeyInput by remember { mutableStateOf(settings.geminiApiKey) }
+    var dailyApiLimitInput by remember { mutableStateOf(settings.dailyApiLimitUsd) }
+    var selectedProvider by remember { mutableStateOf("google") }
     var isSavingAuth by remember { mutableStateOf(false) }
+    LaunchedEffect(auth) {
+        val st = auth?.getOrNull() ?: return@LaunchedEffect
+        st.provider?.let { selectedProvider = it }
+        if (st.dailyApiLimitUsd > 0 && dailyApiLimitInput.isBlank()) {
+            dailyApiLimitInput = String.format(java.util.Locale.US, "%.2f", st.dailyApiLimitUsd)
+        }
+    }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         notify = granted
@@ -168,14 +183,28 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
 
             Section("AGY account") {
                 val status = auth?.getOrNull()
-                val isGemini = status?.provider == "gemini" || status?.subscriptionType == "Gemini API"
+                val activeProvider = status?.provider ?: selectedProvider
+                val capNumber = dailyApiLimitInput.trim().toDoubleOrNull() ?: 0.0
                 Text(
                     when {
                         conn !is ConnState.Connected -> "Connect to a bridge to see which account AGY uses."
                         auth == null -> "Checking…"
                         status == null -> auth?.exceptionOrNull()?.message ?: "Couldn't check the login."
+                        activeProvider == "hybrid" -> buildString {
+                            append("Hybrid (Sub + API)")
+                            val googleLabel = status.email ?: if (status.authMethod == "hybrid") "Google signed in" else null
+                            append(googleLabel?.let { " · $it" } ?: " · Google account not signed in")
+                            if (status.todayApiUsd > 0 || status.dailyApiLimitUsd > 0) {
+                                append(" · ${UsageText.formatUsd(status.todayApiUsd)}")
+                                if (status.dailyApiLimitUsd > 0) {
+                                    append(" / $${String.format(java.util.Locale.US, "%.2f", status.dailyApiLimitUsd)} API today")
+                                } else {
+                                    append(" API today")
+                                }
+                            }
+                        }
                         !status.loggedIn -> "Not signed in. Connect your Google account or provide a Gemini API key."
-                        isGemini -> "Signed in with Gemini API" + (status.orgName?.let { " · $it" } ?: "")
+                        activeProvider == "gemini" -> "Signed in with Gemini API" + (status.orgName?.let { " · $it" } ?: "")
                         else -> "Signed in" + (status.email?.let { " as $it" } ?: "") +
                             (status.subscriptionType?.let { " · ${it.replaceFirstChar(Char::uppercase)}" }
                                 ?: if (status.authMethod == "google") "" else " · ${status.authMethod}")
@@ -183,67 +212,95 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
                     color = if (status?.loggedIn == false) C.Red else C.TextSoft, fontSize = 14.sp,
                 )
 
-                if (isGemini) {
-                    Field("Gemini API Key", geminiApiKeyInput, { geminiApiKeyInput = it }, secret = true)
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        SecondaryButton(
-                            if (isSavingAuth) "Saving…" else "Update key",
-                            {
-                                scope.launch {
-                                    isSavingAuth = true
-                                    auth = repository.setAuth("gemini", geminiApiKeyInput.trim())
-                                    isSavingAuth = false
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = !isSavingAuth && geminiApiKeyInput.isNotBlank() && conn is ConnState.Connected,
-                        )
-                        SecondaryButton(
-                            if (isSavingAuth) "Switching…" else "Use Google account",
-                            {
-                                scope.launch {
-                                    isSavingAuth = true
-                                    auth = repository.setAuth("google", null)
-                                    isSavingAuth = false
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = !isSavingAuth && conn is ConnState.Connected,
-                        )
-                    }
-                    Text(
-                        "Tasks run against Google's Gemini API directly with your API key. Rate limits and token quota are managed in Google AI Studio.",
-                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
-                    )
-                } else {
-                    if (status?.loggedIn == true) {
-                        SecondaryButton("Log in with another account", onLogin, modifier = Modifier.fillMaxWidth())
-                    } else {
-                        PrimaryButton("Log in to AGY", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
-                    }
-                    Text(
-                        "Runs agy auth login on the bridge and opens the sign-in page in your browser.",
-                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
-                    )
+                Segmented(
+                    options = listOf(
+                        "google" to "Google",
+                        "hybrid" to "Hybrid (Save $)",
+                        "gemini" to "Gemini API",
+                    ),
+                    selected = selectedProvider,
+                    onSelect = { next ->
+                        selectedProvider = next
+                        val canSwitchNow = conn is ConnState.Connected && !isSavingAuth &&
+                            (next == "google" || status?.hasGeminiKey == true || geminiApiKeyInput.isNotBlank())
+                        if (canSwitchNow) {
+                            scope.launch {
+                                isSavingAuth = true
+                                val res = repository.setAuth(
+                                    next,
+                                    geminiApiKeyInput.trim().ifBlank { null },
+                                    if (next == "hybrid") capNumber else null,
+                                )
+                                if (res.isSuccess) auth = res
+                                else repository.reportError(res.exceptionOrNull()?.message ?: "Failed to switch mode.")
+                                isSavingAuth = false
+                            }
+                        }
+                    },
+                )
 
-                    Field("Gemini API Key", geminiApiKeyInput, { geminiApiKeyInput = it }, secret = true)
+                if (selectedProvider == "google" || selectedProvider == "hybrid") {
+                    val hasGoogleLogin = status?.email != null || status?.authMethod == "hybrid" ||
+                        (status?.loggedIn == true && status.provider == "google")
+                    if (hasGoogleLogin) {
+                        SecondaryButton("Log in with another Google account", onLogin, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        PrimaryButton("Log in to Google subscription", onLogin, modifier = Modifier.fillMaxWidth(), enabled = conn is ConnState.Connected)
+                    }
+                    Text(
+                        "Opens Google sign-in in your browser so AGY can authenticate your subscription.",
+                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                    )
+                }
+
+                if (selectedProvider == "hybrid" || selectedProvider == "gemini") {
+                    val keyLabel = if (status?.hasGeminiKey == true && geminiApiKeyInput.isBlank()) {
+                        "Gemini API Key (${status.maskedGeminiKey ?: "saved"} on bridge)"
+                    } else {
+                        "Gemini API Key"
+                    }
+                    Field(keyLabel, geminiApiKeyInput, { geminiApiKeyInput = it }, secret = true)
+                    if (selectedProvider == "hybrid") {
+                        Field(
+                            "Daily API cap in USD (optional, 0 = no cap)",
+                            dailyApiLimitInput,
+                            { dailyApiLimitInput = it.filter { ch -> ch.isDigit() || ch == '.' }.take(8) },
+                            keyboard = KeyboardType.Decimal,
+                        )
+                    }
                     SecondaryButton(
-                        if (isSavingAuth) "Connecting…" else "Use Gemini API Key",
+                        when {
+                            isSavingAuth -> "Saving…"
+                            selectedProvider == "hybrid" -> "Save Hybrid settings"
+                            else -> "Save Gemini API key"
+                        },
                         {
                             scope.launch {
                                 isSavingAuth = true
-                                auth = repository.setAuth("gemini", geminiApiKeyInput.trim())
+                                val res = repository.setAuth(
+                                    selectedProvider,
+                                    geminiApiKeyInput.trim().ifBlank { null },
+                                    if (selectedProvider == "hybrid") capNumber else null,
+                                )
+                                if (res.isSuccess) auth = res
+                                else repository.reportError(res.exceptionOrNull()?.message ?: "Failed to update authentication.")
                                 isSavingAuth = false
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !isSavingAuth && geminiApiKeyInput.isNotBlank() && conn is ConnState.Connected,
-                    )
-                    Text(
-                        "Or connect using a Gemini API key from Google AI Studio without signing in.",
-                        color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                        enabled = !isSavingAuth && conn is ConnState.Connected &&
+                            (geminiApiKeyInput.isNotBlank() || status?.hasGeminiKey == true),
                     )
                 }
+
+                Text(
+                    when (selectedProvider) {
+                        "hybrid" -> "Uses your Google subscription first ($0 marginal cost). When subscription quota is full, automatically spills over to Gemini 4 Hydrogen on the Gemini API and switches back once your subscription resets."
+                        "gemini" -> "Tasks run against Google's Gemini API directly (including Gemini 4 Hydrogen & Carbon) using your API key."
+                        else -> "Uses your Google subscription only. Tasks pause when your plan's quota window is full."
+                    },
+                    color = C.Faint, fontSize = 12.sp, lineHeight = 17.sp,
+                )
             }
 
             Section("Default agent mode") {
@@ -261,7 +318,7 @@ fun SettingsScreen(repository: Repository, onBack: (() -> Unit)?, onLogin: () ->
             }
 
             Section("Default reasoning effort") {
-                Segmented(effortShortLabels, effort, { effort = it; settings.effort = it })
+                Segmented(effortLabels, effort, { effort = it; settings.effort = it })
                 Text(effortDescription(effort), color = C.Muted, fontSize = 13.sp)
             }
 
@@ -398,9 +455,6 @@ private fun Field(label: String, value: String, onChange: (String) -> Unit, keyb
         colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = C.Clay, unfocusedBorderColor = C.Surface3, cursorColor = C.Clay, focusedLabelColor = C.ClayText),
     )
 }
-
-/** Six options fit one row only with short names. */
-private val effortShortLabels = effortLabels.map { (v, l) -> v to if (v == "xhigh") "XHigh" else if (v == "medium") "Med" else l }
 
 private fun copy(context: Context, text: String) {
     context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("command", text))

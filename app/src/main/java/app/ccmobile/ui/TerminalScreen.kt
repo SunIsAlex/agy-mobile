@@ -54,6 +54,8 @@ import app.ccmobile.data.AuthStatus
 import app.ccmobile.data.ConnState
 import app.ccmobile.data.Repository
 import app.ccmobile.data.TermLink
+import app.ccmobile.data.bool
+import app.ccmobile.data.str
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -64,6 +66,18 @@ private val extraKeys = listOf(
     listOf("ESC" to "\u001b", "/" to "/", "-" to "-", "HOME" to "\u001b[H", "↑" to "\u001b[A", "END" to "\u001b[F", "PGUP" to "\u001b[5~"),
     listOf("TAB" to "\t", "CTRL" to "", "ALT" to "", "←" to "\u001b[D", "↓" to "\u001b[B", "→" to "\u001b[C", "PGDN" to "\u001b[6~"),
 )
+
+internal fun extraKeySequence(seq: String, ctrl: Boolean, alt: Boolean): String {
+    if (!ctrl && !alt) return seq
+    val mod = 1 + (if (alt) 2 else 0) + (if (ctrl) 4 else 0)
+    return when {
+        seq.length == 3 && seq.startsWith("\u001b[") && seq[2] in "ABCDHF" -> "\u001b[1;${mod}${seq[2]}"
+        seq.startsWith("\u001b[") && seq.endsWith("~") -> "\u001b[${seq.substring(2, seq.length - 1)};${mod}~"
+        ctrl && (seq == "/" || seq == "-") -> if (alt) "\u001b\u001f" else "\u001f"
+        alt -> "\u001b$seq"
+        else -> seq
+    }
+}
 
 /** xterm.js colors for the app's palette; light mode needs darker ANSI colors to stay readable. */
 private fun terminalTheme(p: Palette): String {
@@ -125,10 +139,12 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
         }
     }
     fun js(code: String) = web.evaluateJavascript(code, null)
-    // A bridge on this phone finishes the sign-in by itself (a server on localhost); one elsewhere can't,
-    // so open the page that shows a code to paste instead.
+    // A bridge on this phone finishes a localhost redirect by itself; OOB callback URLs (or remote bridges)
+    // display an authorization code in the browser to copy and paste back here.
     val bridgeHere = repository.settings.host in setOf("127.0.0.1", "localhost")
-    val signInPage = links.firstOrNull { it.local == bridgeHere }?.url
+    val activeLink = links.firstOrNull { it.local == bridgeHere } ?: links.firstOrNull()
+    val signInPage = activeLink?.url
+    val needsCodePaste = activeLink?.local == false || !bridgeHere
     fun openPage(url: String) {
         runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
             .onFailure { repository.reportError("Couldn't open a browser: ${it.message}") }
@@ -169,10 +185,10 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
         val pending = ByteArrayOutputStream()
         var flush: Job? = null
         repository.terminal.collect { ev ->
-            if (ev["id"]?.toString()?.trim('"') != id) return@collect
-            when (ev["ev"]?.toString()?.trim('"')) {
+            if (ev.str("id") != id) return@collect
+            when (ev.str("ev")) {
                 "term_output" -> {
-                    pending.write(Base64.decode(ev["data"]?.toString()?.trim('"') ?: "", Base64.DEFAULT))
+                    pending.write(Base64.decode(ev.str("data") ?: "", Base64.DEFAULT))
                     if (flush?.isActive != true) flush = scope.launch {
                         delay(16)
                         val bytes = pending.toByteArray().also { pending.reset() }
@@ -184,8 +200,8 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
                     if (login) signedIn = repository.authStatus().getOrDefault(AuthStatus())
                 }
                 "term_link" -> {
-                    val url = ev["url"]?.toString()?.trim('"') ?: return@collect
-                    links = links + TermLink(url, ev["local"]?.toString() == "true")
+                    val url = ev.str("url") ?: return@collect
+                    links = links + TermLink(url, ev.bool("local") == true)
                 }
             }
         }
@@ -208,7 +224,11 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
     }
     fun paste() {
         val text = context.getSystemService(ClipboardManager::class.java).primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
-        if (!text.isNullOrEmpty()) js("ccm.paste(${org.json.JSONObject.quote(text)})")
+        if (!text.isNullOrEmpty()) {
+            val cleaned = if (login) text.trim() else text
+            js("ccm.paste(${org.json.JSONObject.quote(cleaned)})")
+            if (login && !ended) scope.launch { delay(120); send("\r") }
+        }
     }
     fun copy() {
         web.evaluateJavascript("ccm.selection()") { quoted ->
@@ -236,11 +256,18 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
         if (login && !ended && error == null) {
             Row(Modifier.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (bridgeHere) "Sign in in your browser, then come back here."
+                    if (!needsCodePaste) "Sign in in your browser, then come back here."
                     else "Sign in in your browser, then copy the code it shows and tap Paste.",
                     color = C.Muted, fontSize = 13.sp, modifier = Modifier.weight(1f),
                 )
-                signInPage?.let { url -> ToolText("Open page", "Open the sign-in page again") { openPage(url) } }
+                signInPage?.let { url ->
+                    ToolText("Copy link", "Copy the sign-in link") {
+                        context.getSystemService(ClipboardManager::class.java)
+                            .setPrimaryClip(ClipData.newPlainText("sign-in link", url))
+                        repository.reportError("Sign-in link copied.")
+                    }
+                    ToolText("Open browser", "Open the sign-in page in your browser") { openPage(url) }
+                }
             }
         }
         error?.let {
@@ -283,7 +310,7 @@ fun TerminalScreen(repository: Repository, onBack: () -> Unit, login: Boolean = 
                                         "ALT" -> alt = !alt
                                         else -> {
                                             // A modifier applies to the next key here too: Ctrl-← etc.
-                                            val text = if (alt) "\u001b$seq" else seq
+                                            val text = extraKeySequence(seq, ctrl, alt)
                                             ctrl = false; alt = false
                                             send(text)
                                         }

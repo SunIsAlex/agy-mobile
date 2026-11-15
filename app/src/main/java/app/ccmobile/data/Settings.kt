@@ -1,11 +1,17 @@
 package app.ccmobile.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.core.content.edit
 
-class Settings(context: Context) {
-    private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
-    private val drafts = context.getSharedPreferences("drafts", Context.MODE_PRIVATE)
+class Settings(
+    private val prefs: SharedPreferences,
+    private val drafts: SharedPreferences,
+) {
+    constructor(context: Context) : this(
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE),
+        context.getSharedPreferences("drafts", Context.MODE_PRIVATE),
+    )
 
     var host: String
         get() = prefs.getString("host", "127.0.0.1")!!
@@ -22,16 +28,21 @@ class Settings(context: Context) {
         get() = prefs.getString("mode", "bypassPermissions")!!
         set(v) = prefs.edit { putString("mode", v) }
 
-    /** Google Gemini API key when using modelProvider: "gemini". */
+    /** Google Gemini API key when using Hybrid or Gemini API mode. */
     var geminiApiKey: String
         get() = prefs.getString("geminiApiKey", "")!!
         set(v) = prefs.edit { putString("geminiApiKey", v) }
+
+    /** Optional daily Gemini API spend cap in USD for Hybrid spillover (blank = unlimited). */
+    var dailyApiLimitUsd: String
+        get() = prefs.getString("dailyApiLimitUsd", "")!!
+        set(v) = prefs.edit { putString("dailyApiLimitUsd", v) }
 
     /** Model alias passed to `--model`, or blank for the CLI's default. */
     var model: String
         get() = prefs.getString("model", "")!!
         set(v) = prefs.edit { putString("model", v) }
-    /** Reasoning effort passed to `--effort` (low, medium, high, xhigh, max), or blank for the model's default. */
+    /** Reasoning effort passed to `--effort` (low, medium, high), or blank for the model's default. */
     var effort: String
         get() = prefs.getString("effort", "")!!
         set(v) = prefs.edit { putString("effort", v) }

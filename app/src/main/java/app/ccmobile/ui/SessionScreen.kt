@@ -109,11 +109,16 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
             IconBtn(R.drawable.ic_back, "Back to tasks", onBack)
             Column(Modifier.weight(1f)) {
                 Text(session?.title ?: "Task", color = C.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val activeModelBadge = when {
+                    session?.billing == "api" && !session.effectiveModel.isNullOrBlank() -> "${modelLabel(session.effectiveModel)} (API)"
+                    session?.billing == "api" -> "Gemini API"
+                    else -> session?.model?.takeIf { it.isNotBlank() }?.let(::modelLabel)
+                }
                 Text(
                     listOfNotNull(
                         session?.let { statusStyle(it.status).label },
                         session?.repoName,
-                        session?.model?.takeIf { it.isNotBlank() }?.let(::modelLabel),
+                        activeModelBadge,
                         session?.effort?.let { "${effortLabel(it)} effort" },
                     ).joinToString(" · "),
                     color = C.Muted, fontSize = 12.sp, fontFamily = Mono, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -121,20 +126,21 @@ fun SessionScreen(repository: Repository, sid: String, onBack: () -> Unit, onDif
                 val modelWindow = remember(session?.model, limits) {
                     limits?.windows?.let { UsageText.windowForModel(session?.model, it) }
                 }
-                val usageLine = remember(session?.outputTokens, session?.readTokens, session?.costUsd, modelWindow) {
+                val usageLine = remember(session?.outputTokens, session?.readTokens, session?.costUsd, session?.billing, modelWindow) {
                     buildList {
-                        if ((session?.costUsd ?: 0.0) > 0) add("$%.2f API".format(session!!.costUsd))
+                        if ((session?.costUsd ?: 0.0) > 0) add("${UsageText.formatUsd(session!!.costUsd)} API")
                         if ((session?.outputTokens ?: 0L) > 0 || (session?.readTokens ?: 0L) > 0) {
                             add("${UsageText.compact(session?.outputTokens ?: 0L)} out")
                             if ((session?.readTokens ?: 0L) > 0) add("${UsageText.compact(session!!.readTokens)} in")
                         }
-                        if (modelWindow != null) {
+                        if (modelWindow != null && session?.billing != "api") {
                             add("${UsageText.percent(modelWindow.utilization)} quota")
                         }
                     }.joinToString(" · ")
                 }
                 if (usageLine.isNotEmpty()) {
                     val quotaTone = when {
+                        session?.billing == "api" -> C.Muted
                         modelWindow != null && (modelWindow.utilization >= 1.0 || modelWindow.disabled) -> C.Red
                         modelWindow != null && modelWindow.utilization >= 0.8 -> C.Amber
                         else -> C.Muted
