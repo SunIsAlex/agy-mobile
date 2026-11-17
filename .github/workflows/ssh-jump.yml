@@ -1,0 +1,46 @@
+name: ssh-jump
+
+# GitHub 的 runner 在境外，可直连被大陆封锁的 176.122.164.30。
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "user@host"
+        required: true
+        default: "root@176.122.164.30"
+      port:
+        description: "SSH 端口"
+        required: true
+        default: "22"
+      command:
+        description: "要在服务器上执行的命令"
+        required: true
+        default: "whoami; hostname; uptime"
+
+permissions:
+  contents: read
+
+jobs:
+  ssh:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TARGET: ${{ inputs.target }}
+      PORT: ${{ inputs.port }}
+      REMOTE_CMD: ${{ inputs.command }}
+    steps:
+      - name: 准备 SSH 凭据
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$PORT" -H "${TARGET#*@}" >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: 执行远程命令
+        run: |
+          set -uo pipefail
+          OPTS="-o ConnectTimeout=20 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new"
+          ssh $OPTS -o BatchMode=yes -p "$PORT" "$TARGET" "$REMOTE_CMD"
