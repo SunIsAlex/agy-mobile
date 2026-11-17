@@ -44,7 +44,7 @@ jobs:
           set -e
           cd /var/www/reader/books
           for d in $DIRS; do
-            [ -d "\$d" ] || { echo "skip \$d"; continue; }
+            [ -e "\$d" ] || { echo "skip \$d"; continue; }
             tar -cf /tmp/bk_\$d.tar "\$d"
             echo "packed \$d"
           done
