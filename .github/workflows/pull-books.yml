@@ -65,9 +65,10 @@ jobs:
         run: |
           set -euo pipefail
           cd out
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "tmp transfer" --notes "temporary book transfer, will be deleted"
-          gh release upload "$TAG" ./*.tar --clobber
-          gh release view "$TAG" --json assets -q '.assets[] | "\(.name)\t\(.size)"'
+          R="$GITHUB_REPOSITORY"
+          gh release view "$TAG" -R "$R" >/dev/null 2>&1 || gh release create "$TAG" -R "$R" --title "tmp transfer" --notes "temporary book transfer, will be deleted"
+          gh release upload "$TAG" -R "$R" ./*.tar --clobber
+          gh release view "$TAG" -R "$R" --json assets -q '.assets[] | "\(.name)\t\(.size)"'
 
       - name: 清理服务器临时文件
         if: always()
